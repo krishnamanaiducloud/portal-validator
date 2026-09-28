@@ -1,4 +1,4 @@
-FROM cgr.dev/chainguard/python:latest-dev@sha256:87729167739190d9309588120a8ac0ffbf2eb95dd895abb9bada6bb9ecbf5a04
+FROM cgr.dev/chainguard/python:latest-dev@sha256:7e3a3c3c8231458251910f5631d84f9d749d370e7317f5b84c5208fbab8bbef5
 
 ARG APK_REPOSITORY=https://apk.cgr.dev/chainguard
 

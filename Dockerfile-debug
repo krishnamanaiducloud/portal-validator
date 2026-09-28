@@ -1,4 +1,4 @@
-ARG PYTHON_BUILD_IMAGE=cgr.dev/chainguard/python:latest-dev@sha256:87729167739190d9309588120a8ac0ffbf2eb95dd895abb9bada6bb9ecbf5a04
+ARG PYTHON_BUILD_IMAGE=cgr.dev/chainguard/python:latest-dev@sha256:7e3a3c3c8231458251910f5631d84f9d749d370e7317f5b84c5208fbab8bbef5
 ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.0.0
 FROM ${PYTHON_BUILD_IMAGE} AS debug-dependencies
 
