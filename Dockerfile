@@ -1,0 +1,27 @@
+FROM cgr.dev/chainguard/python:latest-dev@sha256:87729167739190d9309588120a8ac0ffbf2eb95dd895abb9bada6bb9ecbf5a04
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser \
+    MAX_CONCURRENT_SCANS=2 SESSION_STATE_DIR=/auth PATH=/app/.venv/bin:$PATH
+
+USER 0
+WORKDIR /app
+RUN --mount=type=cache,target=/var/cache/apk apk update \
+    && apk cache --timeout 15 --cache-dir /var/cache/apk download --add-dependencies chromium \
+    && apk add --cache-dir /var/cache/apk chromium \
+    && addgroup -g 10001 validator \
+    && adduser -D -H -u 10001 -G validator -s /sbin/nologin validator \
+    && mkdir -p /auth /app \
+    && chown -R 10001:10001 /auth /app
+
+COPY requirements.txt .
+RUN python -m venv /app/.venv \
+    && /app/.venv/bin/pip install --no-cache-dir --no-compile -r requirements.txt
+COPY --chown=10001:10001 app ./app
+
+USER 10001:10001
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+ENTRYPOINT []
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log", "--proxy-headers", "--forwarded-allow-ips=*"]

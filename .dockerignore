@@ -1,0 +1,8 @@
+.git
+.venv
+__pycache__
+.auth
+reports
+.pytest_cache
+tests
+*.pyc
