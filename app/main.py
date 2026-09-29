@@ -37,7 +37,7 @@ SECURITY_HEADERS = (
     "referrer-policy", "permissions-policy", "cross-origin-opener-policy",
 )
 
-app = FastAPI(title="Portal Validator", version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Portal Validator", version="1.0.1", docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 

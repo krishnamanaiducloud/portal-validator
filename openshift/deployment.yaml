@@ -13,7 +13,7 @@ spec:
       automountServiceAccountToken: false
       containers:
       - name: portal-validator
-        image: registry.example.com/portal-validator:prod-09-27-2026
+        image: docker.io/mohankrishna999/portal-validator:prod-09-29-2026
         ports:
         - containerPort: 8080
         securityContext:

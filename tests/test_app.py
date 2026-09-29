@@ -18,7 +18,7 @@ def test_home_and_security_headers():
 
 
 def test_health_endpoint():
-    assert client.get("/healthz").json() == {"status": "ok", "version": "1.0.0"}
+    assert client.get("/healthz").json() == {"status": "ok", "version": "1.0.1"}
 
 
 @pytest.mark.parametrize(("candidate", "subdomains", "expected"), [

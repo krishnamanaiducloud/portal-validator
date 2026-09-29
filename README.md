@@ -30,11 +30,11 @@ Run this service only for portals you are authorized to test. Protect the valida
 Both images use the pinned Chainguard Python development image and install Wolfi's current Chromium package. The application runs as UID/GID `10001`.
 
 ```bash
-docker build -t portal-validator:prod-09-27-2026 .
+docker build -t portal-validator:prod-09-29-2026 .
 docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,noexec,nosuid,size=256m \
   -v ./auth:/auth:ro \
-  portal-validator:prod-09-27-2026
+  portal-validator:prod-09-29-2026
 ```
 
 Open <http://localhost:8080>.
