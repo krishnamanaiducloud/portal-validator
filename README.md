@@ -30,11 +30,11 @@ Run this service only for portals you are authorized to test. Protect the valida
 Both images use the pinned Chainguard Python development image and install Wolfi's current Chromium package. The application runs as UID/GID `10001`.
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.0.1 .
+docker build -t mohankrishna999/portal-validator:1.0.3 .
 docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,noexec,nosuid,size=256m \
   -v ./auth:/auth:ro \
-  mohankrishna999/portal-validator:1.0.1
+  mohankrishna999/portal-validator:1.0.3
 ```
 
 Open <http://localhost:8080>.
@@ -44,10 +44,10 @@ Open <http://localhost:8080>.
 The debug image includes hot reload and a `debugpy` listener on port 5678.
 
 ```bash
-docker build -f Dockerfile-debug -t mohankrishna999/portal-validator:1.0.1-debug .
+docker build -f Dockerfile-debug -t mohankrishna999/portal-validator:1.0.3-debug .
 docker run --rm -p 8080:8080 -p 5678:5678 \
   -v "$PWD/app:/app/app" -v "$PWD/auth:/auth:ro" \
-  mohankrishna999/portal-validator:1.0.1-debug
+  mohankrishna999/portal-validator:1.0.3-debug
 ```
 
 ## Tests
