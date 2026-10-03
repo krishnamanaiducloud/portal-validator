@@ -50,7 +50,7 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(
     title="Portal Validator",
-    version="1.1.0",
+    version="1.1.1",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -325,11 +325,10 @@ async def scan(req: ScanRequest):
 
     async with SCAN_SEMAPHORE:
         async with async_playwright() as playwright:
-            executable_path = os.getenv("CHROMIUM_EXECUTABLE_PATH")
-            launch_options = {"headless": True, "args": ["--disable-dev-shm-usage"]}
-            if executable_path:
-                launch_options["executable_path"] = executable_path
-            browser = await playwright.chromium.launch(**launch_options)
+            browser = await playwright.chromium.launch(
+                headless=True,
+                args=["--disable-dev-shm-usage"],
+            )
             try:
                 context_args = {"ignore_https_errors": False, "service_workers": "block"}
                 if state_path:

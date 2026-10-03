@@ -1,5 +1,5 @@
 ARG PYTHON_BUILD_IMAGE=cgr.dev/chainguard/python:latest-dev@sha256:1c830d26eef0eb4231d8c119e037bee325329aa0ac67c527a86d6e62c05d23d1
-ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.1.0
+ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.1.1
 FROM ${PYTHON_BUILD_IMAGE} AS debug-dependencies
 
 USER 0
@@ -19,6 +19,7 @@ USER 0
 WORKDIR /app
 COPY --from=debug-dependencies /debug-venv /app/.venv
 COPY --chown=10001:10001 app ./app
+RUN python -c "from pathlib import Path; from playwright.sync_api import sync_playwright; manager = sync_playwright().start(); browser_path = Path(manager.chromium.executable_path); print(f'Playwright expected Chromium: {browser_path}'); assert browser_path.is_file(), f'Playwright Chromium missing: {browser_path}'; manager.stop(); print('Playwright Chromium installation verified')"
 
 USER 10001:10001
 EXPOSE 8080 5678

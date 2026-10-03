@@ -21,7 +21,7 @@ spec:
       automountServiceAccountToken: false
       containers:
       - name: portal-validator
-        image: docker.io/mohankrishna999/portal-validator:1.1.0
+        image: docker.io/mohankrishna999/portal-validator:1.1.1
         ports:
         - containerPort: 8080
         securityContext:

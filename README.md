@@ -27,16 +27,19 @@ Run this service only for portals you are authorized to test. Protect the valida
 
 ## Production container
 
-Both images use the pinned Chainguard Python development image and install Wolfi's current Chromium package. The application runs as UID/GID `10001`.
+Both images use the pinned Chainguard Python development image. The exact
+Playwright version pinned in `requirements.txt` installs and uses its matching
+Chromium revision under `/ms-playwright`; the application does not override it
+with a system Chrome executable. The application runs as UID/GID `10001`.
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.1.0 .
+docker build -t mohankrishna999/portal-validator:1.1.1 .
 docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,noexec,nosuid,size=256m \
   -v ./auth:/auth:ro \
   -v ./corporate-ca.pem:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -e CORPORATE_CA_BUNDLE=/etc/portal-validator/certs/ca-bundle.crt \
-  mohankrishna999/portal-validator:1.1.0
+  mohankrishna999/portal-validator:1.1.1
 ```
 
 Open <http://localhost:8080>.
@@ -46,10 +49,10 @@ Open <http://localhost:8080>.
 The debug image includes hot reload and a `debugpy` listener on port 5678.
 
 ```bash
-docker build -f Dockerfile-debug -t mohankrishna999/portal-validator:1.1.0-debug .
+docker build -f Dockerfile-debug -t mohankrishna999/portal-validator:1.1.1-debug .
 docker run --rm -p 8080:8080 -p 5678:5678 \
   -v "$PWD/app:/app/app" -v "$PWD/auth:/auth:ro" \
-  mohankrishna999/portal-validator:1.1.0-debug
+  mohankrishna999/portal-validator:1.1.1-debug
 ```
 
 ## Tests
@@ -57,6 +60,27 @@ docker run --rm -p 8080:8080 -p 5678:5678 \
 ```bash
 python -m pip install -r requirements.txt -r requirements-dev.txt
 pytest -q
+```
+
+Verify the Playwright-managed browser inside the production image:
+
+```bash
+docker run --rm -i --entrypoint python \
+  mohankrishna999/portal-validator:1.1.1 - <<'PY'
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as playwright:
+    path = Path(playwright.chromium.executable_path)
+    print("Playwright Chromium:", path)
+    print("Exists:", path.is_file())
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=["--disable-dev-shm-usage"],
+    )
+    print("BROWSER LAUNCHED SUCCESSFULLY")
+    browser.close()
+PY
 ```
 
 ## OpenShift

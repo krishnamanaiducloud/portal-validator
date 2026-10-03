@@ -47,20 +47,14 @@ RUN --mount=type=cache,id=portal-validator-apks,target=/tmp/apks set -eux; \
 ENV HOME=/tmp/portal-validator-home \
     CHROMIUM_NSS_DB=/tmp/portal-validator-home/.local/share/pki/nssdb \
     RUNTIME_CA_BUNDLE=/tmp/portal-validator-ca-bundle.pem
-ARG CHROMIUM_VERSION=154.0.8037.92
-ENV CHROMIUM_EXECUTABLE_PATH=/opt/chrome-headless-shell/chrome-headless-shell
 
 COPY requirements.txt .
 RUN python -m venv /app/.venv \
     && /app/.venv/bin/pip install --no-cache-dir --no-compile -r requirements.txt \
-    && curl -fsSL --connect-timeout 15 --max-time 300 --retry 5 --retry-all-errors \
-      "https://storage.googleapis.com/chrome-for-testing-public/${CHROMIUM_VERSION}/linux64/chrome-headless-shell-linux64.zip" \
-      -o /tmp/chromium.zip \
-    && unzip -q /tmp/chromium.zip -d /opt \
-    && mv /opt/chrome-headless-shell-linux64 /opt/chrome-headless-shell \
-    && rm /tmp/chromium.zip \
-    && chmod -R a+rX /opt/chrome-headless-shell \
-    && /opt/chrome-headless-shell/chrome-headless-shell --version \
+    && /app/.venv/bin/python -m playwright install chromium \
+    && chgrp -R 0 /ms-playwright \
+    && chmod -R a+rX,go-w /ms-playwright \
+    && /app/.venv/bin/python -c "from pathlib import Path; from playwright.sync_api import sync_playwright; manager = sync_playwright().start(); browser_path = Path(manager.chromium.executable_path); print(f'Playwright expected Chromium: {browser_path}'); assert browser_path.is_file(), f'Playwright Chromium missing: {browser_path}'; assert str(browser_path).startswith('/ms-playwright/'), f'Unexpected Chromium location: {browser_path}'; manager.stop(); print('Playwright Chromium installation verified')" \
     && /app/.venv/bin/pip uninstall -y pip setuptools \
     && apk --no-network del \
       bash \
