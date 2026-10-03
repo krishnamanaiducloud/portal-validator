@@ -78,7 +78,7 @@ else
     fi
 
     if [ "$certificate_exists" = true ]; then
-        echo "Zscaler Root CA updated successfully in Chromium NSS DB"
+        echo "Zscaler Root CA imported successfully into Chromium NSS DB (updated existing certificate)"
     else
         echo "Zscaler Root CA imported successfully into Chromium NSS DB"
     fi

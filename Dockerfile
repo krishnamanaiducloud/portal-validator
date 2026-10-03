@@ -10,7 +10,8 @@ USER 0
 WORKDIR /app
 RUN --mount=type=cache,id=portal-validator-apks,target=/tmp/apks set -eux; \
     mkdir -p /tmp/repository/x86_64; \
-    wget --https-only --timeout=30 --tries=5 --retry-connrefused \
+    wget --https-only --prefer-family=IPv4 --timeout=30 --tries=5 \
+      --retry-connrefused --retry-on-host-error \
       --retry-on-http-error=429,500,502,503,504 --quiet \
       "$APK_REPOSITORY/x86_64/APKINDEX.tar.gz" \
       -O /tmp/repository/x86_64/APKINDEX.tar.gz; \
@@ -28,7 +29,8 @@ RUN --mount=type=cache,id=portal-validator-apks,target=/tmp/apks set -eux; \
       | grep -v '^chromium-')"; \
     for package_file in $runtime_package_files; do \
           if [ ! -s "/tmp/apks/$package_file" ]; then \
-            wget --https-only --timeout=30 --tries=5 --retry-connrefused \
+            wget --https-only --prefer-family=IPv4 --timeout=30 --tries=5 \
+              --retry-connrefused --retry-on-host-error \
               --retry-on-http-error=429,500,502,503,504 \
               --quiet "$APK_REPOSITORY/x86_64/$package_file" \
               -O "/tmp/apks/$package_file.partial"; \

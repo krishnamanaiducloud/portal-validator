@@ -1,5 +1,5 @@
 ARG PYTHON_BUILD_IMAGE=cgr.dev/chainguard/python:latest-dev@sha256:1c830d26eef0eb4231d8c119e037bee325329aa0ac67c527a86d6e62c05d23d1
-ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.1.2
+ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.1.3
 FROM ${PYTHON_BUILD_IMAGE} AS debug-dependencies
 
 USER 0

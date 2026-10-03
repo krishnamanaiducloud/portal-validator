@@ -37,14 +37,14 @@ Chromium revision under `/ms-playwright`; the application does not override it
 with a system Chrome executable. The application runs as UID/GID `10001`.
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.1.2 .
+docker build -t mohankrishna999/portal-validator:1.1.3 .
 docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,noexec,nosuid,size=256m \
   -v ./auth:/auth:ro \
   -v ./corporate-ca.pem:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./zscaler-root-ca.crt:/etc/portal-validator/zscaler/zscaler-root-ca.crt:ro \
   -e CORPORATE_CA_BUNDLE=/etc/portal-validator/certs/ca-bundle.crt \
-  mohankrishna999/portal-validator:1.1.2
+  mohankrishna999/portal-validator:1.1.3
 ```
 
 Open <http://localhost:8080>.
@@ -54,11 +54,11 @@ Open <http://localhost:8080>.
 The debug image includes hot reload and a `debugpy` listener on port 5678.
 
 ```bash
-docker build -f Dockerfile-debug -t mohankrishna999/portal-validator:1.1.2-debug .
+docker build -f Dockerfile-debug -t mohankrishna999/portal-validator:1.1.3-debug .
 docker run --rm -p 8080:8080 -p 5678:5678 \
   -v "$PWD/app:/app/app" -v "$PWD/auth:/auth:ro" \
   -v ./zscaler-root-ca.crt:/etc/portal-validator/zscaler/zscaler-root-ca.crt:ro \
-  mohankrishna999/portal-validator:1.1.2-debug
+  mohankrishna999/portal-validator:1.1.3-debug
 ```
 
 ## Tests
@@ -72,7 +72,7 @@ Verify the Playwright-managed browser inside the production image:
 
 ```bash
 docker run --rm -i --entrypoint python \
-  mohankrishna999/portal-validator:1.1.2 - <<'PY'
+  mohankrishna999/portal-validator:1.1.3 - <<'PY'
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 

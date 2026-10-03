@@ -56,7 +56,7 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(
     title="Portal Validator",
-    version="1.1.2",
+    version="1.1.3",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
