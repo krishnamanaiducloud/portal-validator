@@ -19,14 +19,19 @@ spec:
       labels: {app: portal-validator}
     spec:
       automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
       containers:
       - name: portal-validator
-        image: docker.io/mohankrishna999/portal-validator:1.1.3
+        image: docker.io/mohankrishna999/portal-validator:1.2.1
         ports:
         - containerPort: 8080
         securityContext:
           allowPrivilegeEscalation: false
           capabilities: {drop: ["ALL"]}
+          privileged: false
+          readOnlyRootFilesystem: true
           runAsNonRoot: true
           seccompProfile: {type: RuntimeDefault}
         resources:
@@ -41,12 +46,16 @@ spec:
           value: /tmp/portal-validator-home
         - name: PLAYWRIGHT_BROWSERS_PATH
           value: /ms-playwright
-        - name: SSL_CERT_FILE
+        - name: PORTAL_VALIDATOR_MANAGED_CA_BUNDLE
           value: /etc/portal-validator/certs/ca-bundle.crt
-        - name: REQUESTS_CA_BUNDLE
-          value: /etc/portal-validator/certs/ca-bundle.crt
-        - name: CORPORATE_CA_BUNDLE
-          value: /etc/portal-validator/certs/ca-bundle.crt
+        - name: PORTAL_VALIDATOR_ADDITIONAL_CA_DIRS
+          value: /etc/portal-validator/zscaler
+        - name: PORTAL_VALIDATOR_BROWSER_CA_DIRS
+          value: /etc/portal-validator/zscaler
+        - name: RUNTIME_CA_BUNDLE
+          value: /tmp/portal-validator-home/.portal-validator/ca-bundle.crt
+        - name: CHROMIUM_NSS_DB
+          value: /tmp/portal-validator-home/.local/share/pki/nssdb
         volumeMounts:
         - name: auth-state
           mountPath: /auth
@@ -57,6 +66,8 @@ spec:
         - name: zscaler-ca
           mountPath: /etc/portal-validator/zscaler
           readOnly: true
+        - name: runtime-tmp
+          mountPath: /tmp
         readinessProbe:
           httpGet: {path: /healthz, port: 8080}
           initialDelaySeconds: 5
@@ -77,9 +88,9 @@ spec:
       - name: zscaler-ca
         configMap:
           name: portal-validator-zscaler-ca
-          items:
-          - key: zscaler-root-ca.crt
-            path: zscaler-root-ca.crt
+      - name: runtime-tmp
+        emptyDir:
+          sizeLimit: 1Gi
 ---
 apiVersion: v1
 kind: Service

@@ -6,7 +6,6 @@ import ipaddress
 import logging
 import os
 import re
-import socket
 import time
 import uuid
 from collections import Counter, deque
@@ -21,7 +20,22 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, SecretStr, field_validator
 from playwright.async_api import BrowserContext, Route, async_playwright
 
-from app.trust import TrustStatus, configure_ca_trust
+from app.logging_config import LOGGER, log_event
+from app.navigation import (
+    NavigationTracker,
+    classify_authentication,
+    classify_navigation_error,
+)
+from app.security import (
+    DestinationError,
+    normalized_host,
+    resolve_and_validate,
+    sanitize_text,
+    sanitize_url,
+    validate_http_url,
+)
+from app.trust import TrustStatus, inspect_trust_status
+
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
@@ -40,23 +54,20 @@ SECURITY_HEADERS = (
     "content-security-policy", "strict-transport-security", "x-content-type-options",
     "referrer-policy", "permissions-policy", "cross-origin-opener-policy",
 )
-TLS_ERROR_RE = re.compile(r"net::ERR_CERT_[A-Z0-9_]+")
-URL_IN_MESSAGE_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
     "ac", "co", "com", "edu", "gov", "net", "org",
 })
-LOGGER = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    application.state.trust_status = configure_ca_trust()
+    application.state.trust_status = inspect_trust_status()
     yield
 
 
 app = FastAPI(
     title="Portal Validator",
-    version="1.1.3",
+    version="1.2.1",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -115,10 +126,12 @@ class Authentication(BaseModel):
 
 
 class ScanRequest(BaseModel):
-    target: str = Field(min_length=8, max_length=4096)
+    target: str = Field(min_length=1, max_length=4096)
     max_pages: int = Field(25, ge=1, le=250)
     max_depth: int = Field(3, ge=0, le=10)
+    max_redirects: int = Field(10, ge=0, le=30)
     timeout_ms: int = Field(15000, ge=1000, le=120000)
+    total_timeout_ms: int = Field(300000, ge=1000, le=900000)
     check_links: bool = True
     check_console: bool = True
     check_resources: bool = True
@@ -127,6 +140,7 @@ class ScanRequest(BaseModel):
     allow_subdomains: bool = False
     allow_private_networks: bool = False
     resource_hosts: list[str] = Field(default_factory=list, max_length=50)
+    credential_hosts: list[str] = Field(default_factory=list, max_length=25)
     authentication: Authentication = Field(default_factory=Authentication)
     allow_mutations: bool = False
     mutation_acknowledged: bool = False
@@ -144,20 +158,16 @@ class ScanRequest(BaseModel):
             return "https://" + value
         return value
 
-    @field_validator("resource_hosts")
+    @field_validator("resource_hosts", "credential_hosts")
     @classmethod
-    def validate_resource_hosts(cls, hosts: list[str]):
+    def validate_host_lists(cls, hosts: list[str]):
         cleaned = []
         for host in hosts:
-            value = host.strip().lower().rstrip(".")
+            value = normalized_host(host)
             if not value or "/" in value or "://" in value:
-                raise ValueError(f"Resource host must be a hostname: {host}")
+                raise ValueError(f"Configured host must be a hostname: {host}")
             cleaned.append(value)
         return list(dict.fromkeys(cleaned))
-
-
-def normalized_host(host: str) -> str:
-    return host.strip().lower().rstrip(".")
 
 
 def portal_boundary_host(host: str) -> str:
@@ -198,7 +208,11 @@ def host_in_scope(host: str, root_host: str, allow_subdomains: bool) -> bool:
 
 def url_in_scope(candidate: str, root_host: str, allow_subdomains: bool) -> bool:
     parsed = urlparse(candidate)
-    return bool(parsed.scheme in {"http", "https"} and parsed.hostname and host_in_scope(parsed.hostname, root_host, allow_subdomains))
+    return bool(
+        parsed.scheme in {"http", "https"}
+        and parsed.hostname
+        and host_in_scope(parsed.hostname, root_host, allow_subdomains)
+    )
 
 
 def evaluate_navigation_scope(
@@ -207,52 +221,32 @@ def evaluate_navigation_scope(
     root_host: str,
     allow_subdomains: bool,
 ) -> tuple[str, str, bool]:
+    """Backward-compatible helper that now describes crawler scope only."""
     requested = urlparse(requested_url)
     final = urlparse(final_url)
     requested_host = normalized_host(requested.hostname or "")
     final_host = normalized_host(final.hostname or "")
-    accepted = bool(
-        final.scheme in {"http", "https"}
-        and final_host
-        and host_in_scope(final_host, root_host, allow_subdomains)
+    return (
+        requested_host,
+        final_host,
+        bool(final_host and url_in_scope(final_url, root_host, allow_subdomains)),
     )
-    return requested_host, final_host, accepted
 
 
 def sanitized_url(value: str, *, include_path: bool = True) -> str:
-    parsed = urlparse(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return "[redacted-url]"
-    host = normalized_host(parsed.hostname)
-    display_host = f"[{host}]" if ":" in host else host
-    try:
-        port = parsed.port
-    except ValueError:
-        port = None
-    netloc = f"{display_host}:{port}" if port is not None else display_host
-    path = parsed.path if include_path else ""
-    return f"{parsed.scheme}://{netloc}{path or ''}"
+    return sanitize_url(value, include_path=include_path)
 
 
 def sanitized_diagnostic(value: str) -> str:
     first_line = value.splitlines()[0] if value else "Unknown navigation error"
-    return URL_IN_MESSAGE_RE.sub(
-        lambda match: sanitized_url(match.group(0), include_path=False),
-        first_line,
-    )[:1000]
+    return sanitize_text(first_line, limit=1000)
 
 
 async def validate_destination(host: str, allow_private: bool) -> None:
     try:
-        infos = await asyncio.to_thread(socket.getaddrinfo, host, None, type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
-        raise HTTPException(400, f"Cannot resolve target host: {exc}") from exc
-    for raw_ip in {info[4][0] for info in infos}:
-        ip = ipaddress.ip_address(raw_ip.split("%", 1)[0])
-        if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved:
-            raise HTTPException(400, f"Blocked destination address: {ip}")
-        if ip.is_private and not allow_private:
-            raise HTTPException(400, "Private-network target requires explicit approval")
+        await resolve_and_validate(host, allow_private)
+    except DestinationError as exc:
+        raise HTTPException(400, exc.public_message) from exc
 
 
 def storage_state_path(profile: str | None) -> Path:
@@ -282,6 +276,23 @@ def auth_headers(authentication: Authentication) -> dict[str, str]:
     return {}
 
 
+def headers_for_destination(
+    request_headers: dict[str, str],
+    sensitive_headers: dict[str, str],
+    destination_host: str,
+    credential_hosts: set[str],
+) -> dict[str, str]:
+    """Attach scan credentials only to explicitly approved destination hosts."""
+    headers = request_headers.copy()
+    sensitive_names = {name.lower() for name in sensitive_headers}
+    for header_name in list(headers):
+        if header_name.lower() in sensitive_names:
+            headers.pop(header_name, None)
+    if normalized_host(destination_host) in credential_hosts:
+        headers.update(sensitive_headers)
+    return headers
+
+
 def classify_page_result(
     *,
     url: str,
@@ -291,24 +302,28 @@ def classify_page_result(
     console_errors: list[str],
     failed_resources: list[dict],
     security_headers_tested: bool,
+    authentication_classification: str | None = None,
 ) -> dict[str, str | int | bool | None]:
     loaded = error is None and status is not None
+    classification = authentication_classification
+    if classification is None:
+        if error:
+            classification = classify_navigation_error(error)
+        elif status == 401:
+            classification = "AUTH_REQUIRED"
+        elif status == 403:
+            classification = "ACCESS_RESTRICTED"
+        elif status is not None and status >= 400:
+            classification = "HTTP_ERROR"
+        else:
+            classification = "PASS"
+
+    category = "TLS_CERTIFICATE_ERROR" if classification == "TLS_ERROR" else (
+        None if classification == "PASS" else classification
+    )
     page_load_status = "LOADED" if loaded else "FAILED_TO_LOAD"
 
-    if error and TLS_ERROR_RE.search(error):
-        category = "TLS_CERTIFICATE_ERROR"
-    elif error and "outside the approved portal scope" in error:
-        category = "SCOPE_VIOLATION"
-    elif error and "Timeout" in error:
-        category = "TIMEOUT"
-    elif error:
-        category = "PAGE_LOAD_ERROR"
-    elif status is not None and status >= 400:
-        category = "HTTP_ERROR"
-    else:
-        category = None
-
-    if category == "TLS_CERTIFICATE_ERROR":
+    if classification == "TLS_ERROR":
         tls_status = "UNTRUSTED"
         tls_basis = "BROWSER_CERTIFICATE_VALIDATION"
         tls_detail = "Chromium rejected the HTTPS certificate chain."
@@ -338,9 +353,13 @@ def classify_page_result(
         + len(failed_resources)
         + int(bool(status is not None and status >= 400))
     )
-    if not loaded:
+    auth_incomplete = classification in {
+        "AUTH_REQUIRED", "AUTH_TIMEOUT", "MFA_REQUIRED", "SESSION_EXPIRED",
+    }
+    hard_failure = classification in {"AUTH_FAILED", "ACCESS_RESTRICTED", "HTTP_ERROR"}
+    if not loaded or auth_incomplete:
         validation_status = "NOT_TESTED"
-    elif status is not None and status >= 400:
+    elif hard_failure:
         validation_status = "FAIL"
     elif findings:
         validation_status = "WARNING"
@@ -349,6 +368,7 @@ def classify_page_result(
         validation_status = "PASS"
 
     return {
+        "classification": classification,
         "page_load_status": page_load_status,
         "validation_status": validation_status,
         "category": category,
@@ -357,7 +377,7 @@ def classify_page_result(
         "tls_detail": tls_detail,
         "security_headers_status": security_headers_status,
         "findings": findings,
-        "passed": loaded and validation_status != "FAIL",
+        "passed": loaded and classification == "PASS" and validation_status != "FAIL",
     }
 
 
@@ -371,8 +391,53 @@ async def configure_cookies(context: BrowserContext, req: ScanRequest, root_host
         domain = normalized_host(cookie.domain or root_host)
         if not host_in_scope(domain.lstrip("."), root_host, req.allow_subdomains):
             raise HTTPException(400, f"Cookie domain is outside the approved portal scope: {domain}")
-        cookies.append({"name": cookie.name, "value": cookie.value.get_secret_value(), "domain": domain, "path": cookie.path, "secure": cookie.secure, "httpOnly": cookie.http_only, "sameSite": cookie.same_site})
+        cookies.append({
+            "name": cookie.name,
+            "value": cookie.value.get_secret_value(),
+            "domain": domain,
+            "path": cookie.path,
+            "secure": cookie.secure,
+            "httpOnly": cookie.http_only,
+            "sameSite": cookie.same_site,
+        })
     await context.add_cookies(cookies)
+
+
+async def detect_auth_signals(page) -> tuple[bool, bool]:
+    try:
+        password_form = await page.locator("input[type=password]").count() > 0
+        mfa_form = await page.locator(
+            "input[autocomplete=one-time-code], input[inputmode=numeric][maxlength]"
+        ).count() > 0
+        return password_form, mfa_form
+    except Exception:
+        return False, False
+
+
+def partition_links(
+    links: list[str],
+    root_host: str,
+    allow_subdomains: bool,
+) -> tuple[list[str], list[str]]:
+    crawl_links: list[str] = []
+    external_links: list[str] = []
+    seen_crawl: set[str] = set()
+    seen_external: set[str] = set()
+    for link in links:
+        clean = urldefrag(link).url
+        parsed = urlparse(clean)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            continue
+        if url_in_scope(clean, root_host, allow_subdomains):
+            if clean not in seen_crawl:
+                crawl_links.append(clean)
+                seen_crawl.add(clean)
+        else:
+            safe_link = sanitized_url(clean)
+            if safe_link not in seen_external:
+                external_links.append(safe_link)
+                seen_external.add(safe_link)
+    return crawl_links, external_links
 
 
 @app.get("/", include_in_schema=False)
@@ -389,22 +454,44 @@ async def healthz():
 async def auth_profiles():
     if not AUTH_STATE_DIR.is_dir():
         return {"profiles": []}
-    return {"profiles": sorted(path.stem for path in AUTH_STATE_DIR.glob("*.json") if PROFILE_RE.fullmatch(path.stem))}
+    return {
+        "profiles": sorted(
+            path.stem for path in AUTH_STATE_DIR.glob("*.json")
+            if PROFILE_RE.fullmatch(path.stem)
+        )
+    }
+
+
+async def _resolve_with_logging(host: str, req: ScanRequest, scan_id: str) -> list[str]:
+    log_event(logging.INFO, "DNS_RESOLUTION_STARTED", scan_id=scan_id, hostname=host)
+    addresses = await resolve_and_validate(host, req.allow_private_networks)
+    log_event(
+        logging.INFO,
+        "DNS_RESOLUTION_COMPLETED",
+        scan_id=scan_id,
+        hostname=host,
+        address_count=len(addresses),
+    )
+    return addresses
 
 
 @app.post("/api/scan")
 async def scan(req: ScanRequest):
-    parsed = urlparse(req.target.strip())
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
-        raise HTTPException(400, "Target must be an http(s) URL without embedded credentials")
+    scan_id = str(uuid.uuid4())
+    requested_target = urldefrag(req.target.strip()).url
+    log_event(logging.INFO, "SCAN_STARTED", scan_id=scan_id, requested_url=requested_target)
     try:
-        port = parsed.port
-    except ValueError as exc:
-        raise HTTPException(400, "Target contains an invalid port") from exc
-    if port not in {None, 80, 443, 8080, 8443}:
-        raise HTTPException(400, "Target port is not allowed")
-    root_host = normalized_host(parsed.hostname)
-    await validate_destination(root_host, req.allow_private_networks)
+        root_host, _port = validate_http_url(requested_target)
+    except DestinationError as exc:
+        log_event(logging.ERROR, "SCAN_FAILED", scan_id=scan_id, classification=exc.classification, error=exc.public_message)
+        raise HTTPException(400, exc.public_message) from exc
+    log_event(logging.INFO, "URL_VALIDATED", scan_id=scan_id, requested_url=requested_target, hostname=root_host)
+    try:
+        await _resolve_with_logging(root_host, req, scan_id)
+    except DestinationError as exc:
+        log_event(logging.ERROR, exc.classification, scan_id=scan_id, hostname=root_host, error=exc.public_message)
+        raise HTTPException(400, exc.public_message) from exc
+
     if req.allow_mutations and not req.mutation_acknowledged:
         raise HTTPException(400, "Mutation testing requires explicit acknowledgement")
     if req.allow_mutations and not req.mutation_endpoint_allowlist:
@@ -415,19 +502,32 @@ async def scan(req: ScanRequest):
 
     approved_resource_hosts = {normalized_host(host) for host in req.resource_hosts}
     for host in approved_resource_hosts:
-        await validate_destination(host, req.allow_private_networks)
+        try:
+            await _resolve_with_logging(host, req, scan_id)
+        except DestinationError as exc:
+            raise HTTPException(400, exc.public_message) from exc
+
+    boundary = portal_boundary_host(root_host)
+    credential_hosts = {boundary, f"www.{boundary}"}
+    for host in req.credential_hosts:
+        if not host_in_scope(host, root_host, req.allow_subdomains):
+            raise HTTPException(400, "Credential host must remain inside the configured crawl scope")
+        try:
+            await _resolve_with_logging(host, req, scan_id)
+        except DestinationError as exc:
+            raise HTTPException(400, exc.public_message) from exc
+        credential_hosts.add(host)
+
     sensitive_headers = auth_headers(req.authentication)
-    state_path = storage_state_path(req.authentication.storage_profile) if req.authentication.mode == "storage_state" else None
-    run_id = str(uuid.uuid4())
-    results: list[dict] = []
-    queue = deque([(urldefrag(req.target.strip()).url, 0)])
-    seen: set[str] = set()
-    LOGGER.info(
-        "Portal scan started run_id=%s requested_host=%s allow_subdomains=%s",
-        run_id,
-        root_host,
-        req.allow_subdomains,
+    state_path = (
+        storage_state_path(req.authentication.storage_profile)
+        if req.authentication.mode == "storage_state"
+        else None
     )
+    results: list[dict] = []
+    queue = deque([(requested_target, 0)])
+    seen: set[str] = set()
+    deadline = time.perf_counter() + (req.total_timeout_ms / 1000)
 
     async with SCAN_SEMAPHORE:
         async with async_playwright() as playwright:
@@ -435,6 +535,7 @@ async def scan(req: ScanRequest):
                 headless=True,
                 args=["--disable-dev-shm-usage"],
             )
+            log_event(logging.INFO, "BROWSER_LAUNCHED", scan_id=scan_id)
             try:
                 context_args = {"ignore_https_errors": False, "service_workers": "block"}
                 if state_path:
@@ -444,67 +545,94 @@ async def scan(req: ScanRequest):
                 page = await context.new_page()
                 console_errors: list[str] = []
                 failed_resources: list[dict] = []
-                blocked_main_navigation_host: str | None = None
-                blocked_main_navigation_url: str | None = None
+                current_tracker: NavigationTracker | None = None
+                navigation_policy_error: DestinationError | None = None
+                navigation_hosts: set[str] = set()
 
                 def record_console_error(message):
                     if message.type == "error":
                         console_errors.append(sanitized_diagnostic(message.text))
 
-                def record_failed_request(request):
+                def is_main_navigation(request) -> bool:
                     try:
-                        is_main_document = bool(
-                            request.is_navigation_request()
-                            and request.frame == page.main_frame
-                        )
+                        return bool(request.is_navigation_request() and request.frame == page.main_frame)
                     except Exception:
-                        is_main_document = False
+                        return False
+
+                def record_failed_request(request):
                     failed_resources.append({
                         "url": sanitized_url(request.url),
                         "error": sanitized_diagnostic(request.failure or "Request failed"),
                         "resource_type": request.resource_type,
-                        "main_document": is_main_document,
+                        "main_document": is_main_navigation(request),
                     })
+
+                def record_response(response):
+                    if current_tracker is None or not is_main_navigation(response.request):
+                        return
+                    current_tracker.record_response(response.url, response.status)
+                    log_event(
+                        logging.INFO,
+                        "HTTP_RESPONSE",
+                        scan_id=scan_id,
+                        current_url=response.url,
+                        http_status=response.status,
+                    )
 
                 page.on("console", record_console_error)
                 page.on("requestfailed", record_failed_request)
+                page.on("response", record_response)
 
                 async def route_guard(route: Route):
-                    nonlocal blocked_main_navigation_host, blocked_main_navigation_url
+                    nonlocal navigation_policy_error
                     request = route.request
                     request_url = urlparse(request.url)
                     host = normalized_host(request_url.hostname or "")
                     portal_scoped = bool(host and host_in_scope(host, root_host, req.allow_subdomains))
                     resource_scoped = host in approved_resource_hosts
-                    try:
-                        is_main_navigation = bool(
-                            request.is_navigation_request()
-                            and request.frame == page.main_frame
-                        )
-                    except Exception:
-                        is_main_navigation = False
-                    if request.is_navigation_request() and not portal_scoped:
-                        if is_main_navigation:
-                            blocked_main_navigation_host = host
-                            blocked_main_navigation_url = sanitized_url(request.url)
-                            LOGGER.warning(
-                                "Rejected out-of-scope redirect run_id=%s final_host=%s",
-                                run_id,
-                                host or "unknown",
+                    main_navigation = is_main_navigation(request)
+                    if main_navigation:
+                        try:
+                            validated_host, _ = validate_http_url(request.url)
+                            await _resolve_with_logging(validated_host, req, scan_id)
+                            if current_tracker is None:
+                                raise DestinationError("NAVIGATION_ERROR", "Navigation tracker is unavailable")
+                            current_tracker.record_destination(request.url)
+                            navigation_hosts.add(validated_host)
+                        except DestinationError as exc:
+                            navigation_policy_error = exc
+                            log_event(
+                                logging.ERROR,
+                                exc.classification,
+                                scan_id=scan_id,
+                                current_url=request.url,
+                                hostname=host,
+                                error=exc.public_message,
                             )
+                            await route.abort("blockedbyclient")
+                            return
+                    elif request_url.scheme not in {"http", "https"} or not (
+                        portal_scoped or resource_scoped or host in navigation_hosts
+                    ):
                         await route.abort("blockedbyclient")
                         return
-                    if request_url.scheme not in {"http", "https"} or not (portal_scoped or resource_scoped):
-                        await route.abort("blockedbyclient")
-                        return
+
                     if request.method.upper() in MUTATING_METHODS:
-                        allowed = req.allow_mutations and portal_scoped and any(request_url.path.startswith(prefix) for prefix in req.mutation_endpoint_allowlist)
+                        allowed = (
+                            req.allow_mutations
+                            and portal_scoped
+                            and any(request_url.path.startswith(prefix) for prefix in req.mutation_endpoint_allowlist)
+                        )
                         if not allowed:
                             await route.abort("blockedbyclient")
                             return
-                    headers = request.headers.copy()
-                    if portal_scoped:
-                        headers.update(sensitive_headers)
+
+                    headers = headers_for_destination(
+                        request.headers,
+                        sensitive_headers,
+                        host,
+                        credential_hosts,
+                    )
                     await route.continue_(headers=headers)
 
                 await context.route("**/*", route_guard)
@@ -513,99 +641,153 @@ async def scan(req: ScanRequest):
                     if url in seen or depth > req.max_depth:
                         continue
                     seen.add(url)
+                    current_tracker = NavigationTracker(req.max_redirects)
+                    navigation_policy_error = None
+                    navigation_hosts.clear()
                     requested_url = sanitized_url(url)
                     requested_host = normalized_host(urlparse(url).hostname or "")
                     final_url: str | None = None
-                    final_host = ""
-                    blocked_main_navigation_host = None
-                    blocked_main_navigation_url = None
+                    final_raw_url = url
                     console_start, failed_start = len(console_errors), len(failed_resources)
                     started = time.perf_counter()
-                    status = title = error = None
-                    headers: dict[str, str] = {}
+                    status: int | None = None
+                    title: str | None = None
+                    error: str | None = None
+                    error_classification: str | None = None
+                    authentication_classification: str | None = None
+                    response_headers: dict[str, str] = {}
                     links: list[str] = []
-                    LOGGER.info(
-                        "Portal navigation started run_id=%s requested_host=%s depth=%d",
-                        run_id,
-                        requested_host,
-                        depth,
-                    )
-                    try:
-                        response = await page.goto(url, wait_until="domcontentloaded", timeout=req.timeout_ms)
-                        if response is None:
-                            raise RuntimeError("Navigation completed without an HTTP response")
-                        final_url = sanitized_url(page.url)
-                        requested_host, final_host, navigation_accepted = evaluate_navigation_scope(
-                            url,
-                            page.url,
-                            root_host,
-                            req.allow_subdomains,
+                    external_links: list[str] = []
+                    redirects: list[dict] = []
+                    remaining_ms = max(0, round((deadline - time.perf_counter()) * 1000))
+                    if remaining_ms == 0:
+                        error = "Total scan timeout exceeded"
+                        error_classification = "TIMEOUT"
+                    else:
+                        log_event(
+                            logging.INFO,
+                            "NAVIGATION_STARTED",
+                            scan_id=scan_id,
+                            requested_url=url,
+                            hostname=requested_host,
+                            page_number=len(results) + 1,
+                            crawl_depth=depth,
                         )
-                        LOGGER.info(
-                            "Portal navigation completed run_id=%s requested_host=%s final_host=%s",
-                            run_id,
-                            requested_host,
-                            final_host,
-                        )
-                        if not navigation_accepted:
-                            LOGGER.warning(
-                                "Rejected out-of-scope redirect run_id=%s requested_host=%s final_host=%s",
-                                run_id,
-                                requested_host,
-                                final_host or "unknown",
+                        try:
+                            response = await page.goto(
+                                url,
+                                wait_until="domcontentloaded",
+                                timeout=min(req.timeout_ms, remaining_ms),
                             )
-                            raise RuntimeError(
-                                "Navigation redirected outside the approved portal scope: "
-                                f"requested_host={requested_host} final_host={final_host or 'unknown'}"
+                            if response is None:
+                                raise RuntimeError("Navigation completed without an HTTP response")
+                            final_raw_url = page.url
+                            final_url = sanitized_url(final_raw_url)
+                            redirects = current_tracker.redirects()
+                            for redirect in redirects:
+                                log_event(logging.INFO, "REDIRECT_DETECTED", scan_id=scan_id, **redirect)
+                                if not redirect["same_origin"]:
+                                    log_event(logging.INFO, "CROSS_ORIGIN_REDIRECT", scan_id=scan_id, **redirect)
+                            status = response.status
+                            response_headers = await response.all_headers()
+                            title = sanitize_text(await page.title(), limit=512)
+                            final_in_scope = url_in_scope(final_raw_url, root_host, req.allow_subdomains)
+                            password_form, mfa_form = await detect_auth_signals(page)
+                            authentication_classification = classify_authentication(
+                                authentication_mode=req.authentication.mode,
+                                status=status,
+                                final_url=final_raw_url,
+                                target_in_scope=final_in_scope,
+                                error_classification=None,
+                                password_form=password_form,
+                                mfa_form=mfa_form,
                             )
-                        if requested_host != final_host:
-                            LOGGER.info(
-                                "Accepted in-scope redirect run_id=%s requested_host=%s final_host=%s",
-                                run_id,
-                                requested_host,
-                                final_host,
+                            log_event(
+                                logging.INFO,
+                                "PAGE_LOADED",
+                                scan_id=scan_id,
+                                final_url=final_raw_url,
+                                hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
+                                http_status=status,
+                                redirect_count=len(redirects),
+                                classification=authentication_classification,
                             )
-                        status = response.status if response else None
-                        headers = await response.all_headers() if response else {}
-                        title = await page.title()
-                        if req.check_links:
-                            links = await page.locator("a[href]").evaluate_all("elements => elements.map(element => element.href)")
-                            if depth < req.max_depth:
-                                for link in links:
-                                    clean = urldefrag(link).url
-                                    path = urlparse(clean).path.lower()
-                                    if clean and url_in_scope(clean, root_host, req.allow_subdomains) and not any(word in path for word in DANGEROUS_PATH_WORDS) and clean not in seen:
-                                        queue.append((clean, depth + 1))
-                    except Exception as exc:
-                        if blocked_main_navigation_host:
-                            final_host = blocked_main_navigation_host
-                            final_url = blocked_main_navigation_url
-                            error = (
-                                "Navigation redirected outside the approved portal scope: "
-                                f"requested_host={requested_host} final_host={final_host}"
+                            if authentication_classification != "PASS":
+                                log_event(
+                                    logging.WARNING,
+                                    authentication_classification,
+                                    scan_id=scan_id,
+                                    final_url=final_raw_url,
+                                )
+                            log_event(logging.INFO, "PAGE_VALIDATION_STARTED", scan_id=scan_id, final_url=final_raw_url)
+                            if req.check_links:
+                                links = await page.locator("a[href]").evaluate_all(
+                                    "elements => elements.map(element => element.href)"
+                                )
+                                crawl_links, external_links = partition_links(
+                                    links,
+                                    root_host,
+                                    req.allow_subdomains,
+                                )
+                                if external_links:
+                                    log_event(
+                                        logging.INFO,
+                                        "EXTERNAL_LINK_SKIPPED",
+                                        scan_id=scan_id,
+                                        count=len(external_links),
+                                    )
+                                if final_in_scope and depth < req.max_depth:
+                                    for link in crawl_links:
+                                        path = urlparse(link).path.lower()
+                                        if not any(word in path for word in DANGEROUS_PATH_WORDS) and link not in seen:
+                                            queue.append((link, depth + 1))
+                                            log_event(
+                                                logging.DEBUG,
+                                                "LINK_DISCOVERED",
+                                                scan_id=scan_id,
+                                                current_url=link,
+                                                crawl_depth=depth + 1,
+                                            )
+                        except Exception as exc:
+                            if navigation_policy_error is not None:
+                                error = navigation_policy_error.public_message
+                                error_classification = navigation_policy_error.classification
+                            else:
+                                error = sanitized_diagnostic(str(exc))
+                                error_classification = classify_navigation_error(error)
+                            final_raw_url = page.url if page.url.startswith(("http://", "https://")) else url
+                            final_url = sanitized_url(final_raw_url)
+                            redirects = current_tracker.redirects()
+                            authentication_classification = classify_authentication(
+                                authentication_mode=req.authentication.mode,
+                                status=status,
+                                final_url=final_raw_url,
+                                target_in_scope=url_in_scope(final_raw_url, root_host, req.allow_subdomains),
+                                error_classification=error_classification,
                             )
-                        else:
-                            error = sanitized_diagnostic(str(exc))
-                        LOGGER.warning(
-                            "Main navigation failed run_id=%s requested_host=%s final_host=%s error=%s",
-                            run_id,
-                            requested_host,
-                            final_host or "unknown",
-                            error,
-                        )
+                            log_event(
+                                logging.ERROR,
+                                error_classification,
+                                scan_id=scan_id,
+                                requested_url=url,
+                                final_url=final_raw_url,
+                                error=error,
+                            )
+
                     elapsed = round((time.perf_counter() - started) * 1000)
-                    header_report = {name: headers.get(name) for name in SECURITY_HEADERS} if req.check_security_headers else {}
+                    header_report = {
+                        name: response_headers.get(name) for name in SECURITY_HEADERS
+                    } if req.check_security_headers else {}
                     page_console = console_errors[console_start:] if req.check_console else []
                     page_failures = failed_resources[failed_start:] if req.check_resources else []
-                    subresource_failures = sum(
-                        not failure["main_document"] for failure in page_failures
-                    )
+                    subresource_failures = sum(not failure["main_document"] for failure in page_failures)
                     if subresource_failures:
-                        LOGGER.warning(
-                            "Subresource failures recorded run_id=%s requested_host=%s count=%d",
-                            run_id,
-                            requested_host,
-                            subresource_failures,
+                        log_event(
+                            logging.WARNING,
+                            "SUBRESOURCE_FAILURES",
+                            scan_id=scan_id,
+                            hostname=requested_host,
+                            count=subresource_failures,
                         )
                     missing_headers = [name for name, value in header_report.items() if not value]
                     classification = classify_page_result(
@@ -616,35 +798,62 @@ async def scan(req: ScanRequest):
                         console_errors=page_console,
                         failed_resources=page_failures,
                         security_headers_tested=req.check_security_headers,
+                        authentication_classification=authentication_classification or error_classification,
                     )
-                    results.append({
+                    result = {
                         "url": final_url or requested_url,
                         "requested_url": requested_url,
                         "final_url": final_url,
-                        "depth": depth, "status": status, "title": title,
-                        "load_ms": elapsed if req.check_performance else None, "error": error,
-                        "links_found": len(links), "console_errors": page_console,
-                        "failed_resources": page_failures, "security_headers": header_report,
+                        "depth": depth,
+                        "status": status,
+                        "title": title,
+                        "load_ms": elapsed if req.check_performance else None,
+                        "error": error,
+                        "redirect_count": len(redirects),
+                        "redirects": redirects,
+                        "links_found": len(links),
+                        "external_links_found": len(external_links),
+                        "external_links": external_links[:100],
+                        "console_errors": page_console,
+                        "failed_resources": page_failures,
+                        "security_headers": header_report,
                         "missing_security_headers": missing_headers,
                         **classification,
-                    })
+                    }
+                    results.append(result)
+                    log_event(
+                        logging.INFO,
+                        "PAGE_VALIDATION_COMPLETED",
+                        scan_id=scan_id,
+                        final_url=final_raw_url,
+                        classification=result["classification"],
+                        elapsed_ms=elapsed,
+                    )
+                    if time.perf_counter() >= deadline:
+                        break
                 await context.close()
             finally:
                 await browser.close()
 
     load_counts = Counter(result["page_load_status"] for result in results)
     validation_counts = Counter(result["validation_status"] for result in results)
+    classification_counts = Counter(result["classification"] for result in results)
     trust_status: TrustStatus = getattr(app.state, "trust_status", TrustStatus(enabled=False))
-    LOGGER.info(
-        "Portal scan completed run_id=%s pages=%d loaded=%d failed_to_load=%d findings=%d",
-        run_id,
-        len(results),
-        load_counts["LOADED"],
-        load_counts["FAILED_TO_LOAD"],
-        sum(result["findings"] for result in results),
+    log_event(
+        logging.INFO,
+        "SCAN_COMPLETED",
+        scan_id=scan_id,
+        pages=len(results),
+        loaded=load_counts["LOADED"],
+        failed_to_load=load_counts["FAILED_TO_LOAD"],
+        findings=sum(result["findings"] for result in results),
+        classification=dict(classification_counts),
     )
     return {
-        "run_id": run_id, "target": sanitized_url(req.target), "pages": len(results),
+        "scan_id": scan_id,
+        "run_id": scan_id,
+        "target": sanitized_url(req.target),
+        "pages": len(results),
         "summary": {
             "loaded": load_counts["LOADED"],
             "failed_to_load": load_counts["FAILED_TO_LOAD"],
@@ -652,13 +861,20 @@ async def scan(req: ScanRequest):
             "warning": validation_counts["WARNING"],
             "fail": validation_counts["FAIL"],
             "not_tested": validation_counts["NOT_TESTED"],
-            # Retain the original aggregate fields for existing API consumers.
-            # A loaded page with warnings remains successful for this legacy view.
             "passed": validation_counts["PASS"] + validation_counts["WARNING"],
             "failed": validation_counts["FAIL"] + load_counts["FAILED_TO_LOAD"],
             "findings": sum(result["findings"] for result in results),
             "duration_ms": sum(result["load_ms"] or 0 for result in results),
+            "classifications": dict(classification_counts),
         },
         "results": results,
-        "safety": {"navigation_scope": root_host, "subdomains_enabled": req.allow_subdomains, "private_network_enabled": req.allow_private_networks, "mutations_enabled": req.allow_mutations, "authentication_mode": req.authentication.mode, "corporate_ca_trust": trust_status.enabled},
+        "safety": {
+            "crawl_scope": root_host,
+            "navigation_redirects": "cross-origin-with-network-policy",
+            "subdomains_enabled": req.allow_subdomains,
+            "private_network_enabled": req.allow_private_networks,
+            "mutations_enabled": req.allow_mutations,
+            "authentication_mode": req.authentication.mode,
+            "corporate_ca_trust": trust_status.enabled,
+        },
     }

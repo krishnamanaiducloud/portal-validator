@@ -1,150 +1,205 @@
 # Portal Validator
 
-A browser-based validator for public, private, and authenticated web portals. It crawls an explicitly bounded host with Chromium and reports broken pages, JavaScript errors, failed resources, performance, and missing security headers.
+Portal Validator 1.2.1 is a browser-based HTTP/HTTPS validator for public,
+private, and authenticated portals. It follows real browser redirects,
+classifies authentication outcomes, crawls a controlled portal scope, and
+reports load, TLS, HTTP, console, resource, performance, and security-header
+results without disabling certificate verification.
 
-Targets may be entered as a hostname such as `google.com` or as an HTTP(S) URL;
-bare hostnames default to HTTPS.
+Targets may be hostnames (`google.com`, `www.google.com`) or complete HTTP(S)
+URLs. Bare hostnames default to HTTPS.
 
-## Authentication modes
+## Navigation, crawl, and network safety
 
-- Anonymous/public portal
-- HTTP Basic credentials
-- Bearer or API token
-- Custom request headers
-- Session cookies
-- Playwright storage-state profiles for SSO, SAML, OIDC, MFA, and other interactive login flows
+Browser navigation and crawling intentionally have different boundaries:
 
-Sensitive headers are attached only to the approved portal hostname or its explicitly enabled subdomains. Secrets are held for one request and are not returned in reports. For SSO, complete authentication through an approved Playwright workflow, save its storage state as `<profile>.json`, and mount it read-only at `/auth`.
+- Main-frame HTTP/HTTPS redirects may cross origins for generic SSO flows.
+- Every main-frame destination is parsed, DNS-resolved, and checked before it
+  is allowed. Loopback, link-local, multicast, reserved, unspecified, and
+  cloud-metadata addresses are blocked. Private addresses require explicit
+  per-scan approval.
+- Redirect chains are bounded, loop-checked, sanitized, and returned in the
+  report.
+- Discovered links are crawled only on the original hostname and its equivalent
+  `www` form. `Include subdomains` expands that crawl boundary using DNS-label
+  matching; external links are reported but not crawled.
+- Optional resource hosts allow only subresources, not recursive crawling.
+- Scan-supplied Basic, bearer, and custom-header credentials are sent only to
+  approved credential hosts. Browser cookie domain rules remain in effect.
+- Mutating methods are blocked unless the caller explicitly acknowledges them
+  and supplies safe portal-scoped path prefixes.
+- Only ports 80, 443, 8080, and 8443 are accepted.
 
-## Safety boundaries
+Authentication modes are anonymous, HTTP Basic, bearer/token, custom headers,
+cookies, and mounted Playwright `storage_state`. Reports use generic behavioral
+classifications such as `PASS`, `AUTH_REQUIRED`, `AUTH_FAILED`, `AUTH_TIMEOUT`,
+`MFA_REQUIRED`, `SESSION_EXPIRED`, `ACCESS_RESTRICTED`, `TLS_ERROR`,
+`DNS_ERROR`, `NETWORK_ERROR`, `TIMEOUT`, `HTTP_ERROR`, and `NAVIGATION_ERROR`.
 
-- Navigation stays on the target hostname and its equivalent `www`/non-`www`
-  form unless subdomains are explicitly enabled.
-- CDN/API hosts are separate, explicit resource-only allowances.
-- Loopback, link-local, multicast, reserved, and unspecified addresses are blocked.
-- Private-network scanning requires explicit per-scan approval.
-- `POST`, `PUT`, `PATCH`, and `DELETE` are blocked by default.
-- Mutation traffic requires acknowledgement and path-prefix allowlisting.
-- Only ports 80, 443, 8080, and 8443 are permitted.
+Treat `storage_state` files as secrets: generate them through an approved
+authentication workflow, store them in an OpenShift Secret, mount them
+read-only at `/auth`, restrict access, rotate them, and never commit them.
 
-Run this service only for portals you are authorized to test. Protect the validator itself behind your organization’s access control because it can reach approved private targets and receive temporary credentials.
+Run this service only for systems you are authorized to validate, and protect
+the service itself with organizational access controls.
 
-## Production container
+## Enterprise CA trust
 
-Both images use the pinned Chainguard Python development image. The exact
-Playwright version pinned in `requirements.txt` installs and uses its matching
-Chromium revision under `/ms-playwright`; the application does not override it
-with a system Chrome executable. The application runs as UID/GID `10001`.
+The container entrypoint is the only trust writer. Before Uvicorn starts it:
+
+1. Reads the required managed bundle from
+   `PORTAL_VALIDATOR_MANAGED_CA_BUNDLE`.
+2. Recursively discovers `*.crt`, `*.pem`, and `*.cer` under the existing
+   `/etc/portal-validator/zscaler` mount by default. Colon-separated directory
+   overrides and legacy file inputs remain supported for compatibility.
+3. Parses every discovered X.509 certificate, rejects malformed/private-key
+   inputs, skips non-CA certificates, and fails if no usable self-signed root
+   is present.
+4. De-duplicates certificates and atomically writes `RUNTIME_CA_BUNDLE` under
+   the writable non-root home.
+5. Initializes `CHROMIUM_NSS_DB` with an empty password when needed and imports
+   only semantically validated self-signed enterprise roots with `C,,` trust.
+   Intermediates remain available in the PEM bundle but never receive NSS root
+   trust. The general managed bundle is never copied into NSS. Stable logical-
+   path nicknames and fingerprint checks make restarts idempotent and safely
+   handle ConfigMap certificate rotation without touching unrelated entries.
+6. Exports `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, and `CURL_CA_BUNDLE`, then
+   uses `exec` to start the original command.
+
+The OpenShift-managed ConfigMap remains read-only and is never overwritten.
+Certificates are mounted at deployment time, not baked into the image. TLS
+verification remains enabled (`ignore_https_errors=False`); no insecure bypass
+flags are used.
+
+Relevant environment variables:
+
+| Variable | Default / purpose |
+|---|---|
+| `HOME` | `/tmp/portal-validator-home` |
+| `PORTAL_VALIDATOR_MANAGED_CA_BUNDLE` | `/etc/portal-validator/certs/ca-bundle.crt` (required) |
+| `PORTAL_VALIDATOR_ADDITIONAL_CA_DIRS` | Colon-separated required directories; defaults to `/etc/portal-validator/zscaler` |
+| `PORTAL_VALIDATOR_BROWSER_CA_DIRS` | Optional browser-root override; defaults to the additional CA directories |
+| `PORTAL_VALIDATOR_ADDITIONAL_CA_FILES` | Legacy OS-path-separated required PEM files |
+| `PORTAL_VALIDATOR_OPTIONAL_CA_DIRS` | OS-path-separated optional certificate directories |
+| `RUNTIME_CA_BUNDLE` | `$HOME/.portal-validator/ca-bundle.crt` |
+| `CHROMIUM_NSS_DB` | `$HOME/.local/share/pki/nssdb` |
+| `PORTAL_VALIDATOR_TRUST_STATUS` | `$HOME/.portal-validator/trust-status.json` |
+| `LOG_LEVEL` | `INFO`; use `DEBUG` only for diagnostics |
+
+## Images
+
+The production image uses the pinned Chainguard Python base and Playwright
+1.63.0 with its matching Chromium revision under `/ms-playwright`. A build-time
+assertion fails the build if the expected browser is missing. The runtime keeps
+`certutil`, removes build tooling, and runs as UID/GID 10001 while remaining
+compatible with an arbitrary OpenShift UID.
+
+Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.1.3 .
+docker build -t mohankrishna999/portal-validator:1.2.1 .
+docker build -f Dockerfile-debug \
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.2.1 \
+  -t mohankrishna999/portal-validator:1.2.1-debug .
+```
+
+The debug image adds `debugpy`, hot reload, and port 5678. It inherits the same
+browser and trust initialization as production.
+
+For a local run, mount a complete managed bundle and approved corporate CA
+directory:
+
+```bash
 docker run --rm -p 8080:8080 \
-  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=256m \
-  -v ./auth:/auth:ro \
-  -v ./corporate-ca.pem:/etc/portal-validator/certs/ca-bundle.crt:ro \
-  -v ./zscaler-root-ca.crt:/etc/portal-validator/zscaler/zscaler-root-ca.crt:ro \
-  -e CORPORATE_CA_BUNDLE=/etc/portal-validator/certs/ca-bundle.crt \
-  mohankrishna999/portal-validator:1.1.3
-```
-
-Open <http://localhost:8080>.
-
-## Debug container
-
-The debug image includes hot reload and a `debugpy` listener on port 5678.
-
-```bash
-docker build -f Dockerfile-debug -t mohankrishna999/portal-validator:1.1.3-debug .
-docker run --rm -p 8080:8080 -p 5678:5678 \
-  -v "$PWD/app:/app/app" -v "$PWD/auth:/auth:ro" \
-  -v ./zscaler-root-ca.crt:/etc/portal-validator/zscaler/zscaler-root-ca.crt:ro \
-  mohankrishna999/portal-validator:1.1.3-debug
-```
-
-## Tests
-
-```bash
-python -m pip install -r requirements.txt -r requirements-dev.txt
-pytest -q
-```
-
-Verify the Playwright-managed browser inside the production image:
-
-```bash
-docker run --rm -i --entrypoint python \
-  mohankrishna999/portal-validator:1.1.3 - <<'PY'
-from pathlib import Path
-from playwright.sync_api import sync_playwright
-
-with sync_playwright() as playwright:
-    path = Path(playwright.chromium.executable_path)
-    print("Playwright Chromium:", path)
-    print("Exists:", path.is_file())
-    browser = playwright.chromium.launch(
-        headless=True,
-        args=["--disable-dev-shm-usage"],
-    )
-    print("BROWSER LAUNCHED SUCCESSFULLY")
-    browser.close()
-PY
+  --read-only --tmpfs /tmp:rw,nosuid,size=512m \
+  -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
+  -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
+  mohankrishna999/portal-validator:1.2.1
 ```
 
 ## OpenShift
 
-The supplied manifest creates `portal-validator-trusted-ca` with the OpenShift
-`config.openshift.io/inject-trusted-cabundle=true` label. The Cluster Network
-Operator injects the cluster's merged public and organization CA bundle into
-`ca-bundle.crt`; the deployment mounts it read-only at
-`/etc/portal-validator/certs/ca-bundle.crt`.
-
-Ensure the internal corporate root CA is present in the cluster-wide additional
-trust bundle before deployment. If CA trust is managed only in this namespace,
-remove the injection label and create the ConfigMap explicitly instead:
+`openshift/deployment.yaml` creates an injection-labeled
+`portal-validator-trusted-ca` ConfigMap for the managed bundle. It mounts that
+bundle read-only and mounts every key from the existing combined
+`portal-validator-zscaler-ca` ConfigMap at `/etc/portal-validator/zscaler`.
+The cluster-managed ConfigMap is not modified and no additional CA ConfigMap is
+created:
 
 ```bash
-oc create configmap portal-validator-trusted-ca \
-  --from-file=ca-bundle.crt=./corporate-ca-chain.pem \
-  --dry-run=client -o yaml | oc apply -f -
+oc apply -f openshift/deployment.yaml
 ```
 
-Create the dedicated Zscaler root CA ConfigMap separately:
+The deployment disables service-account token mounting, runs non-root, drops
+all Linux capabilities, disallows privilege escalation, and uses the runtime
+default seccomp profile. `$HOME` under `/tmp` is ephemeral by design, so every
+new pod reconstructs trust from mounted ConfigMaps.
+
+Verify a fresh pod:
 
 ```bash
-oc create configmap portal-validator-zscaler-ca \
-  --from-file=zscaler-root-ca.crt=./zscaler-root-ca.crt \
-  --dry-run=client -o yaml | oc apply -f -
+oc logs deploy/portal-validator
+oc exec deploy/portal-validator -- sh -c \
+  'tr "\000" "\n" </proc/1/environ | grep -E "^(HOME|SSL_CERT_FILE|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|PORTAL_VALIDATOR_MANAGED_CA_BUNDLE|PORTAL_VALIDATOR_ADDITIONAL_CA_DIRS|PORTAL_VALIDATOR_BROWSER_CA_DIRS|RUNTIME_CA_BUNDLE|CHROMIUM_NSS_DB)="'
+oc exec deploy/portal-validator -- sh -c \
+  'grep -c "BEGIN CERTIFICATE" "$RUNTIME_CA_BUNDLE"'
+oc exec deploy/portal-validator -- sh -c \
+  'cat "$PORTAL_VALIDATOR_TRUST_STATUS"'
+oc exec deploy/portal-validator -- sh -c 'certutil -L -d "sql:$CHROMIUM_NSS_DB"'
+oc exec deploy/portal-validator -- curl --fail --show-error --location https://google.com
+oc exec -i deploy/portal-validator -- python - <<'PY'
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    path = Path(p.chromium.executable_path)
+    print("Playwright Chromium:", path, "exists:", path.is_file())
+    browser = p.chromium.launch(headless=True)
+    for url in ("https://google.com", "https://your-authorized-internal-portal.example"):
+        page = browser.new_page()
+        response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        print(url, "STATUS:", response.status if response else None, "TITLE:", page.title())
+        page.close()
+    browser.close()
+PY
 ```
 
-The container entrypoint requires this certificate and imports it as
-`Zscaler Root CA` with `C,,` trust into
-`sql:$HOME/.local/share/pki/nssdb` before Uvicorn starts. The import is
-idempotent, and startup fails if the mounted certificate is absent or cannot be
-imported. The certificate remains external to the image.
+## Development and reports
 
-The PEM file must contain the self-signed corporate root and any required
-intermediate certificates. At startup, Portal Validator combines it with the
-container's public CA bundle and imports it into Chromium's NSS database. An
-invalid configured bundle fails startup. TLS verification remains enabled;
-`ignore_https_errors` is never enabled.
+```bash
+python -m pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest -q
+```
 
-Create an optional `portal-validator-auth` secret containing SSO storage-state
-JSON files, then run `oc apply -f openshift/deployment.yaml`.
+Each result separates `page_load_status` (`LOADED`/`FAILED_TO_LOAD`) from
+`validation_status` (`PASS`/`WARNING`/`FAIL`/`NOT_TESTED`). Failed subresources
+remain findings and do not turn a successfully loaded main document into a load
+failure. `tls_status=TRUSTED` means Chromium completed certificate-chain
+validation; it does not claim independent inspection of the origin certificate
+when an enterprise TLS proxy is present.
 
-The deployment uses a non-root user, drops Linux capabilities, disables service-account token mounting, uses runtime-default seccomp, and mounts both the SSO secret and CA bundle read-only.
+Logs are structured JSON with a per-scan ID. URLs, query secrets, credentials,
+tokens, cookies, storage state, and certificate/private-key material are
+redacted or excluded at the centralized logging boundary.
 
-## Report status model
+## Troubleshooting classifications
 
-Each result reports page loading separately from validation:
-
-- `page_load_status`: `LOADED` or `FAILED_TO_LOAD`
-- `validation_status`: `PASS`, `WARNING`, `FAIL`, or `NOT_TESTED`
-- `tls_status`: `TRUSTED`, `UNTRUSTED`, `NOT_APPLICABLE`, or `NOT_TESTED`
-- `security_headers_status`: `PASS`, `WARNING`, or `NOT_TESTED`
-
-Missing optional security headers, console errors, or failed subresources make a
-successfully loaded page a `WARNING`; they do not turn it into a load failure.
-Certificate failures are reported as `FAILED_TO_LOAD` with category
-`TLS_CERTIFICATE_ERROR`, TLS `UNTRUSTED`, and security headers `NOT_TESTED`.
-TLS `TRUSTED` means Chromium completed HTTPS certificate-chain validation. It
-does not claim that the origin certificate was independently inspected, which
-is important when a corporate proxy such as Zscaler terminates TLS.
+- `TLS_ERROR`: Chromium rejected the certificate chain. Verify the managed and
+  additional CA mounts, entrypoint logs, runtime bundle, and NSS database; do
+  not add a TLS bypass.
+- `AUTH_REQUIRED`: the page exposed a login/authentication flow and no usable
+  authenticated session was supplied. Use an approved `storage_state` or other
+  supported mode.
+- `AUTH_FAILED` / `SESSION_EXPIRED`: supplied authentication was rejected or a
+  saved browser session returned to login. Rotate or recreate the secret.
+- `ACCESS_RESTRICTED`: the server returned 403 or an equivalent restricted
+  result. Confirm authorization and network policy.
+- `DNS_ERROR`: a destination did not resolve. Check cluster DNS and the exact
+  hostname.
+- `NETWORK_ERROR`: connection or SSRF policy blocked the destination. Private
+  networks require explicit approval; metadata, loopback, and link-local
+  destinations always remain blocked.
+- `TIMEOUT` / `AUTH_TIMEOUT`: increase per-page or total timeout only after
+  checking DNS, proxy, browser, and IdP latency.
+- `HTTP_ERROR`: navigation completed but the server returned an HTTP error.
+- `NAVIGATION_ERROR`: inspect the sanitized redirect chain and browser error;
+  common causes are malformed redirects, redirect loops, or redirect limits.
