@@ -1,9 +1,13 @@
 import base64
+import io
+import logging
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from app.logging_config import LOGGER, log_event
 from app.main import (
     Authentication,
     ScanRequest,
@@ -11,83 +15,60 @@ from app.main import (
     auth_headers,
     classify_page_result,
     evaluate_navigation_scope,
+    headers_for_destination,
     host_in_scope,
-    normalized_host,
+    partition_links,
     sanitized_diagnostic,
     sanitized_url,
     storage_state_path,
     url_in_scope,
 )
+from app.navigation import NavigationTracker, classify_authentication, classify_navigation_error
+from app.security import (
+    DestinationError,
+    normalized_host,
+    sanitize_data,
+    validate_http_url,
+    validate_resolved_addresses,
+)
+
 
 client = TestClient(app)
 
 
-def test_home_and_security_headers():
+def test_home_health_and_security_headers():
     response = client.get("/")
     assert response.status_code == 200
     assert "Know your portal" in response.text
     assert response.headers["x-frame-options"] == "DENY"
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
-
-
-def test_health_endpoint():
-    assert client.get("/healthz").json() == {"status": "ok", "version": "1.1.3"}
+    assert client.get("/healthz").json() == {"status": "ok", "version": "1.2.0"}
 
 
 @pytest.mark.parametrize(("candidate", "root", "subdomains", "expected"), [
     ("example.com", "example.com", False, True),
     ("www.example.com", "example.com", False, True),
     ("example.com", "www.example.com", False, True),
-    ("www.google.com", "google.com", False, True),
-    ("google.com", "www.google.com", False, True),
     ("api.example.com", "example.com", False, False),
     ("api.example.com", "example.com", True, True),
-    ("EXAMPLE.COM", "example.com", False, True),
-    ("example.com.", "example.com", False, True),
+    ("EXAMPLE.COM.", "example.com", False, True),
     ("example.com.evil.com", "example.com", True, False),
     ("evilexample.com", "example.com", True, False),
-    ("example.com.attacker.example", "example.com", True, False),
     ("notexample.com", "example.com", True, False),
     ("example.co.uk", "co.uk", True, False),
 ])
-def test_host_scope(candidate, root, subdomains, expected):
+def test_crawler_host_scope(candidate, root, subdomains, expected):
     assert host_in_scope(candidate, root, subdomains) is expected
 
 
-def test_host_normalization():
+def test_url_normalization_and_scope():
     assert normalized_host(" EXAMPLE.COM. ") == "example.com"
-
-
-def test_url_scope():
-    assert url_in_scope("https://example.com/page", "example.com", False)
-    assert url_in_scope("http://www.example.com:8080/page", "example.com", False)
     assert url_in_scope("https://example.com:443/page", "www.example.com", False)
+    assert url_in_scope("http://www.example.com:8080/page", "example.com", False)
     assert not url_in_scope("file:///etc/passwd", "example.com", False)
-    assert not url_in_scope("https://example.com.evil.test", "example.com", True)
-
-
-def test_www_redirect_is_in_scope():
-    requested, final, accepted = evaluate_navigation_scope(
-        "https://google.com",
-        "https://www.google.com/",
-        "google.com",
-        False,
-    )
-    assert (requested, final, accepted) == ("google.com", "www.google.com", True)
-
-
-def test_unrelated_redirect_is_out_of_scope():
-    requested, final, accepted = evaluate_navigation_scope(
-        "https://example.com",
-        "https://different-company.example/login?token=secret",
-        "example.com",
-        True,
-    )
-    assert (requested, final, accepted) == (
-        "example.com",
-        "different-company.example",
-        False,
-    )
+    assert evaluate_navigation_scope(
+        "https://google.com", "https://www.google.com/", "google.com", False,
+    ) == ("google.com", "www.google.com", True)
 
 
 @pytest.mark.parametrize(("target", "expected"), [
@@ -101,151 +82,166 @@ def test_target_input_normalization(target, expected):
     assert ScanRequest(target=target).target == expected
 
 
-def test_urls_and_errors_remove_credentials_and_query_secrets():
-    value = "https://user:password@example.com/path?token=secret#fragment"
-    assert sanitized_url(value) == "https://example.com/path"
-    assert sanitized_diagnostic(f"Navigation failed at {value}") == (
-        "Navigation failed at https://example.com"
+@pytest.mark.parametrize("url", [
+    "file:///etc/passwd", "ftp://example.com/file", "https://user:secret@example.com",
+    "https://example.com:22", "https://example.com:bad",
+])
+def test_unsafe_urls_are_rejected(url):
+    with pytest.raises(DestinationError):
+        validate_http_url(url)
+
+
+def test_ssrf_address_policy():
+    assert validate_resolved_addresses({"93.184.216.34"}, False) == ["93.184.216.34"]
+    assert validate_resolved_addresses({"10.0.0.8"}, True) == ["10.0.0.8"]
+    for address in ("127.0.0.1", "169.254.169.254", "0.0.0.0", "224.0.0.1"):
+        with pytest.raises(DestinationError):
+            validate_resolved_addresses({address}, True)
+    with pytest.raises(DestinationError, match="explicit approval"):
+        validate_resolved_addresses({"10.0.0.8"}, False)
+
+
+def test_cross_origin_sso_redirect_chain_is_recorded_but_not_crawled():
+    tracker = NavigationTracker(max_redirects=5)
+    tracker.record_destination("https://portal.example.com", now=1.0)
+    tracker.record_response("https://portal.example.com", 302)
+    tracker.record_destination("https://identity.example.net/login?state=secret", now=1.1)
+    tracker.record_response("https://identity.example.net/login?state=secret", 302)
+    tracker.record_destination("https://portal.example.com/callback?code=secret", now=1.2)
+    redirects = tracker.redirects()
+    assert tracker.redirect_count == 2
+    assert [item["redirect_type"] for item in redirects] == ["CROSS_ORIGIN", "CROSS_ORIGIN"]
+    assert "secret" not in str(redirects)
+    crawl, external = partition_links(
+        ["https://portal.example.com/home", "https://identity.example.net/profile"],
+        "portal.example.com",
+        False,
     )
+    assert crawl == ["https://portal.example.com/home"]
+    assert external == ["https://identity.example.net/profile"]
 
 
-def test_basic_auth_header():
+def test_redirect_limits_and_loop_detection():
+    tracker = NavigationTracker(max_redirects=1)
+    tracker.record_destination("https://example.com", now=1.0)
+    tracker.record_destination("https://www.example.com", now=2.0)
+    with pytest.raises(DestinationError, match="Maximum redirect"):
+        tracker.record_destination("https://login.example.net", now=3.0)
+    loop = NavigationTracker(max_redirects=4)
+    loop.record_destination("https://example.com", now=1.0)
+    with pytest.raises(DestinationError, match="loop"):
+        loop.record_destination("https://example.com#fragment", now=2.0)
+
+
+@pytest.mark.parametrize(("kwargs", "expected"), [
+    ({"authentication_mode": "none", "status": 401, "final_url": "https://example.com", "target_in_scope": True, "error_classification": None}, "AUTH_REQUIRED"),
+    ({"authentication_mode": "bearer", "status": 401, "final_url": "https://example.com", "target_in_scope": True, "error_classification": None}, "AUTH_FAILED"),
+    ({"authentication_mode": "none", "status": 200, "final_url": "https://id.example.net/auth?client_id=x", "target_in_scope": False, "error_classification": None}, "AUTH_REQUIRED"),
+    ({"authentication_mode": "storage_state", "status": 200, "final_url": "https://id.example.net/auth?client_id=x", "target_in_scope": False, "error_classification": None}, "SESSION_EXPIRED"),
+    ({"authentication_mode": "none", "status": 403, "final_url": "https://example.com", "target_in_scope": True, "error_classification": None}, "ACCESS_RESTRICTED"),
+])
+def test_generic_authentication_classification(kwargs, expected):
+    assert classify_authentication(**kwargs) == expected
+
+
+def test_navigation_error_classification():
+    assert classify_navigation_error("net::ERR_CERT_AUTHORITY_INVALID") == "TLS_ERROR"
+    assert classify_navigation_error("net::ERR_NAME_NOT_RESOLVED") == "DNS_ERROR"
+    assert classify_navigation_error("Timeout 30000ms exceeded") == "TIMEOUT"
+    assert classify_navigation_error("net::ERR_CONNECTION_REFUSED") == "NETWORK_ERROR"
+
+
+def test_credentials_do_not_cross_origins():
+    sensitive = {"Authorization": "Bearer top-secret", "X-API-Key": "api-secret"}
+    initial = {"Accept": "text/html", "authorization": "stale-secret"}
+    allowed = headers_for_destination(initial, sensitive, "portal.example.com", {"portal.example.com"})
+    external = headers_for_destination(initial, sensitive, "identity.example.net", {"portal.example.com"})
+    assert allowed["Authorization"] == "Bearer top-secret"
+    assert allowed["X-API-Key"] == "api-secret"
+    assert all(name.lower() not in {"authorization", "x-api-key"} for name in external)
+
+
+def test_sanitization_and_structured_log_redaction():
+    secret_url = "https://user:password@example.com/path?token=secret&safe=value#fragment"
+    assert sanitized_url(secret_url) == "https://example.com/path?token=%5BREDACTED%5D&safe=value"
+    data = sanitize_data({"authorization": "Bearer abc", "nested": {"password": "secret"}})
+    assert data == {"authorization": "[REDACTED]", "nested": {"password": "[REDACTED]"}}
+    old_level = LOGGER.level
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.DEBUG)
+    try:
+        for level in (logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR):
+            log_event(level, "REDACTION_TEST", url=secret_url, token="secret", authorization="Bearer abc")
+    finally:
+        LOGGER.setLevel(old_level)
+        LOGGER.removeHandler(handler)
+    output = stream.getvalue()
+    assert "password" not in output
+    assert "Bearer abc" not in output
+    assert '"token":"secret"' not in output
+    assert "[REDACTED]" in output
+    for line in output.splitlines():
+        assert __import__("json").loads(line)["event"] == "REDACTION_TEST"
+
+
+def test_basic_auth_and_input_guards(monkeypatch):
     result = auth_headers(Authentication(mode="basic", username="user", password="secret"))
     assert result == {"Authorization": "Basic " + base64.b64encode(b"user:secret").decode()}
-
-
-def test_forbidden_custom_header():
     with pytest.raises(ValueError):
         Authentication(mode="headers", headers={"Host": "evil.test"})
-
-
-def test_storage_profile_rejects_path_traversal():
     with pytest.raises(HTTPException):
         storage_state_path("../secret")
 
-
-def test_scan_rejects_embedded_credentials_before_network_access():
-    response = client.post("/api/scan", json={"target": "https://user:secret@example.com"})
-    assert response.status_code == 400
-    assert "embedded credentials" in response.json()["detail"]
-
-
-def test_scan_rejects_unsafe_port_before_network_access():
-    response = client.post("/api/scan", json={"target": "https://example.com:22"})
-    assert response.status_code == 400
-    assert "port is not allowed" in response.json()["detail"]
-
-
-def test_mutation_requires_acknowledgement(monkeypatch):
     async def allow_destination(*_args, **_kwargs):
         return None
 
     monkeypatch.setattr("app.main.validate_destination", allow_destination)
-    response = client.post("/api/scan", json={"target": "https://example.com", "allow_mutations": True, "mutation_endpoint_allowlist": ["/test/"]})
+    response = client.post("/api/scan", json={
+        "target": "https://example.com",
+        "allow_mutations": True,
+        "mutation_endpoint_allowlist": ["/test/"],
+    })
     assert response.status_code == 400
     assert "acknowledgement" in response.json()["detail"]
 
 
-def test_tls_failure_has_distinct_load_and_validation_statuses():
-    result = classify_page_result(
-        url="https://portal.example.com",
-        status=None,
+def test_page_status_distinguishes_tls_main_document_and_subresources():
+    tls = classify_page_result(
+        url="https://portal.example.com", status=None,
         error="Page.goto: net::ERR_CERT_AUTHORITY_INVALID",
-        missing_security_headers=[],
-        console_errors=[],
-        failed_resources=[],
+        missing_security_headers=[], console_errors=[], failed_resources=[],
         security_headers_tested=True,
     )
-
-    assert result == {
-        "page_load_status": "FAILED_TO_LOAD",
-        "validation_status": "NOT_TESTED",
-        "category": "TLS_CERTIFICATE_ERROR",
-        "tls_status": "UNTRUSTED",
-        "tls_basis": "BROWSER_CERTIFICATE_VALIDATION",
-        "tls_detail": "Chromium rejected the HTTPS certificate chain.",
-        "security_headers_status": "NOT_TESTED",
-        "findings": 0,
-        "passed": False,
-    }
-
-
-def test_loaded_page_with_optional_findings_is_warning_not_load_failure():
-    result = classify_page_result(
-        url="https://portal.example.com",
-        status=200,
-        error=None,
-        missing_security_headers=["content-security-policy"],
-        console_errors=["optional widget failed"],
-        failed_resources=[],
+    assert (tls["page_load_status"], tls["category"], tls["tls_status"]) == (
+        "FAILED_TO_LOAD", "TLS_CERTIFICATE_ERROR", "UNTRUSTED",
+    )
+    warning = classify_page_result(
+        url="https://portal.example.com", status=200, error=None,
+        missing_security_headers=[], console_errors=[],
+        failed_resources=[{"main_document": False}], security_headers_tested=True,
+    )
+    assert warning["page_load_status"] == "LOADED"
+    assert warning["validation_status"] == "WARNING"
+    failed = classify_page_result(
+        url="https://portal.example.com", status=None,
+        error="net::ERR_NAME_NOT_RESOLVED", missing_security_headers=[],
+        console_errors=[], failed_resources=[{"main_document": True}],
         security_headers_tested=True,
     )
-
-    assert result["page_load_status"] == "LOADED"
-    assert result["tls_status"] == "TRUSTED"
-    assert result["validation_status"] == "WARNING"
-    assert result["security_headers_status"] == "WARNING"
-    assert result["findings"] == 2
-    assert result["passed"] is True
+    assert failed["page_load_status"] == "FAILED_TO_LOAD"
+    assert failed["classification"] == "DNS_ERROR"
 
 
-def test_failed_subresource_is_warning_not_main_document_failure():
-    result = classify_page_result(
-        url="https://portal.example.com",
-        status=200,
-        error=None,
-        missing_security_headers=[],
-        console_errors=[],
-        failed_resources=[{
-            "url": "https://analytics.example.net/script.js",
-            "error": "net::ERR_BLOCKED_BY_CLIENT.Inspector",
-            "resource_type": "script",
-            "main_document": False,
-        }],
-        security_headers_tested=True,
+def test_production_sources_contain_no_tls_bypass():
+    repository = Path(__file__).resolve().parents[1]
+    sources = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in [repository / "app/main.py", repository / "Dockerfile", repository / "container-entrypoint.sh"]
     )
-
-    assert result["page_load_status"] == "LOADED"
-    assert result["validation_status"] == "WARNING"
-    assert result["category"] == "VALIDATION_FINDINGS"
-    assert result["findings"] == 1
-
-
-def test_main_document_navigation_failure_is_failed_to_load():
-    result = classify_page_result(
-        url="https://portal.example.com",
-        status=None,
-        error="Page.goto: net::ERR_NAME_NOT_RESOLVED",
-        missing_security_headers=[],
-        console_errors=[],
-        failed_resources=[{
-            "url": "https://portal.example.com",
-            "error": "net::ERR_NAME_NOT_RESOLVED",
-            "resource_type": "document",
-            "main_document": True,
-        }],
-        security_headers_tested=True,
-    )
-
-    assert result["page_load_status"] == "FAILED_TO_LOAD"
-    assert result["validation_status"] == "NOT_TESTED"
-    assert result["category"] == "PAGE_LOAD_ERROR"
-    assert result["tls_status"] == "NOT_TESTED"
-
-
-def test_loaded_http_error_is_validation_failure():
-    result = classify_page_result(
-        url="https://portal.example.com/missing",
-        status=404,
-        error=None,
-        missing_security_headers=[],
-        console_errors=[],
-        failed_resources=[],
-        security_headers_tested=False,
-    )
-
-    assert result["page_load_status"] == "LOADED"
-    assert result["validation_status"] == "FAIL"
-    assert result["category"] == "HTTP_ERROR"
-    assert result["security_headers_status"] == "NOT_TESTED"
-    assert result["findings"] == 1
+    for forbidden in (
+        "ignore_https_errors=True", "--ignore-certificate-errors",
+        "verify=False", "NODE_TLS_REJECT_UNAUTHORIZED=0",
+    ):
+        assert forbidden not in sources

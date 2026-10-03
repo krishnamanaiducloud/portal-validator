@@ -80,8 +80,13 @@ function renderReport(report) {
     const validationStatus = item.validation_status || 'NOT_TESTED';
     const httpStatus = item.status ?? 'NOT_TESTED';
     const details = {
+      classification: item.classification,
       requested_url: item.requested_url,
       final_url: item.final_url,
+      redirect_count: item.redirect_count,
+      redirects: item.redirects,
+      external_links_found: item.external_links_found,
+      external_links: item.external_links,
       error: item.error,
       tls_basis: item.tls_basis,
       tls_detail: item.tls_detail,
@@ -98,6 +103,7 @@ function renderReport(report) {
           <div><span>Page Load</span><strong class="state ${statusClass(loadStatus)}">${escapeHtml(loadStatus)}</strong></div>
           <div><span>HTTP</span><strong>${escapeHtml(httpStatus)}</strong></div>
           <div><span>Validation</span><strong class="state ${statusClass(validationStatus)}">${escapeHtml(validationStatus)}</strong></div>
+          <div><span>Classification</span><strong>${escapeHtml(item.classification)}</strong></div>
           <div><span>TLS</span><strong class="state ${statusClass(item.tls_status)}">${escapeHtml(item.tls_status)}</strong></div>
           <div><span>Security Headers</span><strong class="state ${statusClass(item.security_headers_status)}">${escapeHtml(item.security_headers_status)}</strong></div>
           <div><span>Findings</span><strong>${escapeHtml(item.findings)}</strong></div>
@@ -118,7 +124,7 @@ form.addEventListener('submit', async (event) => {
   let payload;
   try {
     payload = {
-      target:byId('target').value.trim(), max_pages:Number(byId('pages').value), max_depth:Number(byId('depth').value), timeout_ms:Number(byId('timeout').value),
+      target:byId('target').value.trim(), max_pages:Number(byId('pages').value), max_depth:Number(byId('depth').value), max_redirects:Number(byId('redirects').value), timeout_ms:Number(byId('timeout').value), total_timeout_ms:Number(byId('total-timeout').value),
       check_links:byId('links').checked, check_console:byId('console').checked, check_resources:byId('resources').checked, check_performance:byId('performance').checked, check_security_headers:byId('headers').checked,
       allow_subdomains:byId('subdomains').checked, allow_private_networks:byId('private-network').checked, resource_hosts:splitList(byId('resource-hosts').value), authentication:authenticationPayload(),
       allow_mutations:byId('mutations').checked, mutation_acknowledged:byId('mutation-ack').checked, mutation_endpoint_allowlist:splitList(byId('mutation-paths').value),
