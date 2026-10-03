@@ -1,3 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: portal-validator-trusted-ca
+  labels:
+    config.openshift.io/inject-trusted-cabundle: "true"
+data: {}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,7 +21,7 @@ spec:
       automountServiceAccountToken: false
       containers:
       - name: portal-validator
-        image: docker.io/mohankrishna999/portal-validator:1.0.3
+        image: docker.io/mohankrishna999/portal-validator:1.1.0
         ports:
         - containerPort: 8080
         securityContext:
@@ -29,9 +37,14 @@ spec:
           value: /auth
         - name: MAX_CONCURRENT_SCANS
           value: "2"
+        - name: CORPORATE_CA_BUNDLE
+          value: /etc/portal-validator/certs/ca-bundle.crt
         volumeMounts:
         - name: auth-state
           mountPath: /auth
+          readOnly: true
+        - name: trusted-ca
+          mountPath: /etc/portal-validator/certs
           readOnly: true
         readinessProbe:
           httpGet: {path: /healthz, port: 8080}
@@ -44,6 +57,12 @@ spec:
         secret:
           secretName: portal-validator-auth
           optional: true
+      - name: trusted-ca
+        configMap:
+          name: portal-validator-trusted-ca
+          items:
+          - key: ca-bundle.crt
+            path: ca-bundle.crt
 ---
 apiVersion: v1
 kind: Service

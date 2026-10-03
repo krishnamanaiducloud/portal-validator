@@ -1,0 +1,97 @@
+:root {
+  --warning: #ffbf5b;
+}
+
+.metric.warn strong {
+  color: var(--warning);
+}
+
+.result-item.validation-pass .result-dot {
+  background: var(--lime);
+}
+
+.result-item.validation-warning .result-dot {
+  background: var(--warning);
+}
+
+.result-item.validation-not-tested .result-dot,
+.result-item.load-failed-to-load .result-dot {
+  background: var(--danger);
+}
+
+.result-overview {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+  margin-bottom: 14px;
+}
+
+.result-overview > div {
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #08110e;
+}
+
+.result-overview span {
+  display: block;
+  color: #71877d;
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.result-overview strong {
+  display: block;
+  margin-top: 4px;
+  color: #e2ebe7;
+  font: 700 11px ui-monospace, monospace;
+  overflow-wrap: anywhere;
+}
+
+.state.pass,
+.state.loaded,
+.state.trusted {
+  color: var(--lime);
+}
+
+.state.warning {
+  color: var(--warning);
+}
+
+.state.fail,
+.state.failed-to-load,
+.state.untrusted {
+  color: var(--danger);
+}
+
+.state.not-tested,
+.state.not-applicable {
+  color: var(--muted);
+}
+
+.result-detail pre {
+  border-top: 1px solid var(--line);
+  padding-top: 13px;
+}
+
+@media (max-width: 800px) {
+  .result-overview {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 480px) {
+  .result-item summary {
+    grid-template-columns: auto 1fr;
+  }
+
+  .result-meta {
+    grid-column: 2;
+  }
+
+  .result-overview {
+    grid-template-columns: 1fr;
+  }
+}

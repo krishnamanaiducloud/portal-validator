@@ -8,7 +8,8 @@ import re
 import socket
 import time
 import uuid
-from collections import deque
+from collections import Counter, deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urldefrag, urlparse
@@ -18,6 +19,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, SecretStr, field_validator
 from playwright.async_api import BrowserContext, Route, async_playwright
+
+from app.trust import TrustStatus, configure_ca_trust
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
@@ -36,8 +39,23 @@ SECURITY_HEADERS = (
     "content-security-policy", "strict-transport-security", "x-content-type-options",
     "referrer-policy", "permissions-policy", "cross-origin-opener-policy",
 )
+TLS_ERROR_RE = re.compile(r"net::ERR_CERT_[A-Z0-9_]+")
 
-app = FastAPI(title="Portal Validator", version="1.0.1", docs_url=None, redoc_url=None, openapi_url=None)
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    application.state.trust_status = configure_ca_trust()
+    yield
+
+
+app = FastAPI(
+    title="Portal Validator",
+    version="1.1.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+    lifespan=lifespan,
+)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -174,6 +192,75 @@ def auth_headers(authentication: Authentication) -> dict[str, str]:
     return {}
 
 
+def classify_page_result(
+    *,
+    url: str,
+    status: int | None,
+    error: str | None,
+    missing_security_headers: list[str],
+    console_errors: list[str],
+    failed_resources: list[dict],
+    security_headers_tested: bool,
+) -> dict[str, str | int | bool | None]:
+    loaded = error is None and status is not None
+    page_load_status = "LOADED" if loaded else "FAILED_TO_LOAD"
+
+    if error and TLS_ERROR_RE.search(error):
+        category = "TLS_CERTIFICATE_ERROR"
+    elif error and "outside the approved portal scope" in error:
+        category = "SCOPE_VIOLATION"
+    elif error and "Timeout" in error:
+        category = "TIMEOUT"
+    elif error:
+        category = "PAGE_LOAD_ERROR"
+    elif status is not None and status >= 400:
+        category = "HTTP_ERROR"
+    else:
+        category = None
+
+    if category == "TLS_CERTIFICATE_ERROR":
+        tls_status = "UNTRUSTED"
+    elif loaded and urlparse(url).scheme == "https":
+        tls_status = "TRUSTED"
+    elif loaded:
+        tls_status = "NOT_APPLICABLE"
+    else:
+        tls_status = "NOT_TESTED"
+
+    if not loaded or not security_headers_tested:
+        security_headers_status = "NOT_TESTED"
+    elif missing_security_headers:
+        security_headers_status = "WARNING"
+    else:
+        security_headers_status = "PASS"
+
+    findings = (
+        len(missing_security_headers)
+        + len(console_errors)
+        + len(failed_resources)
+        + int(bool(status is not None and status >= 400))
+    )
+    if not loaded:
+        validation_status = "NOT_TESTED"
+    elif status is not None and status >= 400:
+        validation_status = "FAIL"
+    elif findings:
+        validation_status = "WARNING"
+        category = category or "VALIDATION_FINDINGS"
+    else:
+        validation_status = "PASS"
+
+    return {
+        "page_load_status": page_load_status,
+        "validation_status": validation_status,
+        "category": category,
+        "tls_status": tls_status,
+        "security_headers_status": security_headers_status,
+        "findings": findings,
+        "passed": loaded and validation_status != "FAIL",
+    }
+
+
 async def configure_cookies(context: BrowserContext, req: ScanRequest, root_host: str) -> None:
     if req.authentication.mode != "cookies":
         return
@@ -290,6 +377,8 @@ async def scan(req: ScanRequest):
                     links: list[str] = []
                     try:
                         response = await page.goto(url, wait_until="domcontentloaded", timeout=req.timeout_ms)
+                        if response is None:
+                            raise RuntimeError("Navigation completed without an HTTP response")
                         if not url_in_scope(page.url, root_host, req.allow_subdomains):
                             raise RuntimeError("Navigation redirected outside the approved portal scope")
                         status = response.status if response else None
@@ -309,22 +398,47 @@ async def scan(req: ScanRequest):
                     header_report = {name: headers.get(name) for name in SECURITY_HEADERS} if req.check_security_headers else {}
                     page_console = console_errors[console_start:] if req.check_console else []
                     page_failures = failed_resources[failed_start:] if req.check_resources else []
+                    missing_headers = [name for name, value in header_report.items() if not value]
+                    classification = classify_page_result(
+                        url=url,
+                        status=status,
+                        error=error,
+                        missing_security_headers=missing_headers,
+                        console_errors=page_console,
+                        failed_resources=page_failures,
+                        security_headers_tested=req.check_security_headers,
+                    )
                     results.append({
                         "url": url, "depth": depth, "status": status, "title": title,
                         "load_ms": elapsed if req.check_performance else None, "error": error,
                         "links_found": len(links), "console_errors": page_console,
                         "failed_resources": page_failures, "security_headers": header_report,
-                        "missing_security_headers": [name for name, value in header_report.items() if not value],
-                        "passed": not error and bool(status and status < 400) and not page_console and not page_failures,
+                        "missing_security_headers": missing_headers,
+                        **classification,
                     })
                 await context.close()
             finally:
                 await browser.close()
 
-    passed = sum(1 for result in results if result["passed"])
+    load_counts = Counter(result["page_load_status"] for result in results)
+    validation_counts = Counter(result["validation_status"] for result in results)
+    trust_status: TrustStatus = getattr(app.state, "trust_status", TrustStatus(enabled=False))
     return {
         "run_id": run_id, "target": req.target, "pages": len(results),
-        "summary": {"passed": passed, "failed": len(results) - passed, "duration_ms": sum(result["load_ms"] or 0 for result in results)},
+        "summary": {
+            "loaded": load_counts["LOADED"],
+            "failed_to_load": load_counts["FAILED_TO_LOAD"],
+            "pass": validation_counts["PASS"],
+            "warning": validation_counts["WARNING"],
+            "fail": validation_counts["FAIL"],
+            "not_tested": validation_counts["NOT_TESTED"],
+            # Retain the original aggregate fields for existing API consumers.
+            # A loaded page with warnings remains successful for this legacy view.
+            "passed": validation_counts["PASS"] + validation_counts["WARNING"],
+            "failed": validation_counts["FAIL"] + load_counts["FAILED_TO_LOAD"],
+            "findings": sum(result["findings"] for result in results),
+            "duration_ms": sum(result["load_ms"] or 0 for result in results),
+        },
         "results": results,
-        "safety": {"navigation_scope": root_host, "subdomains_enabled": req.allow_subdomains, "private_network_enabled": req.allow_private_networks, "mutations_enabled": req.allow_mutations, "authentication_mode": req.authentication.mode},
+        "safety": {"navigation_scope": root_host, "subdomains_enabled": req.allow_subdomains, "private_network_enabled": req.allow_private_networks, "mutations_enabled": req.allow_mutations, "authentication_mode": req.authentication.mode, "corporate_ca_trust": trust_status.enabled},
     }

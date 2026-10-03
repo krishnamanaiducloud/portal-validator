@@ -4,7 +4,15 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from app.main import Authentication, app, auth_headers, host_in_scope, storage_state_path, url_in_scope
+from app.main import (
+    Authentication,
+    app,
+    auth_headers,
+    classify_page_result,
+    host_in_scope,
+    storage_state_path,
+    url_in_scope,
+)
 
 client = TestClient(app)
 
@@ -18,7 +26,7 @@ def test_home_and_security_headers():
 
 
 def test_health_endpoint():
-    assert client.get("/healthz").json() == {"status": "ok", "version": "1.0.1"}
+    assert client.get("/healthz").json() == {"status": "ok", "version": "1.1.0"}
 
 
 @pytest.mark.parametrize(("candidate", "subdomains", "expected"), [
@@ -70,3 +78,62 @@ def test_mutation_requires_acknowledgement(monkeypatch):
     response = client.post("/api/scan", json={"target": "https://example.com", "allow_mutations": True, "mutation_endpoint_allowlist": ["/test/"]})
     assert response.status_code == 400
     assert "acknowledgement" in response.json()["detail"]
+
+
+def test_tls_failure_has_distinct_load_and_validation_statuses():
+    result = classify_page_result(
+        url="https://portal.example.com",
+        status=None,
+        error="Page.goto: net::ERR_CERT_AUTHORITY_INVALID",
+        missing_security_headers=[],
+        console_errors=[],
+        failed_resources=[],
+        security_headers_tested=True,
+    )
+
+    assert result == {
+        "page_load_status": "FAILED_TO_LOAD",
+        "validation_status": "NOT_TESTED",
+        "category": "TLS_CERTIFICATE_ERROR",
+        "tls_status": "UNTRUSTED",
+        "security_headers_status": "NOT_TESTED",
+        "findings": 0,
+        "passed": False,
+    }
+
+
+def test_loaded_page_with_optional_findings_is_warning_not_load_failure():
+    result = classify_page_result(
+        url="https://portal.example.com",
+        status=200,
+        error=None,
+        missing_security_headers=["content-security-policy"],
+        console_errors=["optional widget failed"],
+        failed_resources=[],
+        security_headers_tested=True,
+    )
+
+    assert result["page_load_status"] == "LOADED"
+    assert result["tls_status"] == "TRUSTED"
+    assert result["validation_status"] == "WARNING"
+    assert result["security_headers_status"] == "WARNING"
+    assert result["findings"] == 2
+    assert result["passed"] is True
+
+
+def test_loaded_http_error_is_validation_failure():
+    result = classify_page_result(
+        url="https://portal.example.com/missing",
+        status=404,
+        error=None,
+        missing_security_headers=[],
+        console_errors=[],
+        failed_resources=[],
+        security_headers_tested=False,
+    )
+
+    assert result["page_load_status"] == "LOADED"
+    assert result["validation_status"] == "FAIL"
+    assert result["category"] == "HTTP_ERROR"
+    assert result["security_headers_status"] == "NOT_TESTED"
+    assert result["findings"] == 1

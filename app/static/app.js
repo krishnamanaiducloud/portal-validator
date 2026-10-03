@@ -10,6 +10,7 @@ let profileNames = [];
 
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
 const splitList = (value) => value.split(',').map((item) => item.trim()).filter(Boolean);
+const statusClass = (value) => String(value || 'NOT_TESTED').toLowerCase().replaceAll('_', '-');
 
 function notify(message, isError = false) {
   toast.textContent = message;
@@ -62,13 +63,48 @@ function renderReport(report) {
   lastReport = report;
   byId('result-title').textContent = new URL(report.target).hostname;
   const duration = report.summary.duration_ms > 1000 ? `${(report.summary.duration_ms / 1000).toFixed(1)}s` : `${report.summary.duration_ms}ms`;
-  byId('summary').innerHTML = [['Pages',report.pages,''],['Passed',report.summary.passed,'good'],['Needs attention',report.summary.failed,report.summary.failed?'bad':'good'],['Total load time',duration,'']].map(([label,value,kind]) => `<div class="metric ${kind}"><strong>${escapeHtml(value)}</strong><span>${label}</span></div>`).join('');
+  const summaryMetrics = [
+    ['Pages', report.pages, ''],
+    ['Loaded', report.summary.loaded, 'good'],
+    ['Failed to load', report.summary.failed_to_load, report.summary.failed_to_load ? 'bad' : 'good'],
+    ['Passed', report.summary.pass, 'good'],
+    ['Warnings', report.summary.warning, report.summary.warning ? 'warn' : ''],
+    ['Findings', report.summary.findings, report.summary.findings ? 'warn' : ''],
+    ['Validation failures', report.summary.fail, report.summary.fail ? 'bad' : ''],
+    ['Total load time', duration, ''],
+  ];
+  byId('summary').innerHTML = summaryMetrics.map(([label, value, kind]) => `<div class="metric ${kind}"><strong>${escapeHtml(value)}</strong><span>${label}</span></div>`).join('');
+
   byId('result-list').innerHTML = report.results.map((item) => {
-    const detail = {error:item.error,console_errors:item.console_errors,failed_resources:item.failed_resources,missing_security_headers:item.missing_security_headers,security_headers:item.security_headers};
-    return `<details class="result-item ${item.passed?'pass':''}"><summary><span class="result-dot"></span><span class="result-url">${escapeHtml(item.url)}</span><span class="result-meta">${escapeHtml(item.status||'ERR')} · ${escapeHtml(item.load_ms??'—')}ms</span></summary><div class="result-detail"><pre>${escapeHtml(JSON.stringify(detail,null,2))}</pre></div></details>`;
+    const loadStatus = item.page_load_status || 'FAILED_TO_LOAD';
+    const validationStatus = item.validation_status || 'NOT_TESTED';
+    const httpStatus = item.status ?? 'NOT_TESTED';
+    const details = {
+      error: item.error,
+      console_errors: item.console_errors,
+      failed_resources: item.failed_resources,
+      missing_security_headers: item.missing_security_headers,
+      security_headers: item.security_headers,
+    };
+    const category = item.category ? `<div><span>Category</span><strong>${escapeHtml(item.category)}</strong></div>` : '';
+    return `<details class="result-item load-${statusClass(loadStatus)} validation-${statusClass(validationStatus)}">
+      <summary><span class="result-dot"></span><span class="result-url">${escapeHtml(item.url)}</span><span class="result-meta">${escapeHtml(item.findings)} findings &middot; ${escapeHtml(item.load_ms ?? '—')}ms</span></summary>
+      <div class="result-detail">
+        <div class="result-overview">
+          <div><span>Page Load</span><strong class="state ${statusClass(loadStatus)}">${escapeHtml(loadStatus)}</strong></div>
+          <div><span>HTTP</span><strong>${escapeHtml(httpStatus)}</strong></div>
+          <div><span>Validation</span><strong class="state ${statusClass(validationStatus)}">${escapeHtml(validationStatus)}</strong></div>
+          <div><span>TLS</span><strong class="state ${statusClass(item.tls_status)}">${escapeHtml(item.tls_status)}</strong></div>
+          <div><span>Security Headers</span><strong class="state ${statusClass(item.security_headers_status)}">${escapeHtml(item.security_headers_status)}</strong></div>
+          <div><span>Findings</span><strong>${escapeHtml(item.findings)}</strong></div>
+          ${category}
+        </div>
+        <pre>${escapeHtml(JSON.stringify(details, null, 2))}</pre>
+      </div>
+    </details>`;
   }).join('');
   results.hidden = false;
-  results.scrollIntoView({behavior:'smooth',block:'start'});
+  results.scrollIntoView({behavior:'smooth', block:'start'});
 }
 
 authMode.addEventListener('change', renderAuthFields);
@@ -78,27 +114,35 @@ form.addEventListener('submit', async (event) => {
   let payload;
   try {
     payload = {
-      target:byId('target').value.trim(),max_pages:Number(byId('pages').value),max_depth:Number(byId('depth').value),timeout_ms:Number(byId('timeout').value),
-      check_links:byId('links').checked,check_console:byId('console').checked,check_resources:byId('resources').checked,check_performance:byId('performance').checked,check_security_headers:byId('headers').checked,
-      allow_subdomains:byId('subdomains').checked,allow_private_networks:byId('private-network').checked,resource_hosts:splitList(byId('resource-hosts').value),authentication:authenticationPayload(),
-      allow_mutations:byId('mutations').checked,mutation_acknowledged:byId('mutation-ack').checked,mutation_endpoint_allowlist:splitList(byId('mutation-paths').value),
+      target:byId('target').value.trim(), max_pages:Number(byId('pages').value), max_depth:Number(byId('depth').value), timeout_ms:Number(byId('timeout').value),
+      check_links:byId('links').checked, check_console:byId('console').checked, check_resources:byId('resources').checked, check_performance:byId('performance').checked, check_security_headers:byId('headers').checked,
+      allow_subdomains:byId('subdomains').checked, allow_private_networks:byId('private-network').checked, resource_hosts:splitList(byId('resource-hosts').value), authentication:authenticationPayload(),
+      allow_mutations:byId('mutations').checked, mutation_acknowledged:byId('mutation-ack').checked, mutation_endpoint_allowlist:splitList(byId('mutation-paths').value),
     };
-  } catch (error) { notify(error.message,true); return; }
-  runButton.disabled = true; runButton.querySelector('span').textContent = 'Validating…';
+  } catch (error) { notify(error.message, true); return; }
+  runButton.disabled = true;
+  runButton.querySelector('span').textContent = 'Validating...';
   try {
-    const response = await fetch('/api/scan',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
+    const response = await fetch('/api/scan', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(payload)});
     const report = await response.json();
     if (!response.ok) throw new Error(typeof report.detail === 'string' ? report.detail : 'Validation failed');
-    renderReport(report); notify(`Validation complete · ${report.pages} page${report.pages===1?'':'s'} checked`);
-  } catch (error) { notify(error.message||'Validation failed',true); }
-  finally { runButton.disabled=false; runButton.querySelector('span').textContent='Run validation'; }
+    renderReport(report);
+    notify(`Validation complete \u00b7 ${report.pages} page${report.pages === 1 ? '' : 's'} checked`);
+  } catch (error) { notify(error.message || 'Validation failed', true); }
+  finally { runButton.disabled = false; runButton.querySelector('span').textContent = 'Run validation'; }
 });
 
 byId('download-button').addEventListener('click', () => {
   if (!lastReport) return;
-  const blob = new Blob([JSON.stringify(lastReport,null,2)],{type:'application/json'});
+  const blob = new Blob([JSON.stringify(lastReport, null, 2)], {type:'application/json'});
   const link = document.createElement('a');
-  link.href=URL.createObjectURL(blob); link.download=`portal-validation-${lastReport.run_id}.json`; link.click(); URL.revokeObjectURL(link.href);
+  link.href = URL.createObjectURL(blob);
+  link.download = `portal-validation-${lastReport.run_id}.json`;
+  link.click();
+  URL.revokeObjectURL(link.href);
 });
 
-fetch('/api/auth-profiles').then((response) => response.json()).then((data) => { profileNames=data.profiles||[]; renderAuthFields(); }).catch(renderAuthFields);
+fetch('/api/auth-profiles').then((response) => response.json()).then((data) => {
+  profileNames = data.profiles || [];
+  renderAuthFields();
+}).catch(renderAuthFields);

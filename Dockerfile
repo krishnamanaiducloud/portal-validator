@@ -8,24 +8,45 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 
 USER 0
 WORKDIR /app
-RUN set -eux; \
-    printf '%s\n' "$APK_REPOSITORY" > /etc/apk/repositories; \
-    for attempt in 1 2 3 4 5; do \
-      apk --timeout 30 --no-progress update && break; \
-      [ "$attempt" -eq 5 ] && exit 1; \
-    done; \
-    chromium_deps="$(apk --simulate --no-progress add chromium 2>&1 \
+RUN --mount=type=cache,id=portal-validator-apks,target=/tmp/apks set -eux; \
+    mkdir -p /tmp/repository/x86_64; \
+    wget --https-only --timeout=30 --tries=5 --retry-connrefused \
+      --retry-on-http-error=429,500,502,503,504 --quiet \
+      "$APK_REPOSITORY/x86_64/APKINDEX.tar.gz" \
+      -O /tmp/repository/x86_64/APKINDEX.tar.gz; \
+    printf '%s\n' /tmp/repository > /etc/apk/repositories; \
+    apk --no-network --no-progress update; \
+    chromium_deps="$(apk --no-network --simulate --no-progress add chromium 2>&1 \
       | sed -n 's/^([^)]*) Installing \([^ ]*\) (.*/\1/p' \
       | grep -v '^chromium$')"; \
-    apk --timeout 30 --no-progress add --no-cache $chromium_deps; \
-    rm -rf /var/cache/apk/*; \
+    transaction="$(apk --no-network --simulate --no-progress \
+      add libnss-tools $chromium_deps 2>&1)"; \
+    runtime_constraints="$(printf '%s\n' "$transaction" \
+      | sed -n 's/^([^)]*) Installing \([^ ]*\) (\([^)]*\)).*/\1=\2/p')"; \
+    runtime_package_files="$(printf '%s\n' "$transaction" \
+      | sed -n 's/^([^)]*) Installing \([^ ]*\) (\([^)]*\)).*/\1-\2.apk/p' \
+      | grep -v '^chromium-')"; \
+    for package_file in $runtime_package_files; do \
+          if [ ! -s "/tmp/apks/$package_file" ]; then \
+            wget --https-only --timeout=30 --tries=5 --retry-connrefused \
+              --retry-on-http-error=429,500,502,503,504 \
+              --quiet "$APK_REPOSITORY/x86_64/$package_file" \
+              -O "/tmp/apks/$package_file.partial"; \
+            mv "/tmp/apks/$package_file.partial" "/tmp/apks/$package_file"; \
+          fi; \
+    done; \
+    ln -s /tmp/apks/*.apk /tmp/repository/x86_64/; \
+    apk --no-network --no-progress add --no-cache $runtime_constraints; \
+    rm -rf /tmp/repository /var/cache/apk/*; \
     printf '%s\n' 'https://apk.cgr.dev/chainguard' > /etc/apk/repositories; \
     addgroup -g 10001 validator \
     && adduser -D -H -u 10001 -G validator -s /sbin/nologin validator \
     && mkdir -p /auth /app \
     && chown -R 10001:10001 /auth /app
 
-ENV HOME=/tmp
+ENV HOME=/tmp/portal-validator-home \
+    CHROMIUM_NSS_DB=/tmp/portal-validator-home/.local/share/pki/nssdb \
+    RUNTIME_CA_BUNDLE=/tmp/portal-validator-ca-bundle.pem
 ARG CHROMIUM_VERSION=154.0.8037.92
 ENV CHROMIUM_EXECUTABLE_PATH=/opt/chrome-headless-shell/chrome-headless-shell
 
