@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import ipaddress
+import logging
 import os
 import re
 import socket
@@ -40,6 +41,11 @@ SECURITY_HEADERS = (
     "referrer-policy", "permissions-policy", "cross-origin-opener-policy",
 )
 TLS_ERROR_RE = re.compile(r"net::ERR_CERT_[A-Z0-9_]+")
+URL_IN_MESSAGE_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
+    "ac", "co", "com", "edu", "gov", "net", "org",
+})
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 @asynccontextmanager
@@ -50,7 +56,7 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(
     title="Portal Validator",
-    version="1.1.1",
+    version="1.1.2",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -126,6 +132,18 @@ class ScanRequest(BaseModel):
     mutation_acknowledged: bool = False
     mutation_endpoint_allowlist: list[str] = Field(default_factory=list, max_length=50)
 
+    @field_validator("target", mode="before")
+    @classmethod
+    def normalize_target(cls, target):
+        if not isinstance(target, str):
+            return target
+        value = target.strip()
+        if value.startswith("//"):
+            return "https:" + value
+        if "://" not in value:
+            return "https://" + value
+        return value
+
     @field_validator("resource_hosts")
     @classmethod
     def validate_resource_hosts(cls, hosts: list[str]):
@@ -139,17 +157,89 @@ class ScanRequest(BaseModel):
 
 
 def normalized_host(host: str) -> str:
-    return host.lower().rstrip(".")
+    return host.strip().lower().rstrip(".")
+
+
+def portal_boundary_host(host: str) -> str:
+    normalized = normalized_host(host)
+    return normalized[4:] if normalized.startswith("www.") else normalized
+
+
+def can_expand_subdomains(host: str) -> bool:
+    boundary = portal_boundary_host(host)
+    try:
+        ipaddress.ip_address(boundary)
+        return False
+    except ValueError:
+        pass
+    labels = boundary.split(".")
+    if len(labels) < 2:
+        return False
+    return not (
+        len(labels) == 2
+        and len(labels[1]) == 2
+        and labels[0] in COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS
+    )
 
 
 def host_in_scope(host: str, root_host: str, allow_subdomains: bool) -> bool:
-    host, root = normalized_host(host), normalized_host(root_host)
-    return host == root or (allow_subdomains and host.endswith("." + root))
+    candidate = normalized_host(host)
+    boundary = portal_boundary_host(root_host)
+    if not candidate or not boundary:
+        return False
+    if candidate in {boundary, "www." + boundary}:
+        return True
+    return bool(
+        allow_subdomains
+        and can_expand_subdomains(boundary)
+        and candidate.endswith("." + boundary)
+    )
 
 
 def url_in_scope(candidate: str, root_host: str, allow_subdomains: bool) -> bool:
     parsed = urlparse(candidate)
     return bool(parsed.scheme in {"http", "https"} and parsed.hostname and host_in_scope(parsed.hostname, root_host, allow_subdomains))
+
+
+def evaluate_navigation_scope(
+    requested_url: str,
+    final_url: str,
+    root_host: str,
+    allow_subdomains: bool,
+) -> tuple[str, str, bool]:
+    requested = urlparse(requested_url)
+    final = urlparse(final_url)
+    requested_host = normalized_host(requested.hostname or "")
+    final_host = normalized_host(final.hostname or "")
+    accepted = bool(
+        final.scheme in {"http", "https"}
+        and final_host
+        and host_in_scope(final_host, root_host, allow_subdomains)
+    )
+    return requested_host, final_host, accepted
+
+
+def sanitized_url(value: str, *, include_path: bool = True) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "[redacted-url]"
+    host = normalized_host(parsed.hostname)
+    display_host = f"[{host}]" if ":" in host else host
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    netloc = f"{display_host}:{port}" if port is not None else display_host
+    path = parsed.path if include_path else ""
+    return f"{parsed.scheme}://{netloc}{path or ''}"
+
+
+def sanitized_diagnostic(value: str) -> str:
+    first_line = value.splitlines()[0] if value else "Unknown navigation error"
+    return URL_IN_MESSAGE_RE.sub(
+        lambda match: sanitized_url(match.group(0), include_path=False),
+        first_line,
+    )[:1000]
 
 
 async def validate_destination(host: str, allow_private: bool) -> None:
@@ -220,12 +310,20 @@ def classify_page_result(
 
     if category == "TLS_CERTIFICATE_ERROR":
         tls_status = "UNTRUSTED"
+        tls_basis = "BROWSER_CERTIFICATE_VALIDATION"
+        tls_detail = "Chromium rejected the HTTPS certificate chain."
     elif loaded and urlparse(url).scheme == "https":
         tls_status = "TRUSTED"
+        tls_basis = "BROWSER_CERTIFICATE_VALIDATION"
+        tls_detail = "Chromium established HTTPS with certificate verification enabled; the origin certificate was not independently inspected."
     elif loaded:
         tls_status = "NOT_APPLICABLE"
+        tls_basis = "NOT_APPLICABLE"
+        tls_detail = "The final page used HTTP rather than HTTPS."
     else:
         tls_status = "NOT_TESTED"
+        tls_basis = "NOT_TESTED"
+        tls_detail = "Browser TLS trust could not be evaluated because main-document navigation did not complete."
 
     if not loaded or not security_headers_tested:
         security_headers_status = "NOT_TESTED"
@@ -255,6 +353,8 @@ def classify_page_result(
         "validation_status": validation_status,
         "category": category,
         "tls_status": tls_status,
+        "tls_basis": tls_basis,
+        "tls_detail": tls_detail,
         "security_headers_status": security_headers_status,
         "findings": findings,
         "passed": loaded and validation_status != "FAIL",
@@ -322,6 +422,12 @@ async def scan(req: ScanRequest):
     results: list[dict] = []
     queue = deque([(urldefrag(req.target.strip()).url, 0)])
     seen: set[str] = set()
+    LOGGER.info(
+        "Portal scan started run_id=%s requested_host=%s allow_subdomains=%s",
+        run_id,
+        root_host,
+        req.allow_subdomains,
+    )
 
     async with SCAN_SEMAPHORE:
         async with async_playwright() as playwright:
@@ -338,19 +444,57 @@ async def scan(req: ScanRequest):
                 page = await context.new_page()
                 console_errors: list[str] = []
                 failed_resources: list[dict] = []
-                page.on("console", lambda message: console_errors.append(message.text) if message.type == "error" else None)
-                page.on("requestfailed", lambda request: failed_resources.append({"url": request.url, "error": request.failure}))
+                blocked_main_navigation_host: str | None = None
+                blocked_main_navigation_url: str | None = None
+
+                def record_console_error(message):
+                    if message.type == "error":
+                        console_errors.append(sanitized_diagnostic(message.text))
+
+                def record_failed_request(request):
+                    try:
+                        is_main_document = bool(
+                            request.is_navigation_request()
+                            and request.frame == page.main_frame
+                        )
+                    except Exception:
+                        is_main_document = False
+                    failed_resources.append({
+                        "url": sanitized_url(request.url),
+                        "error": sanitized_diagnostic(request.failure or "Request failed"),
+                        "resource_type": request.resource_type,
+                        "main_document": is_main_document,
+                    })
+
+                page.on("console", record_console_error)
+                page.on("requestfailed", record_failed_request)
 
                 async def route_guard(route: Route):
+                    nonlocal blocked_main_navigation_host, blocked_main_navigation_url
                     request = route.request
                     request_url = urlparse(request.url)
                     host = normalized_host(request_url.hostname or "")
                     portal_scoped = bool(host and host_in_scope(host, root_host, req.allow_subdomains))
                     resource_scoped = host in approved_resource_hosts
-                    if request_url.scheme not in {"http", "https"} or not (portal_scoped or resource_scoped):
+                    try:
+                        is_main_navigation = bool(
+                            request.is_navigation_request()
+                            and request.frame == page.main_frame
+                        )
+                    except Exception:
+                        is_main_navigation = False
+                    if request.is_navigation_request() and not portal_scoped:
+                        if is_main_navigation:
+                            blocked_main_navigation_host = host
+                            blocked_main_navigation_url = sanitized_url(request.url)
+                            LOGGER.warning(
+                                "Rejected out-of-scope redirect run_id=%s final_host=%s",
+                                run_id,
+                                host or "unknown",
+                            )
                         await route.abort("blockedbyclient")
                         return
-                    if request.is_navigation_request() and not portal_scoped:
+                    if request_url.scheme not in {"http", "https"} or not (portal_scoped or resource_scoped):
                         await route.abort("blockedbyclient")
                         return
                     if request.method.upper() in MUTATING_METHODS:
@@ -369,17 +513,58 @@ async def scan(req: ScanRequest):
                     if url in seen or depth > req.max_depth:
                         continue
                     seen.add(url)
+                    requested_url = sanitized_url(url)
+                    requested_host = normalized_host(urlparse(url).hostname or "")
+                    final_url: str | None = None
+                    final_host = ""
+                    blocked_main_navigation_host = None
+                    blocked_main_navigation_url = None
                     console_start, failed_start = len(console_errors), len(failed_resources)
                     started = time.perf_counter()
                     status = title = error = None
                     headers: dict[str, str] = {}
                     links: list[str] = []
+                    LOGGER.info(
+                        "Portal navigation started run_id=%s requested_host=%s depth=%d",
+                        run_id,
+                        requested_host,
+                        depth,
+                    )
                     try:
                         response = await page.goto(url, wait_until="domcontentloaded", timeout=req.timeout_ms)
                         if response is None:
                             raise RuntimeError("Navigation completed without an HTTP response")
-                        if not url_in_scope(page.url, root_host, req.allow_subdomains):
-                            raise RuntimeError("Navigation redirected outside the approved portal scope")
+                        final_url = sanitized_url(page.url)
+                        requested_host, final_host, navigation_accepted = evaluate_navigation_scope(
+                            url,
+                            page.url,
+                            root_host,
+                            req.allow_subdomains,
+                        )
+                        LOGGER.info(
+                            "Portal navigation completed run_id=%s requested_host=%s final_host=%s",
+                            run_id,
+                            requested_host,
+                            final_host,
+                        )
+                        if not navigation_accepted:
+                            LOGGER.warning(
+                                "Rejected out-of-scope redirect run_id=%s requested_host=%s final_host=%s",
+                                run_id,
+                                requested_host,
+                                final_host or "unknown",
+                            )
+                            raise RuntimeError(
+                                "Navigation redirected outside the approved portal scope: "
+                                f"requested_host={requested_host} final_host={final_host or 'unknown'}"
+                            )
+                        if requested_host != final_host:
+                            LOGGER.info(
+                                "Accepted in-scope redirect run_id=%s requested_host=%s final_host=%s",
+                                run_id,
+                                requested_host,
+                                final_host,
+                            )
                         status = response.status if response else None
                         headers = await response.all_headers() if response else {}
                         title = await page.title()
@@ -392,14 +577,39 @@ async def scan(req: ScanRequest):
                                     if clean and url_in_scope(clean, root_host, req.allow_subdomains) and not any(word in path for word in DANGEROUS_PATH_WORDS) and clean not in seen:
                                         queue.append((clean, depth + 1))
                     except Exception as exc:
-                        error = str(exc).splitlines()[0][:1000]
+                        if blocked_main_navigation_host:
+                            final_host = blocked_main_navigation_host
+                            final_url = blocked_main_navigation_url
+                            error = (
+                                "Navigation redirected outside the approved portal scope: "
+                                f"requested_host={requested_host} final_host={final_host}"
+                            )
+                        else:
+                            error = sanitized_diagnostic(str(exc))
+                        LOGGER.warning(
+                            "Main navigation failed run_id=%s requested_host=%s final_host=%s error=%s",
+                            run_id,
+                            requested_host,
+                            final_host or "unknown",
+                            error,
+                        )
                     elapsed = round((time.perf_counter() - started) * 1000)
                     header_report = {name: headers.get(name) for name in SECURITY_HEADERS} if req.check_security_headers else {}
                     page_console = console_errors[console_start:] if req.check_console else []
                     page_failures = failed_resources[failed_start:] if req.check_resources else []
+                    subresource_failures = sum(
+                        not failure["main_document"] for failure in page_failures
+                    )
+                    if subresource_failures:
+                        LOGGER.warning(
+                            "Subresource failures recorded run_id=%s requested_host=%s count=%d",
+                            run_id,
+                            requested_host,
+                            subresource_failures,
+                        )
                     missing_headers = [name for name, value in header_report.items() if not value]
                     classification = classify_page_result(
-                        url=url,
+                        url=final_url or requested_url,
                         status=status,
                         error=error,
                         missing_security_headers=missing_headers,
@@ -408,7 +618,10 @@ async def scan(req: ScanRequest):
                         security_headers_tested=req.check_security_headers,
                     )
                     results.append({
-                        "url": url, "depth": depth, "status": status, "title": title,
+                        "url": final_url or requested_url,
+                        "requested_url": requested_url,
+                        "final_url": final_url,
+                        "depth": depth, "status": status, "title": title,
                         "load_ms": elapsed if req.check_performance else None, "error": error,
                         "links_found": len(links), "console_errors": page_console,
                         "failed_resources": page_failures, "security_headers": header_report,
@@ -422,8 +635,16 @@ async def scan(req: ScanRequest):
     load_counts = Counter(result["page_load_status"] for result in results)
     validation_counts = Counter(result["validation_status"] for result in results)
     trust_status: TrustStatus = getattr(app.state, "trust_status", TrustStatus(enabled=False))
+    LOGGER.info(
+        "Portal scan completed run_id=%s pages=%d loaded=%d failed_to_load=%d findings=%d",
+        run_id,
+        len(results),
+        load_counts["LOADED"],
+        load_counts["FAILED_TO_LOAD"],
+        sum(result["findings"] for result in results),
+    )
     return {
-        "run_id": run_id, "target": req.target, "pages": len(results),
+        "run_id": run_id, "target": sanitized_url(req.target), "pages": len(results),
         "summary": {
             "loaded": load_counts["LOADED"],
             "failed_to_load": load_counts["FAILED_TO_LOAD"],

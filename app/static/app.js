@@ -80,7 +80,11 @@ function renderReport(report) {
     const validationStatus = item.validation_status || 'NOT_TESTED';
     const httpStatus = item.status ?? 'NOT_TESTED';
     const details = {
+      requested_url: item.requested_url,
+      final_url: item.final_url,
       error: item.error,
+      tls_basis: item.tls_basis,
+      tls_detail: item.tls_detail,
       console_errors: item.console_errors,
       failed_resources: item.failed_resources,
       missing_security_headers: item.missing_security_headers,

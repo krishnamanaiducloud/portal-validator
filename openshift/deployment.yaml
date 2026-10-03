@@ -21,7 +21,7 @@ spec:
       automountServiceAccountToken: false
       containers:
       - name: portal-validator
-        image: docker.io/mohankrishna999/portal-validator:1.1.1
+        image: docker.io/mohankrishna999/portal-validator:1.1.2
         ports:
         - containerPort: 8080
         securityContext:
@@ -37,6 +37,14 @@ spec:
           value: /auth
         - name: MAX_CONCURRENT_SCANS
           value: "2"
+        - name: HOME
+          value: /tmp/portal-validator-home
+        - name: PLAYWRIGHT_BROWSERS_PATH
+          value: /ms-playwright
+        - name: SSL_CERT_FILE
+          value: /etc/portal-validator/certs/ca-bundle.crt
+        - name: REQUESTS_CA_BUNDLE
+          value: /etc/portal-validator/certs/ca-bundle.crt
         - name: CORPORATE_CA_BUNDLE
           value: /etc/portal-validator/certs/ca-bundle.crt
         volumeMounts:
@@ -45,6 +53,9 @@ spec:
           readOnly: true
         - name: trusted-ca
           mountPath: /etc/portal-validator/certs
+          readOnly: true
+        - name: zscaler-ca
+          mountPath: /etc/portal-validator/zscaler
           readOnly: true
         readinessProbe:
           httpGet: {path: /healthz, port: 8080}
@@ -63,6 +74,12 @@ spec:
           items:
           - key: ca-bundle.crt
             path: ca-bundle.crt
+      - name: zscaler-ca
+        configMap:
+          name: portal-validator-zscaler-ca
+          items:
+          - key: zscaler-root-ca.crt
+            path: zscaler-root-ca.crt
 ---
 apiVersion: v1
 kind: Service

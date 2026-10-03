@@ -1,5 +1,5 @@
 ARG PYTHON_BUILD_IMAGE=cgr.dev/chainguard/python:latest-dev@sha256:1c830d26eef0eb4231d8c119e037bee325329aa0ac67c527a86d6e62c05d23d1
-ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.1.1
+ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.1.2
 FROM ${PYTHON_BUILD_IMAGE} AS debug-dependencies
 
 USER 0
@@ -23,5 +23,5 @@ RUN python -c "from pathlib import Path; from playwright.sync_api import sync_pl
 
 USER 10001:10001
 EXPOSE 8080 5678
-ENTRYPOINT []
+ENTRYPOINT ["/app/container-entrypoint.sh"]
 CMD ["python", "-m", "debugpy", "--listen", "0.0.0.0:5678", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]

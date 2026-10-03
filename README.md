@@ -2,6 +2,9 @@
 
 A browser-based validator for public, private, and authenticated web portals. It crawls an explicitly bounded host with Chromium and reports broken pages, JavaScript errors, failed resources, performance, and missing security headers.
 
+Targets may be entered as a hostname such as `google.com` or as an HTTP(S) URL;
+bare hostnames default to HTTPS.
+
 ## Authentication modes
 
 - Anonymous/public portal
@@ -15,7 +18,8 @@ Sensitive headers are attached only to the approved portal hostname or its expli
 
 ## Safety boundaries
 
-- Navigation stays on the target hostname unless subdomains are explicitly enabled.
+- Navigation stays on the target hostname and its equivalent `www`/non-`www`
+  form unless subdomains are explicitly enabled.
 - CDN/API hosts are separate, explicit resource-only allowances.
 - Loopback, link-local, multicast, reserved, and unspecified addresses are blocked.
 - Private-network scanning requires explicit per-scan approval.
@@ -33,13 +37,14 @@ Chromium revision under `/ms-playwright`; the application does not override it
 with a system Chrome executable. The application runs as UID/GID `10001`.
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.1.1 .
+docker build -t mohankrishna999/portal-validator:1.1.2 .
 docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,noexec,nosuid,size=256m \
   -v ./auth:/auth:ro \
   -v ./corporate-ca.pem:/etc/portal-validator/certs/ca-bundle.crt:ro \
+  -v ./zscaler-root-ca.crt:/etc/portal-validator/zscaler/zscaler-root-ca.crt:ro \
   -e CORPORATE_CA_BUNDLE=/etc/portal-validator/certs/ca-bundle.crt \
-  mohankrishna999/portal-validator:1.1.1
+  mohankrishna999/portal-validator:1.1.2
 ```
 
 Open <http://localhost:8080>.
@@ -49,10 +54,11 @@ Open <http://localhost:8080>.
 The debug image includes hot reload and a `debugpy` listener on port 5678.
 
 ```bash
-docker build -f Dockerfile-debug -t mohankrishna999/portal-validator:1.1.1-debug .
+docker build -f Dockerfile-debug -t mohankrishna999/portal-validator:1.1.2-debug .
 docker run --rm -p 8080:8080 -p 5678:5678 \
   -v "$PWD/app:/app/app" -v "$PWD/auth:/auth:ro" \
-  mohankrishna999/portal-validator:1.1.1-debug
+  -v ./zscaler-root-ca.crt:/etc/portal-validator/zscaler/zscaler-root-ca.crt:ro \
+  mohankrishna999/portal-validator:1.1.2-debug
 ```
 
 ## Tests
@@ -66,7 +72,7 @@ Verify the Playwright-managed browser inside the production image:
 
 ```bash
 docker run --rm -i --entrypoint python \
-  mohankrishna999/portal-validator:1.1.1 - <<'PY'
+  mohankrishna999/portal-validator:1.1.2 - <<'PY'
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
@@ -101,6 +107,20 @@ oc create configmap portal-validator-trusted-ca \
   --dry-run=client -o yaml | oc apply -f -
 ```
 
+Create the dedicated Zscaler root CA ConfigMap separately:
+
+```bash
+oc create configmap portal-validator-zscaler-ca \
+  --from-file=zscaler-root-ca.crt=./zscaler-root-ca.crt \
+  --dry-run=client -o yaml | oc apply -f -
+```
+
+The container entrypoint requires this certificate and imports it as
+`Zscaler Root CA` with `C,,` trust into
+`sql:$HOME/.local/share/pki/nssdb` before Uvicorn starts. The import is
+idempotent, and startup fails if the mounted certificate is absent or cannot be
+imported. The certificate remains external to the image.
+
 The PEM file must contain the self-signed corporate root and any required
 intermediate certificates. At startup, Portal Validator combines it with the
 container's public CA bundle and imports it into Chromium's NSS database. An
@@ -125,3 +145,6 @@ Missing optional security headers, console errors, or failed subresources make a
 successfully loaded page a `WARNING`; they do not turn it into a load failure.
 Certificate failures are reported as `FAILED_TO_LOAD` with category
 `TLS_CERTIFICATE_ERROR`, TLS `UNTRUSTED`, and security headers `NOT_TESTED`.
+TLS `TRUSTED` means Chromium completed HTTPS certificate-chain validation. It
+does not claim that the origin certificate was independently inspected, which
+is important when a corporate proxy such as Zscaler terminates TLS.
