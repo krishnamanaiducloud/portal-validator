@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.2.1 is a browser-based HTTP/HTTPS validator for public,
+Portal Validator 1.2.2 is a browser-based HTTP/HTTPS validator for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -27,7 +27,9 @@ Browser navigation and crawling intentionally have different boundaries:
 - Scan-supplied Basic, bearer, and custom-header credentials are sent only to
   approved credential hosts. Browser cookie domain rules remain in effect.
 - Mutating methods are blocked unless the caller explicitly acknowledges them
-  and supplies safe portal-scoped path prefixes.
+  and supplies safe portal-scoped path prefixes. Main-frame SSO form POSTs are
+  handled separately: they are allowed only inside a detected authentication
+  chain and every new destination still passes the network/SSRF policy.
 - Only ports 80, 443, 8080, and 8443 are accepted.
 
 Authentication modes are anonymous, HTTP Basic, bearer/token, custom headers,
@@ -39,6 +41,9 @@ classifications such as `PASS`, `AUTH_REQUIRED`, `AUTH_FAILED`, `AUTH_TIMEOUT`,
 Treat `storage_state` files as secrets: generate them through an approved
 authentication workflow, store them in an OpenShift Secret, mount them
 read-only at `/auth`, restrict access, rotate them, and never commit them.
+The UI discovers valid `*.json` profiles from this mount; users cannot enter an
+arbitrary container path. Desktop browser sessions are separate from the
+Playwright Chromium session running in OpenShift.
 
 Run this service only for systems you are authorized to validate, and protect
 the service itself with organizational access controls.
@@ -97,10 +102,10 @@ compatible with an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.2.1 .
+docker build -t mohankrishna999/portal-validator:1.2.2 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.2.1 \
-  -t mohankrishna999/portal-validator:1.2.1-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.2.2 \
+  -t mohankrishna999/portal-validator:1.2.2-debug .
 ```
 
 The debug image adds `debugpy`, hot reload, and port 5678. It inherits the same
@@ -114,7 +119,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.2.1
+  mohankrishna999/portal-validator:1.2.2
 ```
 
 ## OpenShift
@@ -171,9 +176,12 @@ python -m pytest -q
 ```
 
 Each result separates `page_load_status` (`LOADED`/`FAILED_TO_LOAD`) from
-`validation_status` (`PASS`/`WARNING`/`FAIL`/`NOT_TESTED`). Failed subresources
-remain findings and do not turn a successfully loaded main document into a load
-failure. `tls_status=TRUSTED` means Chromium completed certificate-chain
+`validation_status` (`PASS`/`WARNING`/`FAIL`/`NOT_TESTED`) and the authoritative
+page outcome (`PASS`, `PASS_WITH_WARNINGS`, authentication outcomes, or an
+actual failure). `PASS_WITH_WARNINGS` remains a passed page. Expected resources
+skipped by validator policy are informational and deduplicated; unexpected
+failed subresources remain warnings and do not turn a successfully loaded main
+document into a load failure. `tls_status=TRUSTED` means Chromium completed certificate-chain
 validation; it does not claim independent inspection of the origin certificate
 when an enterprise TLS proxy is present.
 

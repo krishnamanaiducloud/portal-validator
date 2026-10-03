@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse, urldefrag
@@ -15,6 +16,12 @@ AUTH_QUERY_KEYS = frozenset({
     "samlrequest",
     "samlresponse",
     "relaystate",
+})
+AUTH_FORM_KEYS = frozenset({
+    "samlrequest", "samlresponse", "relaystate", "code", "id_token", "state", "error",
+})
+AUTH_PATH_MARKERS = frozenset({
+    "authorize", "authorization", "oauth", "oidc", "saml", "sso", "signin", "login", "idp",
 })
 
 
@@ -41,9 +48,20 @@ class NavigationTracker:
         self.destinations: list[NavigationDestination] = []
         self._seen: set[str] = set()
 
-    def record_destination(self, url: str, *, now: float | None = None) -> None:
+    def record_destination(
+        self,
+        url: str,
+        *,
+        now: float | None = None,
+        allow_revisit: bool = False,
+    ) -> None:
         normalized = urldefrag(url).url
-        if normalized in self._seen:
+        if normalized in self._seen and (
+            not allow_revisit
+            or not self.destinations
+            or self.destinations[-1].raw_url == normalized
+            or sum(destination.raw_url == normalized for destination in self.destinations) >= 2
+        ):
             raise DestinationError("NAVIGATION_ERROR", "Redirect loop detected")
         if len(self.destinations) >= self.max_redirects + 1:
             raise DestinationError("NAVIGATION_ERROR", "Maximum redirect count exceeded")
@@ -56,6 +74,22 @@ class NavigationTracker:
             if destination.raw_url == normalized:
                 destination.status = status
                 return
+
+    def reconcile_http_chain(self, chain: list[tuple[str, int | None]]) -> None:
+        """Use Playwright's authoritative HTTP redirect chain when routing missed a hop."""
+        normalized_chain = [(urldefrag(url).url, status) for url, status in chain]
+        if len(normalized_chain) > len(self.destinations):
+            now = time.perf_counter()
+            self.destinations = [
+                NavigationDestination(url, now + (index / 1000), status)
+                for index, (url, status) in enumerate(normalized_chain)
+            ]
+            self._seen = {destination.raw_url for destination in self.destinations}
+            return
+        statuses = {url: status for url, status in normalized_chain}
+        for destination in self.destinations:
+            if destination.raw_url in statuses:
+                destination.status = statuses[destination.raw_url]
 
     @property
     def redirect_count(self) -> int:
@@ -86,7 +120,41 @@ class NavigationTracker:
 def auth_protocol_signal(url: str) -> bool:
     parsed = urlparse(url)
     keys = {key.lower() for key in parse_qs(parsed.query, keep_blank_values=True)}
-    return bool(keys & AUTH_QUERY_KEYS)
+    path_tokens = {token for token in re.split(r"[^a-z0-9]+", parsed.path.lower()) if token}
+    return bool(keys & AUTH_QUERY_KEYS or path_tokens & AUTH_PATH_MARKERS)
+
+
+def authentication_form_signal(post_data: str | None) -> bool:
+    if not post_data:
+        return False
+    try:
+        keys = {key.lower() for key in parse_qs(post_data, keep_blank_values=True)}
+    except (TypeError, ValueError):
+        return False
+    return bool(keys & AUTH_FORM_KEYS)
+
+
+@dataclass
+class AuthenticationNavigationPolicy:
+    """Track an SSO navigation chain without broadening crawler or resource scope."""
+
+    active: bool = False
+
+    def observe(self, url: str) -> None:
+        self.active = self.active or auth_protocol_signal(url)
+
+    def allows_main_frame_method(self, method: str, url: str, post_data: str | None = None) -> bool:
+        normalized_method = method.upper()
+        url_signal = auth_protocol_signal(url)
+        self.observe(url)
+        if normalized_method in {"GET", "HEAD", "OPTIONS"}:
+            return True
+        if normalized_method != "POST":
+            return False
+        form_signal = authentication_form_signal(post_data)
+        allowed = form_signal or (self.active and url_signal)
+        self.active = self.active or form_signal
+        return allowed
 
 
 def classify_authentication(

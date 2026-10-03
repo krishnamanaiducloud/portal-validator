@@ -7,6 +7,7 @@ const results = byId('results');
 const toast = byId('toast');
 let lastReport = null;
 let profileNames = [];
+let profileMessage = '';
 
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
 const splitList = (value) => value.split(',').map((item) => item.trim()).filter(Boolean);
@@ -19,13 +20,17 @@ function notify(message, isError = false) {
 }
 
 function renderAuthFields() {
+  const profileOptions = profileNames.length
+    ? `<option value="">Choose a profile</option>${profileNames.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('')}`
+    : '<option value="" disabled selected>No valid profiles mounted</option>';
+  const profileHelp = profileMessage || 'Profiles are discovered from the read-only /auth mount.';
   const templates = {
     none: '<div class="empty-auth">No credentials will be sent. Best for public portals.</div>',
     basic: '<div class="field-grid"><label class="field"><span>Username</span><input id="auth-username" autocomplete="username"></label><label class="field"><span>Password</span><input id="auth-password" type="password" autocomplete="current-password"></label></div>',
     bearer: '<label class="field"><span>Bearer token</span><input id="auth-token" type="password" autocomplete="off" placeholder="Token is never stored or returned"></label>',
     headers: '<label class="field"><span>Custom headers</span><textarea id="auth-headers" rows="4" placeholder="X-API-Key: value&#10;X-Portal-Context: validation"></textarea><small>One header per line. Unsafe transport headers are blocked.</small></label>',
     cookies: '<label class="field"><span>Session cookies</span><textarea id="auth-cookies" rows="4" placeholder="session_id=value&#10;portal_context=value"></textarea><small>One name=value pair per line, scoped to the target hostname.</small></label>',
-    storage_state: `<label class="field"><span>Mounted SSO profile</span><select id="auth-profile"><option value="">Choose a profile</option>${profileNames.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('')}</select><small>Mount Playwright state as /auth/&lt;profile&gt;.json.</small></label>`,
+    storage_state: `<label class="field"><span>Mounted SSO profile</span><select id="auth-profile" ${profileNames.length ? '' : 'disabled'}>${profileOptions}</select><small>${escapeHtml(profileHelp)} Profiles must be approved Playwright storage state mounted read-only under /auth.</small></label>`,
   };
   authFields.innerHTML = templates[authMode.value];
 }
@@ -66,11 +71,14 @@ function renderReport(report) {
   const summaryMetrics = [
     ['Pages', report.pages, ''],
     ['Loaded', report.summary.loaded, 'good'],
-    ['Failed to load', report.summary.failed_to_load, report.summary.failed_to_load ? 'bad' : 'good'],
-    ['Passed', report.summary.pass, 'good'],
-    ['Warnings', report.summary.warning, report.summary.warning ? 'warn' : ''],
-    ['Findings', report.summary.findings, report.summary.findings ? 'warn' : ''],
-    ['Validation failures', report.summary.fail, report.summary.fail ? 'bad' : ''],
+    ['Passed', report.summary.passed_pages, 'good'],
+    ['Passed with warnings', report.summary.pass_with_warnings, report.summary.pass_with_warnings ? 'warn' : ''],
+    ['Failed', report.summary.failed_pages, report.summary.failed_pages ? 'bad' : 'good'],
+    ['Auth required', report.summary.auth_required_pages, report.summary.auth_required_pages ? 'auth' : ''],
+    ['Warnings', report.summary.warning_findings, report.summary.warning_findings ? 'warn' : ''],
+    ['Errors', report.summary.error_findings, report.summary.error_findings ? 'bad' : ''],
+    ['Findings', report.summary.total_findings, ''],
+    ['Validation failures', report.summary.validation_failures, report.summary.validation_failures ? 'bad' : 'good'],
     ['Total load time', duration, ''],
   ];
   byId('summary').innerHTML = summaryMetrics.map(([label, value, kind]) => `<div class="metric ${kind}"><strong>${escapeHtml(value)}</strong><span>${label}</span></div>`).join('');
@@ -90,20 +98,23 @@ function renderReport(report) {
       error: item.error,
       tls_basis: item.tls_basis,
       tls_detail: item.tls_detail,
+      tls: item.tls,
+      finding_details: item.finding_details,
+      finding_occurrences: item.finding_occurrences,
       console_errors: item.console_errors,
       failed_resources: item.failed_resources,
       missing_security_headers: item.missing_security_headers,
       security_headers: item.security_headers,
     };
     const category = item.category ? `<div><span>Category</span><strong>${escapeHtml(item.category)}</strong></div>` : '';
-    return `<details class="result-item load-${statusClass(loadStatus)} validation-${statusClass(validationStatus)}">
+    return `<details class="result-item outcome-${statusClass(item.classification)} load-${statusClass(loadStatus)} validation-${statusClass(validationStatus)}">
       <summary><span class="result-dot"></span><span class="result-url">${escapeHtml(item.url)}</span><span class="result-meta">${escapeHtml(item.findings)} findings &middot; ${escapeHtml(item.load_ms ?? '—')}ms</span></summary>
       <div class="result-detail">
         <div class="result-overview">
           <div><span>Page Load</span><strong class="state ${statusClass(loadStatus)}">${escapeHtml(loadStatus)}</strong></div>
           <div><span>HTTP</span><strong>${escapeHtml(httpStatus)}</strong></div>
           <div><span>Validation</span><strong class="state ${statusClass(validationStatus)}">${escapeHtml(validationStatus)}</strong></div>
-          <div><span>Classification</span><strong>${escapeHtml(item.classification)}</strong></div>
+          <div><span>Classification</span><strong class="state ${statusClass(item.classification)}">${escapeHtml(item.classification)}</strong></div>
           <div><span>TLS</span><strong class="state ${statusClass(item.tls_status)}">${escapeHtml(item.tls_status)}</strong></div>
           <div><span>Security Headers</span><strong class="state ${statusClass(item.security_headers_status)}">${escapeHtml(item.security_headers_status)}</strong></div>
           <div><span>Findings</span><strong>${escapeHtml(item.findings)}</strong></div>
@@ -154,5 +165,6 @@ byId('download-button').addEventListener('click', () => {
 
 fetch('/api/auth-profiles').then((response) => response.json()).then((data) => {
   profileNames = data.profiles || [];
+  profileMessage = data.message || '';
   renderAuthFields();
 }).catch(renderAuthFields);

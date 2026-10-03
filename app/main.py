@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import ipaddress
+import json
 import logging
 import os
 import re
 import time
 import uuid
-from collections import Counter, deque
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -22,10 +23,12 @@ from playwright.async_api import BrowserContext, Route, async_playwright
 
 from app.logging_config import LOGGER, log_event
 from app.navigation import (
+    AuthenticationNavigationPolicy,
     NavigationTracker,
     classify_authentication,
     classify_navigation_error,
 )
+from app.reporting import aggregate_report, classify_page_result
 from app.security import (
     DestinationError,
     normalized_host,
@@ -67,7 +70,7 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(
     title="Portal Validator",
-    version="1.2.1",
+    version="1.2.2",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -256,7 +259,73 @@ def storage_state_path(profile: str | None) -> Path:
     root = AUTH_STATE_DIR.resolve()
     if root not in path.parents or not path.is_file():
         raise HTTPException(400, "Storage-state profile was not found")
+    try:
+        validate_storage_state_file(path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, "Storage-state profile is not valid Playwright JSON") from exc
     return path
+
+
+def validate_storage_state_file(path: Path) -> None:
+    """Validate Playwright storage state without returning or logging its secrets."""
+    size = path.stat().st_size
+    if size <= 0 or size > 10 * 1024 * 1024:
+        raise ValueError("Storage-state file size is invalid")
+    with path.open("r", encoding="utf-8") as handle:
+        state = json.load(handle)
+    if not isinstance(state, dict):
+        raise ValueError("Storage state must be an object")
+    cookies = state.get("cookies", [])
+    origins = state.get("origins", [])
+    if not isinstance(cookies, list) or not isinstance(origins, list):
+        raise ValueError("Storage state cookies and origins must be arrays")
+    for cookie in cookies:
+        if (
+            not isinstance(cookie, dict)
+            or not all(isinstance(cookie.get(key), str) for key in ("name", "value", "domain", "path"))
+            or not all(cookie.get(key) for key in ("name", "domain", "path"))
+        ):
+            raise ValueError("Storage state contains an invalid cookie")
+    for origin_state in origins:
+        if not isinstance(origin_state, dict) or not isinstance(origin_state.get("origin"), str):
+            raise ValueError("Storage state contains an invalid origin")
+        validate_http_url(origin_state["origin"])
+        local_storage = origin_state.get("localStorage", [])
+        if not isinstance(local_storage, list) or not all(
+            isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and isinstance(item.get("value"), str)
+            for item in local_storage
+        ):
+            raise ValueError("Storage state contains invalid local storage")
+
+
+def discover_storage_profiles() -> list[str]:
+    if not AUTH_STATE_DIR.is_dir():
+        return []
+    profiles: list[str] = []
+    for path in AUTH_STATE_DIR.glob("*.json"):
+        if not PROFILE_RE.fullmatch(path.stem):
+            continue
+        try:
+            resolved = path.resolve(strict=True)
+            if AUTH_STATE_DIR.resolve() not in resolved.parents:
+                continue
+            validate_storage_state_file(resolved)
+        except (OSError, ValueError, json.JSONDecodeError, DestinationError):
+            continue
+        profiles.append(path.stem)
+    return sorted(profiles)
+
+
+def browser_context_options(state_path: Path | None) -> dict[str, object]:
+    options: dict[str, object] = {
+        "ignore_https_errors": False,
+        "service_workers": "block",
+    }
+    if state_path is not None:
+        options["storage_state"] = str(state_path)
+    return options
 
 
 def auth_headers(authentication: Authentication) -> dict[str, str]:
@@ -291,94 +360,6 @@ def headers_for_destination(
     if normalized_host(destination_host) in credential_hosts:
         headers.update(sensitive_headers)
     return headers
-
-
-def classify_page_result(
-    *,
-    url: str,
-    status: int | None,
-    error: str | None,
-    missing_security_headers: list[str],
-    console_errors: list[str],
-    failed_resources: list[dict],
-    security_headers_tested: bool,
-    authentication_classification: str | None = None,
-) -> dict[str, str | int | bool | None]:
-    loaded = error is None and status is not None
-    classification = authentication_classification
-    if classification is None:
-        if error:
-            classification = classify_navigation_error(error)
-        elif status == 401:
-            classification = "AUTH_REQUIRED"
-        elif status == 403:
-            classification = "ACCESS_RESTRICTED"
-        elif status is not None and status >= 400:
-            classification = "HTTP_ERROR"
-        else:
-            classification = "PASS"
-
-    category = "TLS_CERTIFICATE_ERROR" if classification == "TLS_ERROR" else (
-        None if classification == "PASS" else classification
-    )
-    page_load_status = "LOADED" if loaded else "FAILED_TO_LOAD"
-
-    if classification == "TLS_ERROR":
-        tls_status = "UNTRUSTED"
-        tls_basis = "BROWSER_CERTIFICATE_VALIDATION"
-        tls_detail = "Chromium rejected the HTTPS certificate chain."
-    elif loaded and urlparse(url).scheme == "https":
-        tls_status = "TRUSTED"
-        tls_basis = "BROWSER_CERTIFICATE_VALIDATION"
-        tls_detail = "Chromium established HTTPS with certificate verification enabled; the origin certificate was not independently inspected."
-    elif loaded:
-        tls_status = "NOT_APPLICABLE"
-        tls_basis = "NOT_APPLICABLE"
-        tls_detail = "The final page used HTTP rather than HTTPS."
-    else:
-        tls_status = "NOT_TESTED"
-        tls_basis = "NOT_TESTED"
-        tls_detail = "Browser TLS trust could not be evaluated because main-document navigation did not complete."
-
-    if not loaded or not security_headers_tested:
-        security_headers_status = "NOT_TESTED"
-    elif missing_security_headers:
-        security_headers_status = "WARNING"
-    else:
-        security_headers_status = "PASS"
-
-    findings = (
-        len(missing_security_headers)
-        + len(console_errors)
-        + len(failed_resources)
-        + int(bool(status is not None and status >= 400))
-    )
-    auth_incomplete = classification in {
-        "AUTH_REQUIRED", "AUTH_TIMEOUT", "MFA_REQUIRED", "SESSION_EXPIRED",
-    }
-    hard_failure = classification in {"AUTH_FAILED", "ACCESS_RESTRICTED", "HTTP_ERROR"}
-    if not loaded or auth_incomplete:
-        validation_status = "NOT_TESTED"
-    elif hard_failure:
-        validation_status = "FAIL"
-    elif findings:
-        validation_status = "WARNING"
-        category = category or "VALIDATION_FINDINGS"
-    else:
-        validation_status = "PASS"
-
-    return {
-        "classification": classification,
-        "page_load_status": page_load_status,
-        "validation_status": validation_status,
-        "category": category,
-        "tls_status": tls_status,
-        "tls_basis": tls_basis,
-        "tls_detail": tls_detail,
-        "security_headers_status": security_headers_status,
-        "findings": findings,
-        "passed": loaded and classification == "PASS" and validation_status != "FAIL",
-    }
 
 
 async def configure_cookies(context: BrowserContext, req: ScanRequest, root_host: str) -> None:
@@ -452,14 +433,30 @@ async def healthz():
 
 @app.get("/api/auth-profiles")
 async def auth_profiles():
-    if not AUTH_STATE_DIR.is_dir():
-        return {"profiles": []}
+    profiles = discover_storage_profiles()
     return {
-        "profiles": sorted(
-            path.stem for path in AUTH_STATE_DIR.glob("*.json")
-            if PROFILE_RE.fullmatch(path.stem)
-        )
+        "profiles": profiles,
+        "message": None if profiles else (
+            "No valid SSO session profiles are mounted. A desktop browser session is separate "
+            "from Chromium running in this container."
+        ),
     }
+
+
+async def reconcile_http_redirect_chain(response, tracker: NavigationTracker) -> None:
+    requests = []
+    request = response.request
+    while request is not None:
+        requests.append(request)
+        request = request.redirected_from
+    chain: list[tuple[str, int | None]] = []
+    for redirected_request in reversed(requests):
+        redirected_response = await redirected_request.response()
+        chain.append((
+            redirected_request.url,
+            redirected_response.status if redirected_response is not None else None,
+        ))
+    tracker.reconcile_http_chain(chain)
 
 
 async def _resolve_with_logging(host: str, req: ScanRequest, scan_id: str) -> list[str]:
@@ -537,10 +534,7 @@ async def scan(req: ScanRequest):
             )
             log_event(logging.INFO, "BROWSER_LAUNCHED", scan_id=scan_id)
             try:
-                context_args = {"ignore_https_errors": False, "service_workers": "block"}
-                if state_path:
-                    context_args["storage_state"] = str(state_path)
-                context = await browser.new_context(**context_args)
+                context = await browser.new_context(**browser_context_options(state_path))
                 await configure_cookies(context, req, root_host)
                 page = await context.new_page()
                 console_errors: list[str] = []
@@ -548,6 +542,8 @@ async def scan(req: ScanRequest):
                 current_tracker: NavigationTracker | None = None
                 navigation_policy_error: DestinationError | None = None
                 navigation_hosts: set[str] = set()
+                authentication_navigation = AuthenticationNavigationPolicy()
+                validator_blocks: dict[tuple[str, str, str, bool], deque[str]] = defaultdict(deque)
 
                 def record_console_error(message):
                     if message.type == "error":
@@ -559,12 +555,41 @@ async def scan(req: ScanRequest):
                     except Exception:
                         return False
 
+                def request_event_key(request) -> tuple[str, str, str, bool]:
+                    return (
+                        sanitized_url(request.url),
+                        request.method.upper(),
+                        request.resource_type,
+                        is_main_navigation(request),
+                    )
+
+                async def abort_by_validator(route: Route, reason: str) -> None:
+                    request = route.request
+                    validator_blocks[request_event_key(request)].append(reason)
+                    log_event(
+                        logging.DEBUG,
+                        "REQUEST_BLOCKED_BY_VALIDATOR",
+                        scan_id=scan_id,
+                        hostname=normalized_host(urlparse(request.url).hostname or ""),
+                        resource_type=request.resource_type,
+                        main_document=is_main_navigation(request),
+                        block_reason=reason,
+                    )
+                    await route.abort("blockedbyclient")
+
                 def record_failed_request(request):
+                    key = request_event_key(request)
+                    reasons = validator_blocks.get(key)
+                    block_reason = reasons.popleft() if reasons else None
+                    if reasons is not None and not reasons:
+                        validator_blocks.pop(key, None)
                     failed_resources.append({
                         "url": sanitized_url(request.url),
                         "error": sanitized_diagnostic(request.failure or "Request failed"),
                         "resource_type": request.resource_type,
                         "main_document": is_main_navigation(request),
+                        "blocked_by_validator": block_reason is not None,
+                        "block_reason": block_reason,
                     })
 
                 def record_response(response):
@@ -597,7 +622,11 @@ async def scan(req: ScanRequest):
                             await _resolve_with_logging(validated_host, req, scan_id)
                             if current_tracker is None:
                                 raise DestinationError("NAVIGATION_ERROR", "Navigation tracker is unavailable")
-                            current_tracker.record_destination(request.url)
+                            authentication_navigation.observe(request.url)
+                            current_tracker.record_destination(
+                                request.url,
+                                allow_revisit=authentication_navigation.active,
+                            )
                             navigation_hosts.add(validated_host)
                         except DestinationError as exc:
                             navigation_policy_error = exc
@@ -609,23 +638,42 @@ async def scan(req: ScanRequest):
                                 hostname=host,
                                 error=exc.public_message,
                             )
-                            await route.abort("blockedbyclient")
+                            await abort_by_validator(route, "network_policy")
                             return
                     elif request_url.scheme not in {"http", "https"} or not (
                         portal_scoped or resource_scoped or host in navigation_hosts
                     ):
-                        await route.abort("blockedbyclient")
+                        await abort_by_validator(route, "third_party_resource_policy")
                         return
 
                     if request.method.upper() in MUTATING_METHODS:
-                        allowed = (
+                        auth_navigation_allowed = False
+                        if main_navigation:
+                            try:
+                                post_data = request.post_data
+                            except Exception:
+                                post_data = None
+                            auth_navigation_allowed = authentication_navigation.allows_main_frame_method(
+                                request.method,
+                                request.url,
+                                post_data,
+                            )
+                        mutation_allowed = (
                             req.allow_mutations
                             and portal_scoped
                             and any(request_url.path.startswith(prefix) for prefix in req.mutation_endpoint_allowlist)
                         )
-                        if not allowed:
-                            await route.abort("blockedbyclient")
+                        if not (auth_navigation_allowed or mutation_allowed):
+                            await abort_by_validator(route, "mutation_policy")
                             return
+                        if auth_navigation_allowed:
+                            log_event(
+                                logging.INFO,
+                                "AUTHENTICATION_NAVIGATION_ALLOWED",
+                                scan_id=scan_id,
+                                hostname=host,
+                                method=request.method.upper(),
+                            )
 
                     headers = headers_for_destination(
                         request.headers,
@@ -644,6 +692,7 @@ async def scan(req: ScanRequest):
                     current_tracker = NavigationTracker(req.max_redirects)
                     navigation_policy_error = None
                     navigation_hosts.clear()
+                    authentication_navigation = AuthenticationNavigationPolicy()
                     requested_url = sanitized_url(url)
                     requested_host = normalized_host(urlparse(url).hostname or "")
                     final_url: str | None = None
@@ -683,13 +732,16 @@ async def scan(req: ScanRequest):
                                 raise RuntimeError("Navigation completed without an HTTP response")
                             final_raw_url = page.url
                             final_url = sanitized_url(final_raw_url)
+                            await reconcile_http_redirect_chain(response, current_tracker)
                             redirects = current_tracker.redirects()
                             for redirect in redirects:
                                 log_event(logging.INFO, "REDIRECT_DETECTED", scan_id=scan_id, **redirect)
                                 if not redirect["same_origin"]:
                                     log_event(logging.INFO, "CROSS_ORIGIN_REDIRECT", scan_id=scan_id, **redirect)
                             status = response.status
-                            response_headers = await response.all_headers()
+                            response_headers = {
+                                name.lower(): value for name, value in (await response.all_headers()).items()
+                            }
                             title = sanitize_text(await page.title(), limit=512)
                             final_in_scope = url_in_scope(final_raw_url, root_host, req.allow_subdomains)
                             password_form, mfa_form = await detect_auth_signals(page)
@@ -775,20 +827,36 @@ async def scan(req: ScanRequest):
                             )
 
                     elapsed = round((time.perf_counter() - started) * 1000)
-                    header_report = {
-                        name: response_headers.get(name) for name in SECURITY_HEADERS
-                    } if req.check_security_headers else {}
                     page_console = console_errors[console_start:] if req.check_console else []
                     page_failures = failed_resources[failed_start:] if req.check_resources else []
                     subresource_failures = sum(not failure["main_document"] for failure in page_failures)
-                    if subresource_failures:
+                    unexpected_subresource_failures = sum(
+                        not failure["main_document"] and not failure.get("blocked_by_validator")
+                        for failure in page_failures
+                    )
+                    if unexpected_subresource_failures:
                         log_event(
                             logging.WARNING,
                             "SUBRESOURCE_FAILURES",
                             scan_id=scan_id,
                             hostname=requested_host,
-                            count=subresource_failures,
+                            count=unexpected_subresource_failures,
                         )
+                    validator_skips = subresource_failures - unexpected_subresource_failures
+                    if validator_skips:
+                        log_event(
+                            logging.INFO,
+                            "VALIDATOR_RESOURCE_SKIPS",
+                            scan_id=scan_id,
+                            hostname=requested_host,
+                            count=validator_skips,
+                        )
+                    header_names = SECURITY_HEADERS
+                    if urlparse(final_url or requested_url).scheme != "https":
+                        header_names = tuple(name for name in SECURITY_HEADERS if name != "strict-transport-security")
+                    header_report = {
+                        name: response_headers.get(name) for name in header_names
+                    } if req.check_security_headers else {}
                     missing_headers = [name for name, value in header_report.items() if not value]
                     classification = classify_page_result(
                         url=final_url or requested_url,
@@ -835,38 +903,25 @@ async def scan(req: ScanRequest):
             finally:
                 await browser.close()
 
-    load_counts = Counter(result["page_load_status"] for result in results)
-    validation_counts = Counter(result["validation_status"] for result in results)
-    classification_counts = Counter(result["classification"] for result in results)
+    summary = aggregate_report(results)
     trust_status: TrustStatus = getattr(app.state, "trust_status", TrustStatus(enabled=False))
     log_event(
         logging.INFO,
         "SCAN_COMPLETED",
         scan_id=scan_id,
         pages=len(results),
-        loaded=load_counts["LOADED"],
-        failed_to_load=load_counts["FAILED_TO_LOAD"],
-        findings=sum(result["findings"] for result in results),
-        classification=dict(classification_counts),
+        loaded=summary["loaded"],
+        failed_to_load=summary["failed_to_load"],
+        passed=summary["passed_pages"],
+        findings=summary["total_findings"],
+        classification=summary["classifications"],
     )
     return {
         "scan_id": scan_id,
         "run_id": scan_id,
         "target": sanitized_url(req.target),
         "pages": len(results),
-        "summary": {
-            "loaded": load_counts["LOADED"],
-            "failed_to_load": load_counts["FAILED_TO_LOAD"],
-            "pass": validation_counts["PASS"],
-            "warning": validation_counts["WARNING"],
-            "fail": validation_counts["FAIL"],
-            "not_tested": validation_counts["NOT_TESTED"],
-            "passed": validation_counts["PASS"] + validation_counts["WARNING"],
-            "failed": validation_counts["FAIL"] + load_counts["FAILED_TO_LOAD"],
-            "findings": sum(result["findings"] for result in results),
-            "duration_ms": sum(result["load_ms"] or 0 for result in results),
-            "classifications": dict(classification_counts),
-        },
+        "summary": summary,
         "results": results,
         "safety": {
             "crawl_scope": root_host,

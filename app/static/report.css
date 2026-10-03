@@ -6,17 +6,26 @@
   color: var(--warning);
 }
 
-.result-item.validation-pass .result-dot {
+.result-item.outcome-pass .result-dot {
   background: var(--lime);
 }
 
-.result-item.validation-warning .result-dot {
+.result-item.outcome-pass-with-warnings .result-dot {
   background: var(--warning);
+}
+
+.metric.auth strong {
+  color: #71b7ff;
 }
 
 .result-item.validation-not-tested .result-dot,
 .result-item.load-failed-to-load .result-dot {
   background: var(--danger);
+}
+
+.result-item.outcome-auth-required .result-dot,
+.result-item.outcome-session-expired .result-dot {
+  background: #71b7ff;
 }
 
 .result-overview {
@@ -58,6 +67,15 @@
 
 .state.warning {
   color: var(--warning);
+}
+
+.state.pass-with-warnings {
+  color: var(--warning);
+}
+
+.state.auth-required,
+.state.session-expired {
+  color: #71b7ff;
 }
 
 .state.fail,
