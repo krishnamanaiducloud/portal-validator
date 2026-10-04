@@ -111,8 +111,22 @@ def test_spa_route_without_http_response_is_loaded_with_inherited_tls_and_header
 
 def test_spa_api_failure_fails_health_without_failing_page_load():
     findings = api_health_findings([
-        {"url": "https://portal.example.com/api/health", "status": 502, "error": None},
+        {
+            "url": "https://portal.example.com/api/health?token=secret",
+            "host": "portal.example.com",
+            "endpoint": "/api/health",
+            "method": "POST",
+            "status": 502,
+            "error": None,
+            "importance": "REQUIRED",
+        },
     ])
+    assert findings[0]["resource"] == "POST portal.example.com /api/health"
+    assert findings[0]["http_status"] == 502
+    assert findings[0]["importance"] == "REQUIRED"
+    assert findings[0]["target_failure"] is True
+    assert findings[0]["validator_block"] is False
+    assert "secret" not in str(findings)
     result = classify_page_result(
         url="https://portal.example.com/health", status=None, error=None,
         missing_security_headers=[], console_errors=[], failed_resources=[],
@@ -338,6 +352,103 @@ def test_validator_blocks_are_auditable_but_not_target_api_failures():
     assert inventory[0]["blocked_count"] == 1
     assert inventory[0]["network_failures"] == 0
     assert inventory[0]["health"] == "HEALTHY"
+    assert inventory[0]["observation_outcome"] == "BLOCKED_BY_VALIDATOR"
+    assert inventory[0]["allowed_calls"] == 0
+    assert inventory[0]["blocked_calls"] == 1
+    assert inventory[0]["target_failure_count"] == 0
+
+
+def test_route_and_api_counts_are_independent_and_lifecycle_events_are_not_duplicated():
+    results = [
+        {
+            "url": f"https://portal.example.com/route-{index}",
+            "normalized_route_identity": f"https://portal.example.com/route-{index}",
+            "api_requests": [],
+        }
+        for index in range(44)
+    ]
+    events = [
+        {
+            "url": f"https://api.example.net/api/{index}",
+            "host": "api.example.net",
+            "endpoint": f"/api/{index}",
+            "method": "GET" if index % 2 else "POST",
+            "status": 200,
+            "error": None,
+            "blocked_by_validator": False,
+            "phase": "ROUTE_VALIDATION",
+            "request_classification": "SAFE_METHOD" if index % 2 else "APPROVED_READ_POST",
+            "initiating_route": results[index % 44]["normalized_route_identity"],
+        }
+        for index in range(47)
+    ]
+    inventory = aggregate_api_events(events)
+    assert len(results) == 44
+    assert len(inventory) == 47
+    assert sum(item["calls"] for item in inventory) == 47
+
+
+def test_session_expiration_marks_remaining_routes_not_tested():
+    result = classify_page_result(
+        url="https://portal.example.com/login",
+        status=200,
+        error=None,
+        missing_security_headers=[],
+        console_errors=[],
+        failed_resources=[],
+        security_headers_tested=True,
+        authentication_classification="SESSION_EXPIRED",
+    )
+    summary = aggregate_report(
+        [result],
+        routes_discovered=4,
+        routes_eligible=4,
+        termination_reason="SESSION_EXPIRED",
+    )
+    assert summary["session_expired_pages"] == 1
+    assert summary["routes_not_tested"] == 3
+    assert summary["not_tested_reason_counts"] == {
+        "NOT_TESTED_SESSION_EXPIRED": 3,
+    }
+    assert summary["scan_completeness"] == "PARTIAL"
+
+
+def test_api_inventory_preserves_phase_route_and_request_classification_metadata():
+    inventory = aggregate_api_events([
+        {
+            "url": "https://api.example.net/query",
+            "host": "api.example.net",
+            "endpoint": "/query",
+            "method": "POST",
+            "status": 201,
+            "error": None,
+            "blocked_by_validator": False,
+            "phase": "APPLICATION_BOOTSTRAP",
+            "request_classification": "APPROVED_READ_POST",
+            "initiating_route": "https://portal.example.com/home",
+        },
+        {
+            "url": "https://api.example.net/query",
+            "host": "api.example.net",
+            "endpoint": "/query",
+            "method": "POST",
+            "status": 200,
+            "error": None,
+            "blocked_by_validator": False,
+            "phase": "ROUTE_VALIDATION",
+            "request_classification": "APPROVED_READ_POST",
+            "initiating_route": "https://portal.example.com/reports",
+        },
+    ])
+    item = inventory[0]
+    assert item["calls"] == 2
+    assert item["routes_observed"] == 2
+    assert item["application_bootstrap_phase_count"] == 1
+    assert item["route_validation_phase_count"] == 1
+    assert item["classifications"] == ["APPROVED_READ_POST"]
+    assert item["status_counts"] == {
+        "2xx": 2, "3xx": 0, "4xx": 0, "5xx": 0, "network": 0,
+    }
 
 
 def test_inherited_spa_security_recommendations_are_not_repeated_as_findings():

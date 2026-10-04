@@ -25,7 +25,7 @@ const authOutcomes = new Set(['ACCESS_RESTRICTED','AUTH_REQUIRED','AUTH_FAILED',
 const passOutcomes = new Set(['PASS','PASS_WITH_WARNINGS']);
 const terminalStates = new Set(['COMPLETED','PARTIAL','FAILED','CANCELLED']);
 const numericRouteKeys = new Set(['status','load_ms','api_failures','resource_failure_count','console_count','warning_findings']);
-const numericApiKeys = new Set(['calls','status_2xx','status_3xx','status_4xx','status_5xx','network_failures','route_count','blocked_count','discovery_phase_count','validation_phase_count','average_duration_ms','worst_duration_ms']);
+const numericApiKeys = new Set(['calls','status_2xx','status_3xx','status_4xx','status_5xx','network_failures','route_count','allowed_calls','blocked_count','application_bootstrap_phase_count','authentication_phase_count','route_validation_phase_count','session_refresh_phase_count','average_duration_ms','worst_duration_ms']);
 
 function notify(message, isError = false) {
   toast.textContent = message;
@@ -199,18 +199,35 @@ function updateApiRouteFilter(inventory) {
   if (routes.includes(current)) select.value = current;
 }
 
+function updateApiMethodFilter(inventory) {
+  const select = byId('api-method-filter');
+  const current = select.value;
+  const methods = [...new Set(inventory.map((item) => item.method).filter(Boolean))].sort();
+  select.innerHTML = `<option value="all">All methods</option>${methods.map((method) => `<option value="${escapeHtml(method)}">${escapeHtml(method)}</option>`).join('')}`;
+  if (methods.includes(current)) select.value = current;
+}
+
 function renderApiInventory() {
   const inventory = lastReport?.api_inventory || [];
   const search = byId('api-search').value.trim().toLowerCase();
   const method = byId('api-method-filter').value;
   const health = byId('api-status-filter').value;
+  const policy = byId('api-policy-filter').value;
   const route = byId('api-route-filter')?.value || 'all';
   const failedOnly = apiFailureOnly || byId('api-failed-only').checked;
-  const visible = inventory.filter((item) => (!search || `${item.host} ${item.endpoint}`.toLowerCase().includes(search)) && (method === 'all' || item.method === method) && (health === 'all' || item.health === health) && (route === 'all' || (item.routes_using_endpoint || []).includes(route)) && (!failedOnly || item.health !== 'HEALTHY'));
+  const visible = inventory.filter((item) => {
+    const outcome = item.observation_outcome || (item.health === 'DEGRADED' ? 'WARNING' : item.health);
+    return (!search || `${item.host} ${item.endpoint}`.toLowerCase().includes(search))
+      && (method === 'all' || item.method === method)
+      && (health === 'all' || outcome === health)
+      && (policy === 'all' || (policy === 'blocked' ? Number(item.blocked_count || 0) > 0 : Number(item.allowed_calls ?? item.calls ?? 0) > 0))
+      && (route === 'all' || (item.routes_using_endpoint || []).includes(route))
+      && (!failedOnly || ['FAILED','WARNING'].includes(outcome));
+  });
   visible.sort((left, right) => compareValues(left[apiSort.key], right[apiSort.key], numericApiKeys.has(apiSort.key)) * apiSort.direction);
   updateAriaSort('[data-api-sort]', apiSort, 'apiSort');
   byId('api-count').textContent = visible.length === inventory.length ? `${inventory.length} unique APIs observed` : `${visible.length} of ${inventory.length} unique APIs observed`;
-  byId('api-list').innerHTML = visible.map((item, index) => `<tr><td><strong>${escapeHtml(item.method)}</strong></td><td>${escapeHtml(item.host)}</td><td><button class="api-endpoint" type="button" data-api-index="${index}" title="${escapeHtml(item.endpoint)}">${escapeHtml(item.endpoint)}</button></td><td>${escapeHtml(item.calls)}</td><td>${escapeHtml(item.status_2xx)}</td><td>${escapeHtml(item.status_3xx)}</td><td>${escapeHtml(item.status_4xx)}</td><td>${escapeHtml(item.status_5xx)}</td><td>${escapeHtml(item.network_failures)}</td><td>${escapeHtml(item.route_count)}</td><td>${escapeHtml(item.blocked_count || 0)}</td><td>${escapeHtml(item.discovery_phase_count || 0)}</td><td>${escapeHtml(item.validation_phase_count || 0)}</td><td>${escapeHtml(item.average_duration_ms ?? 'N/A')}</td><td>${escapeHtml(item.worst_duration_ms ?? 'N/A')}</td><td><span class="dimension-state ${statusClass(item.health)}">${escapeHtml(item.health)}</span></td></tr>`).join('') || `<tr><td colspan="16" class="empty-table">${failedOnly ? 'No API failures were observed during this scan.' : 'No API requests match these filters.'}</td></tr>`;
+  byId('api-list').innerHTML = visible.map((item, index) => { const outcome = item.observation_outcome || (item.health === 'DEGRADED' ? 'WARNING' : item.health); return `<tr><td><strong>${escapeHtml(item.method)}</strong></td><td>${escapeHtml(item.host)}</td><td><button class="api-endpoint" type="button" data-api-index="${index}" title="${escapeHtml(item.endpoint)}">${escapeHtml(item.endpoint)}</button></td><td>${escapeHtml(item.calls)}</td><td>${escapeHtml(item.status_2xx)}</td><td>${escapeHtml(item.status_3xx)}</td><td>${escapeHtml(item.status_4xx)}</td><td>${escapeHtml(item.status_5xx)}</td><td>${escapeHtml(item.network_failures)}</td><td>${escapeHtml(item.route_count)}</td><td>${escapeHtml(item.allowed_calls ?? Math.max(0, Number(item.calls || 0) - Number(item.blocked_count || 0)))}</td><td>${escapeHtml(item.blocked_count || 0)}</td><td>${escapeHtml(item.application_bootstrap_phase_count || 0)}</td><td>${escapeHtml(item.authentication_phase_count || 0)}</td><td>${escapeHtml(item.route_validation_phase_count ?? item.validation_phase_count ?? 0)}</td><td>${escapeHtml(item.session_refresh_phase_count || 0)}</td><td>${escapeHtml(item.average_duration_ms ?? 'N/A')}</td><td>${escapeHtml(item.worst_duration_ms ?? 'N/A')}</td><td><span class="dimension-state ${statusClass(outcome)}">${escapeHtml(outcome)}</span></td></tr>`; }).join('') || `<tr><td colspan="19" class="empty-table">${failedOnly ? 'No target API failures were observed during this scan.' : 'No API requests match these filters.'}</td></tr>`;
   byId('api-list').querySelectorAll('[data-api-index]').forEach((button) => button.addEventListener('click', () => {
     const item = visible[Number(button.dataset.apiIndex)];
     showEvidence(`${item.method} ${item.host}${item.endpoint}`, item);
@@ -276,6 +293,8 @@ function renderReport(report) {
   activeDrilldown = 'all';
   apiFailureOnly = false;
   byId('api-failed-only').checked = false;
+  byId('api-policy-filter').value = 'all';
+  updateApiMethodFilter(report.api_inventory || []);
   updateApiRouteFilter(report.api_inventory || []);
   renderRows();
   renderApiInventory();
@@ -366,7 +385,7 @@ authMode.addEventListener('change', renderAuthFields);
 byId('result-search').addEventListener('input', renderRows);
 byId('result-filter').addEventListener('change', renderRows);
 byId('navigation-filter').addEventListener('change', renderRows);
-['api-search','api-method-filter','api-status-filter','api-route-filter','api-failed-only'].forEach((id) => byId(id)?.addEventListener(id === 'api-search' ? 'input' : 'change', () => { if (id === 'api-failed-only') apiFailureOnly = false; renderApiInventory(); }));
+['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-failed-only'].forEach((id) => byId(id)?.addEventListener(id === 'api-search' ? 'input' : 'change', () => { if (id === 'api-failed-only') apiFailureOnly = false; renderApiInventory(); }));
 byId('evidence-close').addEventListener('click', () => { byId('evidence-panel').hidden = true; });
 document.querySelectorAll('[data-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.sort; routeSort = {key, direction:routeSort.key === key ? -routeSort.direction : 1}; renderRows(); }));
 document.querySelectorAll('[data-api-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.apiSort; apiSort = {key, direction:apiSort.key === key ? -apiSort.direction : 1}; renderApiInventory(); }));

@@ -4,6 +4,7 @@ import asyncio
 import time
 from typing import Any
 
+from app.network import safe_api_identity
 from app.reporting import finding
 
 
@@ -163,7 +164,22 @@ def api_health_findings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for event in events:
         status = event.get("status")
-        resource = event.get("url")
+        _, fallback_host, fallback_endpoint = safe_api_identity(str(event.get("url") or ""))
+        method = str(event.get("method") or "GET").upper()
+        host = str(event.get("host") or fallback_host)
+        endpoint = str(event.get("endpoint") or fallback_endpoint)
+        required = event.get("importance", "REQUIRED") == "REQUIRED"
+        resource = f"{method} {host} {endpoint}"
+        detail = {
+            "resource": resource,
+            "method": method,
+            "host": host,
+            "endpoint": endpoint,
+            "http_status": status,
+            "importance": "REQUIRED" if required else "OPTIONAL",
+            "target_failure": True,
+            "validator_block": False,
+        }
         if event.get("error"):
             upper_error = str(event["error"]).upper()
             failure_type = (
@@ -176,10 +192,9 @@ def api_health_findings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 failure_type,
                 "WARNING",
                 "An observed application API request failed.",
-                resource=resource,
+                **detail,
             ))
         elif isinstance(status, int) and status >= 500:
-            required = event.get("importance", "REQUIRED") == "REQUIRED"
             findings.append(finding(
                 "API_SERVER_ERROR" if required else "API_SERVER_ERROR_OPTIONAL",
                 "ERROR" if required else "WARNING",
@@ -188,7 +203,7 @@ def api_health_findings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     if required else
                     f"A background or optional API returned HTTP {status}."
                 ),
-                resource=resource,
+                **detail,
                 blocking=required,
             ))
         elif isinstance(status, int) and status >= 400:
@@ -205,7 +220,7 @@ def api_health_findings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 failure_type,
                 "WARNING",
                 f"An observed application API returned HTTP {status}.",
-                resource=resource,
+                **detail,
             ))
     return findings
 

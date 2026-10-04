@@ -39,16 +39,20 @@ async def main():
             summary:{routes_discovered:3,routes_validated:1,healthy_routes:1,routes_with_warnings:0,
               failed_pages:0,auth_issues:0,api_failures:0,resource_failures:0,slow_pages:0,
               read_only_blocks:0,duration_ms:125,routes_not_tested:2,console_failures:0,
-              unique_apis:2,security_recommendations:1},
+              unique_apis:5,security_recommendations:1},
             coverage:{scan_completeness:'PARTIAL',termination_reason:'MAX_ROUTES_REACHED',routes_discovered:3,routes_validated:1,routes_not_tested:2,routes_remaining:2},
             api_inventory:[{method:'GET',host:'api.example.net',endpoint:'/health',calls:1,status_2xx:1,
               status_3xx:0,status_4xx:0,status_5xx:0,network_failures:0,route_count:1,
-              blocked_count:0,discovery_phase_count:0,validation_phase_count:1,
-              average_duration_ms:12,worst_duration_ms:12,health:'HEALTHY',routes_using_endpoint:['/health']},
+              allowed_calls:1,blocked_count:0,application_bootstrap_phase_count:1,authentication_phase_count:0,route_validation_phase_count:0,session_refresh_phase_count:0,
+              average_duration_ms:12,worst_duration_ms:12,health:'HEALTHY',observation_outcome:'HEALTHY',routes_using_endpoint:['/health']},
               {method:'POST',host:'api.example.net',endpoint:'/query',calls:10,status_2xx:8,
               status_3xx:0,status_4xx:2,status_5xx:0,network_failures:0,route_count:1,
-              blocked_count:1,discovery_phase_count:2,validation_phase_count:8,
-              average_duration_ms:25,worst_duration_ms:40,health:'DEGRADED',routes_using_endpoint:['/health']}],
+              allowed_calls:9,blocked_count:1,application_bootstrap_phase_count:2,authentication_phase_count:0,route_validation_phase_count:8,session_refresh_phase_count:0,
+              average_duration_ms:25,worst_duration_ms:40,health:'DEGRADED',observation_outcome:'WARNING',routes_using_endpoint:['/health']},
+              ...['PUT','PATCH','DELETE'].map((method, index) => ({method,host:'api.example.net',endpoint:`/blocked/${index}`,calls:1,status_2xx:0,
+              status_3xx:0,status_4xx:0,status_5xx:0,network_failures:0,route_count:1,allowed_calls:0,
+              blocked_count:1,application_bootstrap_phase_count:0,authentication_phase_count:0,route_validation_phase_count:1,session_refresh_phase_count:0,
+              average_duration_ms:1,worst_duration_ms:1,health:'HEALTHY',observation_outcome:'BLOCKED_BY_VALIDATOR',routes_using_endpoint:['/health']}))],
             security_recommendations:[{type:'MISSING_SECURITY_HEADER',header:'content-security-policy',
               severity:'RECOMMENDATION',impact:'NON_BLOCKING',affected_document_count:1,
               affected_documents:['https://portal.example.com/health']}],
@@ -70,7 +74,17 @@ async def main():
         assert await page.locator("#result-list .route-name-cell strong").text_content() == "Health"
         assert await page.locator("#result-list .route-cell code").text_content() == "/health"
         assert await page.locator(".metric").count() >= 10
-        assert await page.locator("#api-list tr").count() == 2
+        assert await page.locator("#api-list tr").count() == 5
+        assert await page.locator("#api-method-filter option").all_text_contents() == [
+            "All methods", "DELETE", "GET", "PATCH", "POST", "PUT",
+        ]
+        await page.locator("#api-method-filter").select_option("POST")
+        assert await page.locator("#api-list tr").count() == 1
+        assert await page.locator("#api-list tr td:first-child").text_content() == "POST"
+        await page.locator("#api-method-filter").select_option("all")
+        await page.locator("#api-policy-filter").select_option("blocked")
+        assert await page.locator("#api-list tr").count() == 4
+        await page.locator("#api-policy-filter").select_option("all")
         assert await page.locator("#security-list .recommendation").count() == 1
         calls_sort = page.get_by_role("button", name="Calls", exact=True)
         assert await calls_sort.count() == 1
@@ -113,22 +127,25 @@ async def main():
         assert "HTTP 504" in gateway_message
         assert "Unexpected token" not in gateway_message
         await page.screenshot(path=screenshot, full_page=True)
-        large_inventory = await page.evaluate("""
-          () => {
-            lastReport.api_inventory = Array.from({length:1000}, (_, index) => ({
+        for inventory_size in (100, 500, 1000):
+            large_inventory = await page.evaluate("""
+          (inventorySize) => {
+            lastReport.api_inventory = Array.from({length:inventorySize}, (_, index) => ({
               method:index % 2 ? 'GET' : 'POST', host:'api.example.net', endpoint:`/items/${index}`,
               calls:index + 1, status_2xx:index + 1, status_3xx:0, status_4xx:0, status_5xx:0,
-              network_failures:0, route_count:1, average_duration_ms:index % 37,
-              worst_duration_ms:index % 53, health:'HEALTHY', routes_using_endpoint:['/health']
+              network_failures:0, route_count:1, allowed_calls:index + 1, blocked_count:0,
+              average_duration_ms:index % 37, worst_duration_ms:index % 53, health:'HEALTHY',
+              observation_outcome:'HEALTHY', routes_using_endpoint:['/health']
             }));
+            updateApiMethodFilter(lastReport.api_inventory);
             updateApiRouteFilter(lastReport.api_inventory);
             const started = performance.now();
             renderApiInventory();
             return {milliseconds:performance.now() - started, rows:document.querySelectorAll('#api-list tr').length};
           }
-        """)
-        assert large_inventory["rows"] == 1000
-        assert large_inventory["milliseconds"] < 3000
+        """, inventory_size)
+            assert large_inventory["rows"] == inventory_size
+            assert large_inventory["milliseconds"] < 3000
         for viewport in (
             {"width": 1920, "height": 1080},
             {"width": 1366, "height": 768},

@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.6.0 is an authenticated, read-only browser health validator for public,
+Portal Validator 1.7.0 is an authenticated, read-only browser health validator for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -33,11 +33,51 @@ Browser navigation and crawling intentionally have different boundaries:
   is explicitly credential-approved. Credential, crawl, and resource scopes
   are independent. Browser cookie domain rules remain in effect.
 - Normal validation permits only GET, HEAD, and OPTIONS. Unexpected mutating
-  requests are blocked and reported as `READ_ONLY_MUTATION_BLOCKED`. Main-frame
+  requests are observed first, then blocked and reported as
+  `READ_ONLY_MUTATION_BLOCKED`. Main-frame
   SSO form POSTs are handled separately: they are allowed only inside a detected
   authentication chain and every new destination still passes the network/SSRF
   policy.
 - Only ports 80, 443, 8080, and 8443 are accepted.
+
+### Passive API observation and read-only policy
+
+Observed API Inventory is passive: it records safe metadata for every natural
+browser request method, but it never probes, replays, retries, or transforms an
+API call. Observation never implies permission. Unknown POST, PUT, PATCH,
+DELETE, and other mutation-capable methods remain blocked before reaching the
+target while their attempted method, sanitized host/path, route, and policy
+outcome remain visible. Request/response bodies, headers, cookies, tokens, and
+storage are never captured. Route totals and unique API totals are independent.
+
+Administrators may approve an exact method + hostname + query-free path for a
+logically read-only application request, session refresh, or access-gate action.
+Set `PORTAL_VALIDATOR_READ_ONLY_POLICY` to JSON, or mount the same JSON and set
+`PORTAL_VALIDATOR_READ_ONLY_POLICY_FILE` (maximum 64 KiB). Configure only one:
+
+```json
+{
+  "safe_application_requests": [
+    {
+      "method": "POST",
+      "host": "portal.example.com",
+      "path": "/api/read-query",
+      "classification": "APPROVED_READ_POST"
+    }
+  ],
+  "access_gates": [
+    {"host": "portal.example.com", "selector": "#approved-access-gate"}
+  ]
+}
+```
+
+Rules use exact hosts and paths; URL wording, response status, and request body
+never establish safety. An access-gate selector must resolve to one visible,
+explicitly approved control, and any non-safe request caused by it still needs
+its own safe-request rule. Authentication POSTs retain their separate narrow
+main-frame authentication-chain exception. Browser-native session refresh runs
+inside the same context; lost authenticated sessions terminate remaining route
+validation as `SESSION_EXPIRED` instead of creating misleading failures.
 
 Authentication modes are anonymous, HTTP Basic, bearer/token, custom headers,
 cookies, and mounted Playwright `storage_state`. Reports use generic behavioral
@@ -138,10 +178,10 @@ compatible with an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.6.0 .
+docker build -t mohankrishna999/portal-validator:1.7.0 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.6.0 \
-  -t mohankrishna999/portal-validator:1.6.0-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.7.0 \
+  -t mohankrishna999/portal-validator:1.7.0-debug .
 ```
 
 The debug image adds `debugpy`, hot reload, and port 5678. It inherits the same
@@ -155,7 +195,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.6.0
+  mohankrishna999/portal-validator:1.7.0
 ```
 
 ## OpenShift
@@ -242,7 +282,7 @@ document into a load failure. `tls_status=TRUSTED` means Chromium completed cert
 validation; it does not claim independent inspection of the origin certificate
 when an enterprise TLS proxy is present.
 
-Report schema `2.0` keeps route identity independent from the rendered title.
+Report schema `2.1` keeps route identity independent from the rendered title.
 It preserves canonical hash/hashbang/history paths and exposes `route_name`,
 `route_name_source`, `route_name_confidence`, `display_path`, `spa_route`, and
 deduplicated discovery provenance. Navigation labels and accessible names rank
@@ -261,11 +301,13 @@ routes discovered. Terminal counters follow `discovered = validated +
 not_tested + skipped`; unexecuted routes carry an explicit reason. Summary cards
 drill into route, API, resource, security, and coverage evidence.
 
-Observed API calls are aggregated by sanitized method/host/path with status
-distribution, timing, failure classification, affected routes, read-only block
-count, and discovery/validation/authentication phase counts. Naturally observed
-authentication POSTs are visible, but bodies, credentials, and sensitive
-headers are never captured. Required route APIs and optional/background APIs
+Observed API calls are aggregated by sanitized method/host/normalized path with
+status distribution, timing, failure classification, affected routes, allowed
+and blocked counts, request classifications, and bootstrap/authentication/route
+validation/session-refresh phase counts. Every natural method is observed
+before read-only enforcement. Naturally observed authentication POSTs are
+visible, but bodies, credentials, and sensitive headers are never captured.
+Required route APIs and optional/background APIs
 are attributed separately so an explained critical dependency failure can fail
 a route without treating telemetry as equivalent. Resources,
 APIs, and routes remain separate inventories. Browser APIs are observed only

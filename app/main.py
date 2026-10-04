@@ -10,7 +10,6 @@ import time
 import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Literal
 from urllib.parse import urlparse
@@ -55,6 +54,12 @@ from app.navigation import (
     classify_navigation_error,
     origin_for_url,
 )
+from app.network import (
+    SAFE_HTTP_METHODS,
+    PassiveNetworkObserver,
+    ReadOnlyPolicy,
+    load_read_only_policy,
+)
 from app.reporting import (
     aggregate_api_events,
     aggregate_api_inventory,
@@ -86,7 +91,7 @@ SCAN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
 SCAN_REGISTRY = ScanRegistry(maximum_jobs=max(10, int(os.getenv("MAX_SCAN_JOBS", "100"))))
 ProgressCallback = Callable[..., Awaitable[None]]
 
-SAFE_READ_ONLY_METHODS = {"GET", "HEAD", "OPTIONS"}
+SAFE_READ_ONLY_METHODS = set(SAFE_HTTP_METHODS)
 DANGEROUS_PATH_WORDS = (
     "delete", "destroy", "restart", "reboot", "deploy", "approve",
     "terminate", "logout", "remove", "signout",
@@ -100,13 +105,14 @@ SECURITY_HEADERS = (
 COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
     "ac", "co", "com", "edu", "gov", "net", "org",
 })
-VALIDATOR_VERSION = "1.6.0"
-REPORT_SCHEMA_VERSION = "2.0"
+VALIDATOR_VERSION = "1.7.0"
+REPORT_SCHEMA_VERSION = "2.1"
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     application.state.trust_status = inspect_trust_status()
+    application.state.read_only_policy = load_read_only_policy()
     try:
         yield
     finally:
@@ -515,6 +521,32 @@ async def detect_auth_signals(page) -> tuple[bool, bool]:
         return False, False
 
 
+async def acknowledge_configured_access_gate(
+    page,
+    policy: ReadOnlyPolicy,
+    current_url: str,
+    acknowledged: set[tuple[str, str]],
+) -> bool:
+    """Activate one exact administrator-approved gate without inspecting content."""
+    rule = policy.access_gate_for(current_url)
+    if rule is None:
+        return False
+    key = (rule.host, rule.selector)
+    if key in acknowledged:
+        return False
+    control = page.locator(rule.selector)
+    count = await control.count()
+    if count == 0:
+        return False
+    if count != 1:
+        raise RuntimeError("Configured access gate selector is ambiguous")
+    if not await control.is_visible():
+        return False
+    await control.click(timeout=5000)
+    acknowledged.add(key)
+    return True
+
+
 def partition_links(
     links: list[str],
     root_host: str,
@@ -638,6 +670,21 @@ async def execute_scan(
 
     if req.allow_mutations:
         raise HTTPException(400, "Portal health validation is read-only; mutations cannot be enabled")
+
+    try:
+        read_only_policy: ReadOnlyPolicy = app.state.read_only_policy
+    except AttributeError:
+        try:
+            read_only_policy = load_read_only_policy()
+        except (OSError, ValueError) as exc:
+            raise HTTPException(500, "Administrator read-only policy is invalid") from exc
+    log_event(
+        logging.INFO,
+        "READ_ONLY_POLICY_LOADED",
+        scan_id=scan_id,
+        safe_request_rules=len(read_only_policy.safe_application_requests),
+        access_gate_rules=len(read_only_policy.access_gates),
+    )
 
     approved_resource_hosts = {normalized_host(host) for host in req.resource_hosts}
     for host in approved_resource_hosts:
@@ -785,6 +832,7 @@ async def execute_scan(
     document_evidence: dict[tuple[str, str, int | None], dict[str, object]] = {}
     scan_api_events: list[dict] = []
     scan_resource_events: list[dict] = []
+    session_expired = False
     deadline = time.perf_counter() + (req.total_timeout_ms / 1000)
 
     await publish_progress(
@@ -803,11 +851,12 @@ async def execute_scan(
                 context = await browser.new_context(**browser_context_options(state_path))
                 await context.add_init_script(script=ROUTE_OBSERVER_SCRIPT)
                 await configure_cookies(context, req, root_host, approved_portal_hosts)
-                page = await context.new_page()
+                page = None
                 console_errors: list[str] = []
                 page_errors: list[str] = []
                 failed_resources: list[dict] = []
                 api_events: list[dict] = []
+                network_observer = PassiveNetworkObserver(api_events)
                 resource_events: list[dict] = []
                 scan_api_events = api_events
                 scan_resource_events = resource_events
@@ -825,6 +874,7 @@ async def execute_scan(
                 navigation_hosts: set[str] = set()
                 authentication_navigation = AuthenticationNavigationPolicy()
                 validator_blocks: dict[tuple[str, str, str, bool], deque[str]] = defaultdict(deque)
+                acknowledged_access_gates: set[tuple[str, str]] = set()
                 observation_phase = "AUTHENTICATION"
 
                 def record_console_error(message):
@@ -833,12 +883,6 @@ async def execute_scan(
 
                 def record_page_error(error):
                     page_errors.append(sanitized_diagnostic(str(error)))
-
-                def api_protocol(url: str) -> str:
-                    return "GRAPHQL" if "/graphql" in urlparse(url).path.lower() else "REST"
-
-                def observed_at() -> str:
-                    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
                 def is_api_observation(request) -> bool:
                     return (
@@ -858,7 +902,11 @@ async def execute_scan(
                         "/analytics", "/beacon", "/collect", "/metrics", "/telemetry",
                     )):
                         return "OPTIONAL"
-                    return "REQUIRED" if observation_phase == "VALIDATION" else "BACKGROUND"
+                    return (
+                        "REQUIRED"
+                        if observation_phase in {"APPLICATION_BOOTSTRAP", "ROUTE_VALIDATION", "VALIDATION"}
+                        else "BACKGROUND"
+                    )
 
                 def request_phase(request) -> str:
                     if api_importance(request) == "AUTHENTICATION":
@@ -873,7 +921,11 @@ async def execute_scan(
 
                 def is_primary_navigation(request) -> bool:
                     try:
-                        return bool(is_main_navigation(request) and request.frame == page.main_frame)
+                        return bool(
+                            page is not None
+                            and is_main_navigation(request)
+                            and request.frame == page.main_frame
+                        )
                     except Exception:
                         return False
 
@@ -885,13 +937,39 @@ async def execute_scan(
                         is_main_navigation(request),
                     )
 
+                def ensure_api_observed(request) -> dict | None:
+                    if not is_api_observation(request):
+                        return None
+                    return network_observer.observe_request(
+                        request,
+                        phase=request_phase(request),
+                        importance=api_importance(request),
+                        initiating_route=active_route_id,
+                        main_document=is_main_navigation(request),
+                    )
+
                 def record_request(request):
+                    if id(request) in request_started:
+                        ensure_api_observed(request)
+                        return
                     request_started[id(request)] = time.perf_counter()
                     request_routes[id(request)] = active_route_id
                     request_observation[id(request)] = (
                         request_phase(request),
                         api_importance(request),
                     )
+                    api_event = ensure_api_observed(request)
+                    if api_event is not None:
+                        log_event(
+                            logging.DEBUG,
+                            "API_REQUEST_OBSERVED",
+                            scan_id=scan_id,
+                            method=api_event["method"],
+                            hostname=api_event["host"],
+                            endpoint=api_event["endpoint"],
+                            phase=api_event["phase"],
+                            resource_type=api_event["resource_type"],
+                        )
 
                 def request_timing(
                     request,
@@ -911,6 +989,31 @@ async def execute_scan(
                 async def abort_by_validator(route: Route, reason: str) -> None:
                     request = route.request
                     validator_blocks[request_event_key(request)].append(reason)
+                    api_event = ensure_api_observed(request)
+                    if api_event is not None:
+                        public_reason = (
+                            "READ_ONLY_MUTATION_BLOCKED"
+                            if reason == "read_only_mutation_policy"
+                            else reason.upper()
+                        )
+                        network_observer.mark_blocked(
+                            request,
+                            public_reason,
+                            classification=(
+                                "BLOCKED_MUTATION"
+                                if reason == "read_only_mutation_policy"
+                                else "BLOCKED_BY_NETWORK_POLICY"
+                            ),
+                        )
+                        log_event(
+                            logging.WARNING,
+                            "API_REQUEST_BLOCKED",
+                            scan_id=scan_id,
+                            method=api_event["method"],
+                            hostname=api_event["host"],
+                            endpoint=api_event["endpoint"],
+                            block_reason=public_reason,
+                        )
                     log_event(
                         logging.DEBUG,
                         "REQUEST_BLOCKED_BY_VALIDATOR",
@@ -941,20 +1044,20 @@ async def execute_scan(
                         "initiating_route": initiating_route,
                     })
                     if is_api_observation(request):
-                        api_events.append({
-                            "url": sanitized_url(request.url),
-                            "method": request.method.upper(),
-                            "status": None,
-                            "error": sanitized_diagnostic(request.failure or "Request failed"),
-                            "blocked_by_validator": block_reason is not None,
-                            "protocol": api_protocol(request.url),
-                            "resource_type": request.resource_type,
-                            "phase": phase,
-                            "importance": importance,
-                            "observed_at": observed_at(),
-                            "duration_ms": duration_ms,
-                            "initiating_route": initiating_route,
-                        })
+                        api_event = network_observer.record_failure(
+                            request,
+                            sanitized_diagnostic(request.failure or "Request failed"),
+                        )
+                        if api_event is not None and not api_event.get("blocked_by_validator"):
+                            log_event(
+                                logging.WARNING,
+                                "API_REQUEST_FAILED",
+                                scan_id=scan_id,
+                                method=api_event["method"],
+                                hostname=api_event["host"],
+                                endpoint=api_event["endpoint"],
+                                phase=api_event["phase"],
+                            )
                     elif request.resource_type not in {"document", "eventsource"}:
                         resource_events.append({
                             "url": sanitized_url(request.url),
@@ -964,7 +1067,6 @@ async def execute_scan(
                             "blocked_by_validator": block_reason is not None,
                             "block_reason": block_reason,
                             "phase": phase,
-                            "observed_at": observed_at(),
                             "duration_ms": duration_ms,
                             "initiating_route": initiating_route,
                         })
@@ -978,20 +1080,33 @@ async def execute_scan(
                 def record_response(response):
                     duration_ms, initiating_route, phase, importance = request_timing(response.request)
                     if is_api_observation(response.request):
-                        api_events.append({
-                            "url": sanitized_url(response.url),
-                            "method": response.request.method.upper(),
-                            "status": response.status,
-                            "error": None,
-                            "blocked_by_validator": False,
-                            "protocol": api_protocol(response.url),
-                            "resource_type": response.request.resource_type,
-                            "phase": phase,
-                            "importance": importance,
-                            "observed_at": observed_at(),
-                            "duration_ms": duration_ms,
-                            "initiating_route": initiating_route,
-                        })
+                        api_event = network_observer.record_response(
+                            response.request,
+                            response.status,
+                        )
+                        if api_event is not None:
+                            log_event(
+                                logging.DEBUG,
+                                "API_RESPONSE_OBSERVED",
+                                scan_id=scan_id,
+                                method=api_event["method"],
+                                hostname=api_event["host"],
+                                endpoint=api_event["endpoint"],
+                                http_status=response.status,
+                                phase=api_event["phase"],
+                            )
+                            if (
+                                api_event.get("request_classification") == "SESSION_REFRESH"
+                                and 200 <= response.status < 400
+                            ):
+                                log_event(
+                                    logging.INFO,
+                                    "SESSION_REFRESH_SUCCEEDED",
+                                    scan_id=scan_id,
+                                    hostname=api_event["host"],
+                                    endpoint=api_event["endpoint"],
+                                    http_status=response.status,
+                                )
                     elif response.request.resource_type not in {"document", "eventsource"}:
                         resource_events.append({
                             "url": sanitized_url(response.url),
@@ -999,7 +1114,6 @@ async def execute_scan(
                             "status": response.status,
                             "error": None,
                             "phase": phase,
-                            "observed_at": observed_at(),
                             "duration_ms": duration_ms,
                             "initiating_route": initiating_route,
                         })
@@ -1054,17 +1168,8 @@ async def execute_scan(
                     if frame.url.startswith(("http://", "https://")):
                         frame_events.append({
                             "url": sanitized_url(frame.url),
-                            "main_frame": frame == page.main_frame,
+                            "main_frame": bool(page is not None and frame == page.main_frame),
                         })
-
-                page.on("console", record_console_error)
-                page.on("pageerror", record_page_error)
-                page.on("request", record_request)
-                page.on("requestfailed", record_failed_request)
-                page.on("response", record_response)
-                page.on("websocket", record_websocket)
-                page.on("download", record_download)
-                page.on("framenavigated", record_frame_navigation)
 
                 async def record_popup(popup):
                     try:
@@ -1087,11 +1192,15 @@ async def execute_scan(
                         if not popup.is_closed():
                             await popup.close()
 
-                page.on("popup", record_popup)
-
                 async def route_guard(route: Route):
                     nonlocal navigation_policy_error
                     request = route.request
+                    # Observation is intentionally first and idempotent. Context listeners
+                    # normally arrive first; this guarantees policy never makes an attempt
+                    # invisible if Playwright schedules interception before the event callback.
+                    if id(request) not in request_started:
+                        record_request(request)
+                    api_event = ensure_api_observed(request)
                     request_url = urlparse(request.url)
                     host = normalized_host(request_url.hostname or "")
                     portal_scoped = bool(host and host_in_scan_scope(
@@ -1134,7 +1243,8 @@ async def execute_scan(
                         await abort_by_validator(route, "third_party_resource_policy")
                         return
 
-                    if request.method.upper() not in SAFE_READ_ONLY_METHODS:
+                    method = request.method.upper()
+                    if method not in SAFE_READ_ONLY_METHODS:
                         auth_navigation_allowed = False
                         if main_navigation:
                             try:
@@ -1146,7 +1256,11 @@ async def execute_scan(
                                 request.url,
                                 post_data,
                             )
-                        if not auth_navigation_allowed:
+                        approved_rule = (
+                            None if auth_navigation_allowed else
+                            read_only_policy.match(method, request.url)
+                        )
+                        if not auth_navigation_allowed and approved_rule is None:
                             await abort_by_validator(route, "read_only_mutation_policy")
                             return
                         if auth_navigation_allowed:
@@ -1154,13 +1268,58 @@ async def execute_scan(
                                 "AUTHENTICATION",
                                 "AUTHENTICATION",
                             )
+                            network_observer.mark_allowed(
+                                request,
+                                "AUTH_FLOW",
+                                phase="AUTHENTICATION",
+                                importance="AUTHENTICATION",
+                            )
                             log_event(
                                 logging.INFO,
-                                "AUTHENTICATION_NAVIGATION_ALLOWED",
+                                "AUTH_FLOW_POST_ALLOWED",
                                 scan_id=scan_id,
                                 hostname=host,
-                                method=request.method.upper(),
+                                method=method,
                             )
+                        elif approved_rule is not None:
+                            classification = approved_rule.classification
+                            policy_phase = (
+                                "SESSION_REFRESH"
+                                if classification == "SESSION_REFRESH"
+                                else observation_phase
+                            )
+                            policy_importance = (
+                                "AUTHENTICATION"
+                                if classification == "SESSION_REFRESH"
+                                else api_importance(request)
+                            )
+                            request_observation[id(request)] = (
+                                policy_phase,
+                                policy_importance,
+                            )
+                            network_observer.mark_allowed(
+                                request,
+                                classification,
+                                phase=policy_phase,
+                                importance=policy_importance,
+                            )
+                            log_event(
+                                logging.INFO,
+                                (
+                                    "SESSION_REFRESH_OBSERVED"
+                                    if classification == "SESSION_REFRESH"
+                                    else "SAFE_APPLICATION_POST_ALLOWED"
+                                    if method == "POST"
+                                    else "SAFE_APPLICATION_REQUEST_ALLOWED"
+                                ),
+                                scan_id=scan_id,
+                                hostname=host,
+                                endpoint=api_event.get("endpoint") if api_event else "/",
+                                method=method,
+                                classification=classification,
+                            )
+                    elif api_event is not None:
+                        network_observer.mark_allowed(request, "SAFE_METHOD")
 
                     headers = authentication_manager.headers_for_request(
                         request.headers,
@@ -1168,13 +1327,24 @@ async def execute_scan(
                     )
                     await route.continue_(headers=headers)
 
+                context.on("request", record_request)
+                context.on("requestfailed", record_failed_request)
+                context.on("response", record_response)
                 await context.route("**/*", route_guard)
+                page = await context.new_page()
+                page.on("console", record_console_error)
+                page.on("pageerror", record_page_error)
+                page.on("websocket", record_websocket)
+                page.on("download", record_download)
+                page.on("framenavigated", record_frame_navigation)
+                page.on("popup", record_popup)
                 session_refresh: dict[str, object] = {"attempted": False}
                 if refresh_config is not None:
                     current_tracker = NavigationTracker(req.max_redirects)
                     navigation_policy_error = None
                     navigation_hosts.clear()
                     authentication_navigation = AuthenticationNavigationPolicy()
+                    observation_phase = "SESSION_REFRESH"
                     log_event(
                         logging.INFO,
                         "SESSION_REFRESH_STARTED",
@@ -1188,6 +1358,7 @@ async def execute_scan(
                         scan_id=scan_id,
                         **session_refresh,
                     )
+                    observation_phase = "AUTHENTICATION"
                 authentication_duration_ms = round((time.perf_counter() - scan_started) * 1000)
                 while queue and len(results) < req.max_pages:
                     if cancel_event is not None and cancel_event.is_set():
@@ -1237,7 +1408,11 @@ async def execute_scan(
                     navigation_policy_error = None
                     navigation_hosts.clear()
                     authentication_navigation = AuthenticationNavigationPolicy()
-                    observation_phase = "VALIDATION"
+                    observation_phase = (
+                        "APPLICATION_BOOTSTRAP"
+                        if not results and depth == 0
+                        else "ROUTE_VALIDATION"
+                    )
                     requested_url = sanitized_url(url)
                     requested_host = normalized_host(urlparse(url).hostname or "")
                     final_url: str | None = None
@@ -1326,6 +1501,30 @@ async def execute_scan(
                                 response_headers = dict(evidence["response_headers"])
                                 inherited_strict_tls = bool(evidence["strict_tls"])
                                 security_headers_inherited = True
+                            if (
+                                url_in_scan_scope(
+                                    final_raw_url,
+                                    root_host,
+                                    req.allow_subdomains,
+                                    approved_portal_hosts,
+                                )
+                                and await acknowledge_configured_access_gate(
+                                    page,
+                                    read_only_policy,
+                                    final_raw_url,
+                                    acknowledged_access_gates,
+                                )
+                            ):
+                                final_raw_url = page.url
+                                final_url = sanitized_url(final_raw_url)
+                                log_event(
+                                    logging.INFO,
+                                    "ACCESS_GATE_ACKNOWLEDGED",
+                                    scan_id=scan_id,
+                                    hostname=normalized_host(
+                                        urlparse(final_raw_url).hostname or ""
+                                    ),
+                                )
                             title = sanitize_text(await page.title(), limit=512)
                             name_evidence = await collect_route_name_evidence(page)
                             final_in_scope = url_in_scan_scope(
@@ -1545,7 +1744,7 @@ async def execute_scan(
                                     (time.perf_counter() - discovery_started) * 1000
                                 )
                                 discovery_duration_ms += route_discovery_ms
-                                observation_phase = "VALIDATION"
+                                observation_phase = "ROUTE_VALIDATION"
                         except Exception as exc:
                             if navigation_policy_error is not None:
                                 error = navigation_policy_error.public_message
@@ -1576,6 +1775,21 @@ async def execute_scan(
                                 final_url=final_raw_url,
                                 error=error,
                             )
+
+                    if (
+                        authentication_classification == "AUTH_REQUIRED"
+                        and req.authentication.mode != "none"
+                        and any(item.get("authentication_status") == "PASS" for item in results)
+                    ):
+                        authentication_classification = "SESSION_EXPIRED"
+                    if authentication_classification == "SESSION_EXPIRED":
+                        session_expired = True
+                        log_event(
+                            logging.WARNING,
+                            "SESSION_EXPIRED",
+                            scan_id=scan_id,
+                            hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
+                        )
 
                     elapsed = round((time.perf_counter() - started) * 1000)
                     route_validation_ms = max(0, elapsed - route_discovery_ms)
@@ -1712,8 +1926,9 @@ async def execute_scan(
                         bool(event.get("error")) for event in failed_api_events
                     )
                     read_only_blocks = sum(
-                        failure.get("block_reason") == "read_only_mutation_policy"
-                        for failure in page_failures
+                        bool(event.get("blocked_by_validator"))
+                        and event.get("block_reason") == "READ_ONLY_MUTATION_BLOCKED"
+                        for event in page_api_events
                     )
                     final_identity = normalize_route_url(
                         final_raw_url,
@@ -1848,6 +2063,8 @@ async def execute_scan(
                         classification=result["classification"],
                         elapsed_ms=elapsed,
                     )
+                    if session_expired:
+                        break
                     if time.perf_counter() >= deadline:
                         total_timeout_reached = bool(queue)
                         break
@@ -1864,6 +2081,7 @@ async def execute_scan(
                     session_refresh["runtime_state_updated"] = updated_state is not None
                     session_refresh["concurrent_update_preserved"] = updated_state is None
                 await context.close()
+                network_observer.finalize_pending()
             finally:
                 await browser.close()
 
@@ -1887,6 +2105,8 @@ async def execute_scan(
     remaining_routes = (discovered_routes - seen) - depth_limited_routes
     if cancellation_requested:
         termination_reason = "USER_CANCELLED"
+    elif session_expired:
+        termination_reason = "SESSION_EXPIRED"
     elif total_timeout_reached:
         termination_reason = "SCAN_TIMEOUT"
     elif remaining_routes and len(results) >= req.max_pages:
@@ -2004,6 +2224,7 @@ async def execute_scan(
                     "NOT_TESTED_MAX_ROUTES" if termination_reason == "MAX_ROUTES_REACHED" else
                     "NOT_TESTED_TIMEOUT" if termination_reason == "SCAN_TIMEOUT" else
                     "NOT_TESTED_CANCELLED" if termination_reason == "USER_CANCELLED" else
+                    "NOT_TESTED_SESSION_EXPIRED" if termination_reason == "SESSION_EXPIRED" else
                     "NOT_TESTED"
                 ),
             }

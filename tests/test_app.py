@@ -53,7 +53,7 @@ def test_home_health_and_security_headers():
     assert "Know your portal" in response.text
     assert response.headers["x-frame-options"] == "DENY"
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
-    assert client.get("/healthz").json() == {"status": "ok", "version": "1.6.0"}
+    assert client.get("/healthz").json() == {"status": "ok", "version": "1.7.0"}
 
 
 @pytest.mark.parametrize("max_pages", [5, 10, 40])

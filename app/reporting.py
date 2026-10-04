@@ -5,6 +5,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app.navigation import classify_navigation_error
+from app.network import safe_api_identity
 
 
 PASS_OUTCOMES = frozenset({"PASS", "PASS_WITH_WARNINGS"})
@@ -38,6 +39,7 @@ def finding(
     resource: str | None = None,
     blocked_by_validator: bool = False,
     block_reason: str | None = None,
+    **metadata: Any,
 ) -> dict[str, Any]:
     item: dict[str, Any] = {
         "type": finding_type,
@@ -54,6 +56,7 @@ def finding(
     if blocked_by_validator:
         item["blocked_by_validator"] = True
         item["block_reason"] = block_reason or "validator_policy"
+    item.update(metadata)
     return item
 
 
@@ -430,6 +433,7 @@ def aggregate_report(
         "MAX_ROUTES_REACHED": "NOT_TESTED_MAX_ROUTES",
         "SCAN_TIMEOUT": "NOT_TESTED_TIMEOUT",
         "USER_CANCELLED": "NOT_TESTED_CANCELLED",
+        "SESSION_EXPIRED": "NOT_TESTED_SESSION_EXPIRED",
     }.get(termination_reason, "NOT_TESTED")
     not_tested_reason_counts = (
         {not_tested_reason: not_tested_count} if not_tested_count else {}
@@ -547,25 +551,30 @@ def classify_api_status(status: int | None, error: str | None) -> str:
 
 def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Aggregate naturally observed API traffic without request headers or bodies."""
-    inventory: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    inventory: dict[tuple[str, str, str], dict[str, Any]] = {}
     for result in results:
         result_route_id = result.get("normalized_route_identity") or result.get("url")
         for event in result.get("api_requests", []):
-            parsed = urlparse(str(event.get("url") or ""))
-            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            event_url = str(event.get("url") or "")
+            _, safe_host, safe_endpoint = safe_api_identity(event_url)
+            host = str(event.get("host") or safe_host).lower()
+            endpoint = str(event.get("endpoint") or safe_endpoint)
+            if not host or not endpoint.startswith("/"):
                 continue
             method = str(event.get("method") or "GET").upper()
             protocol = str(event.get("protocol") or "REST")
-            key = (method, parsed.hostname.lower(), parsed.path or "/", protocol)
+            key = (method, host, endpoint)
             item = inventory.setdefault(key, {
                 "method": method,
-                "host": parsed.hostname.lower(),
-                "endpoint": parsed.path or "/",
-                "raw_sanitized_endpoint": parsed.path or "/",
-                "normalized_endpoint": parsed.path or "/",
+                "host": host,
+                "endpoint": endpoint,
+                "raw_sanitized_endpoint": endpoint,
+                "normalized_endpoint": endpoint,
                 "normalization_confidence": "EXACT",
                 "category": protocol,
                 "calls": 0,
+                "allowed_calls": 0,
+                "blocked_calls": 0,
                 "status_2xx": 0,
                 "status_3xx": 0,
                 "status_4xx": 0,
@@ -576,11 +585,16 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 "discovery_phase_count": 0,
                 "validation_phase_count": 0,
                 "authentication_phase_count": 0,
+                "application_bootstrap_phase_count": 0,
+                "route_validation_phase_count": 0,
+                "session_refresh_phase_count": 0,
                 "first_seen": None,
                 "last_seen": None,
                 "durations_ms": [],
                 "routes": set(),
                 "failure_classifications": Counter(),
+                "request_classifications": Counter(),
+                "block_reasons": Counter(),
                 "importance": Counter(),
             })
             item["calls"] += 1
@@ -588,6 +602,9 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             phase_field = {
                 "DISCOVERY": "discovery_phase_count",
                 "AUTHENTICATION": "authentication_phase_count",
+                "APPLICATION_BOOTSTRAP": "application_bootstrap_phase_count",
+                "ROUTE_VALIDATION": "route_validation_phase_count",
+                "SESSION_REFRESH": "session_refresh_phase_count",
             }.get(phase, "validation_phase_count")
             item[phase_field] += 1
             observed_at = event.get("observed_at")
@@ -598,10 +615,18 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             route_id = event.get("initiating_route") or result_route_id
             if route_id:
                 item["routes"].add(route_id)
+            item["request_classifications"][str(
+                event.get("request_classification") or "UNKNOWN"
+            )] += 1
             if event.get("blocked_by_validator"):
                 item["validator_blocks"] += 1
                 item["blocked_count"] += 1
+                item["blocked_calls"] += 1
+                item["block_reasons"][str(
+                    event.get("block_reason") or "VALIDATOR_POLICY_BLOCK"
+                )] += 1
                 continue
+            item["allowed_calls"] += 1
             status = event.get("status")
             if isinstance(status, int) and 200 <= status < 600:
                 item[f"status_{status // 100}xx"] += 1
@@ -619,24 +644,47 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
         durations = item.pop("durations_ms")
         routes = sorted(item.pop("routes"))
         failures = dict(item.pop("failure_classifications"))
+        classifications = dict(item.pop("request_classifications"))
+        block_reasons = dict(item.pop("block_reasons"))
         importance = dict(item.pop("importance"))
+        target_failures = item["status_4xx"] + item["status_5xx"] + item["network_failures"]
+        status_counts = {
+            "2xx": item["status_2xx"],
+            "3xx": item["status_3xx"],
+            "4xx": item["status_4xx"],
+            "5xx": item["status_5xx"],
+            "network": item["network_failures"],
+        }
+        observation_outcome = (
+            "FAILED" if item["status_5xx"] or item["network_failures"] else
+            "WARNING" if item["status_4xx"] else
+            "BLOCKED_BY_VALIDATOR"
+            if item["blocked_calls"] and not item["allowed_calls"] else
+            "WARNING" if item["blocked_calls"] else
+            "HEALTHY"
+        )
         item.update({
             "routes_using_endpoint": routes,
             "route_count": len(routes),
+            "routes_observed": len(routes),
             "average_duration_ms": (
                 round(sum(durations) / len(durations)) if durations else None
             ),
             "worst_duration_ms": max(durations) if durations else None,
             "failure_classifications": failures,
+            "classifications": sorted(classifications),
+            "classification_counts": classifications,
+            "block_reasons": block_reasons,
             "importance_counts": importance,
+            "status_counts": status_counts,
+            "target_failure_count": target_failures,
+            "observation_outcome": observation_outcome,
             "health": (
                 "FAILED" if item["status_5xx"] or item["network_failures"] else
                 "DEGRADED" if item["status_4xx"] else
                 "HEALTHY"
             ),
         })
-        if not item["validator_blocks"]:
-            item.pop("validator_blocks")
         output.append(item)
     return sorted(output, key=lambda item: (item["host"], item["endpoint"], item["method"]))
 
