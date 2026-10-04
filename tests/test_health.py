@@ -1,5 +1,8 @@
+import pytest
+
 from app.health import api_health_findings, assess_page_health
 from app.reporting import (
+    aggregate_api_events,
     aggregate_api_inventory,
     aggregate_report,
     aggregate_resource_inventory,
@@ -188,6 +191,50 @@ def test_explicit_route_coverage_reports_complete_and_partial_scans():
     assert partial["termination_reason"] == "MAX_ROUTES_REACHED"
 
 
+@pytest.mark.parametrize(("validated", "healthy", "failed", "not_tested"), [
+    (10, 9, 1, 34),
+    (40, 38, 2, 4),
+])
+def test_terminal_route_counters_use_one_canonical_invariant(
+    validated, healthy, failed, not_tested,
+):
+    results = []
+    for index in range(validated):
+        result = classify_page_result(
+            url=f"https://portal.example.com/{index}",
+            status=500 if index >= healthy else 200,
+            error=None,
+            missing_security_headers=[],
+            console_errors=[],
+            failed_resources=[],
+            security_headers_tested=True,
+        )
+        result["load_ms"] = 1
+        results.append(result)
+    summary = aggregate_report(
+        results,
+        routes_discovered=44,
+        routes_eligible=44,
+        routes_queued=44,
+        routes_remaining=not_tested,
+        termination_reason="MAX_ROUTES_REACHED",
+    )
+    assert summary["routes_discovered"] == 44
+    assert summary["routes_validated"] == validated
+    assert summary["healthy_routes"] == healthy
+    assert summary["failed_pages"] == failed
+    assert summary["routes_not_tested"] == not_tested
+    assert summary["not_tested"] == not_tested
+    assert summary["routes_discovered"] == (
+        summary["routes_validated"]
+        + summary["routes_not_tested"]
+        + summary["routes_skipped"]
+    )
+    assert summary["not_tested_reason_counts"] == {
+        "NOT_TESTED_MAX_ROUTES": not_tested,
+    }
+
+
 def test_api_inventory_correlates_routes_and_classifies_401_without_auth_failure():
     results = [
         {
@@ -214,6 +261,51 @@ def test_api_inventory_correlates_routes_and_classifies_401_without_auth_failure
     assert endpoint["route_count"] == 2
     assert endpoint["average_duration_ms"] == 20
     assert endpoint["health"] == "DEGRADED"
+
+
+def test_scan_wide_api_events_preserve_early_and_route_correlated_requests():
+    inventory = aggregate_api_events([
+        {
+            "url": "https://identity.example.net/session?code=REDACTED",
+            "method": "GET",
+            "protocol": "REST",
+            "status": 200,
+            "error": None,
+            "initiating_route": None,
+        },
+        {
+            "url": "https://api.example.net/items?token=REDACTED",
+            "method": "GET",
+            "protocol": "REST",
+            "status": 200,
+            "error": None,
+            "initiating_route": "https://portal.example.com/items",
+        },
+    ])
+    assert [(item["host"], item["endpoint"]) for item in inventory] == [
+        ("api.example.net", "/items"),
+        ("identity.example.net", "/session"),
+    ]
+    assert inventory[0]["routes_using_endpoint"] == [
+        "https://portal.example.com/items",
+    ]
+    assert "REDACTED" not in str(inventory)
+
+
+def test_validator_blocks_are_auditable_but_not_target_api_failures():
+    inventory = aggregate_api_events([{
+        "url": "https://portal.example.com/update",
+        "method": "POST",
+        "protocol": "REST",
+        "status": None,
+        "error": "net::ERR_BLOCKED_BY_CLIENT",
+        "blocked_by_validator": True,
+        "initiating_route": "https://portal.example.com/settings",
+    }])
+    assert inventory[0]["calls"] == 1
+    assert inventory[0]["validator_blocks"] == 1
+    assert inventory[0]["network_failures"] == 0
+    assert inventory[0]["health"] == "HEALTHY"
 
 
 def test_inherited_spa_security_recommendations_are_not_repeated_as_findings():

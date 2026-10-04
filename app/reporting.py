@@ -379,6 +379,19 @@ def aggregate_report(
         or result["classification"] in FAILURE_OUTCOMES
         for result in results
     )
+    discovered_count = routes_discovered if routes_discovered is not None else len(results)
+    eligible_count = routes_eligible if routes_eligible is not None else discovered_count
+    validated_count = len(results)
+    skipped_count = min(max(0, routes_skipped), max(0, eligible_count - validated_count))
+    not_tested_count = max(0, eligible_count - validated_count - skipped_count)
+    not_tested_reason = {
+        "MAX_ROUTES_REACHED": "NOT_TESTED_MAX_ROUTES",
+        "SCAN_TIMEOUT": "NOT_TESTED_TIMEOUT",
+        "USER_CANCELLED": "NOT_TESTED_CANCELLED",
+    }.get(termination_reason, "NOT_TESTED")
+    not_tested_reason_counts = (
+        {not_tested_reason: not_tested_count} if not_tested_count else {}
+    )
     summary = {
         "total_pages": len(results),
         "loaded_pages": load_counts["LOADED"],
@@ -407,17 +420,18 @@ def aggregate_report(
         "errors": sum(int(result.get("error_findings", 0)) for result in results),
         "validation_failures": validation_counts["FAIL"],
         "fail": validation_counts["FAIL"],
-        "not_tested": validation_counts["NOT_TESTED"],
+        "not_tested": not_tested_count,
+        "validation_not_tested": validation_counts["NOT_TESTED"],
         "total_load_time": sum(result.get("load_ms") or 0 for result in results),
         "duration_ms": sum(result.get("load_ms") or 0 for result in results),
-        "routes_discovered": routes_discovered if routes_discovered is not None else len(results),
-        "routes_eligible": routes_eligible if routes_eligible is not None else (
-            routes_discovered if routes_discovered is not None else len(results)
-        ),
+        "routes_discovered": discovered_count,
+        "routes_eligible": eligible_count,
         "routes_queued": routes_queued if routes_queued is not None else len(results),
-        "routes_validated": len(results),
-        "routes_remaining": routes_remaining,
-        "routes_skipped": routes_skipped,
+        "routes_validated": validated_count,
+        "routes_remaining": not_tested_count,
+        "routes_not_tested": not_tested_count,
+        "routes_skipped": skipped_count,
+        "not_tested_reason_counts": not_tested_reason_counts,
         "healthy_routes": passed_pages,
         "routes_with_warnings": classification_counts["PASS_WITH_WARNINGS"],
         "auth_issues": sum(classification_counts[item] for item in AUTH_OUTCOMES),
@@ -435,7 +449,8 @@ def aggregate_report(
         "classifications": dict(classification_counts),
         "termination_reason": termination_reason,
         "scan_completeness": (
-            "COMPLETE" if termination_reason == "DISCOVERY_EXHAUSTED" and routes_remaining == 0
+            "CANCELLED" if termination_reason == "USER_CANCELLED"
+            else "COMPLETE" if termination_reason == "DISCOVERY_EXHAUSTED" and not_tested_count == 0
             else "FAILED" if not results
             else "PARTIAL"
         ),
@@ -443,7 +458,7 @@ def aggregate_report(
             "COMPLETE" if termination_reason == "DISCOVERY_EXHAUSTED" else "PARTIAL"
         ),
         "validation_status": (
-            "COMPLETE" if routes_remaining == 0 else "PARTIAL"
+            "COMPLETE" if not_tested_count == 0 else "PARTIAL"
         ),
     }
     return summary
@@ -499,6 +514,7 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 "status_4xx": 0,
                 "status_5xx": 0,
                 "network_failures": 0,
+                "validator_blocks": 0,
                 "durations_ms": [],
                 "routes": set(),
                 "failure_classifications": Counter(),
@@ -507,6 +523,9 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             route_id = event.get("initiating_route") or result_route_id
             if route_id:
                 item["routes"].add(route_id)
+            if event.get("blocked_by_validator"):
+                item["validator_blocks"] += 1
+                continue
             status = event.get("status")
             if isinstance(status, int) and 200 <= status < 600:
                 item[f"status_{status // 100}xx"] += 1
@@ -538,8 +557,15 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 "HEALTHY"
             ),
         })
+        if not item["validator_blocks"]:
+            item.pop("validator_blocks")
         output.append(item)
     return sorted(output, key=lambda item: (item["host"], item["endpoint"], item["method"]))
+
+
+def aggregate_api_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate the scan-wide listener stream, including authentication and late events."""
+    return aggregate_api_inventory([{"api_requests": events}])
 
 
 def aggregate_security_recommendations(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -581,10 +607,13 @@ def aggregate_resource_inventory(results: list[dict[str, Any]]) -> list[dict[str
                 "type": resource_type,
                 "calls": 0,
                 "failures": 0,
+                "validator_blocks": 0,
                 "routes": set(),
             })
             item["calls"] += 1
-            if event.get("error") or (
+            if event.get("blocked_by_validator"):
+                item["validator_blocks"] += 1
+            elif event.get("error") or (
                 isinstance(event.get("status"), int) and event["status"] >= 400
             ):
                 item["failures"] += 1
@@ -599,5 +628,12 @@ def aggregate_resource_inventory(results: list[dict[str, Any]]) -> list[dict[str
             "route_count": len(routes),
             "health": "DEGRADED" if item["failures"] else "HEALTHY",
         })
+        if not item["validator_blocks"]:
+            item.pop("validator_blocks")
         output.append(item)
     return sorted(output, key=lambda item: (item["host"], item["path"], item["type"]))
+
+
+def aggregate_resource_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate resources from the listener that remains installed for the whole scan."""
+    return aggregate_resource_inventory([{"resources": events}])

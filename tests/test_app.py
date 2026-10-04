@@ -2,6 +2,8 @@ import base64
 import io
 import json
 import logging
+import asyncio
+import time
 from pathlib import Path
 
 import pytest
@@ -51,7 +53,108 @@ def test_home_health_and_security_headers():
     assert "Know your portal" in response.text
     assert response.headers["x-frame-options"] == "DENY"
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
-    assert client.get("/healthz").json() == {"status": "ok", "version": "1.4.0"}
+    assert client.get("/healthz").json() == {"status": "ok", "version": "1.5.0"}
+
+
+@pytest.mark.parametrize("max_pages", [5, 10, 40])
+def test_async_scan_api_returns_immediately_and_exposes_progress_and_report(monkeypatch, max_pages):
+    async def fake_execute(req, *, scan_id, progress_callback, cancel_event):
+        await progress_callback("STARTING")
+        await asyncio.sleep(0.02)
+        await progress_callback(
+            "VALIDATING",
+            discovered=max_pages + 4,
+            queued=4,
+            validated=max_pages,
+            healthy=max_pages - 1,
+            failed=1,
+            warnings=0,
+            current_route="https://portal.example.com/current",
+        )
+        return {
+            "scan_id": scan_id,
+            "run_id": scan_id,
+            "pages": max_pages,
+            "summary": {
+                "scan_completeness": "PARTIAL",
+                "termination_reason": "MAX_ROUTES_REACHED",
+                "routes_discovered": max_pages + 4,
+                "routes_validated": max_pages,
+                "healthy_routes": max_pages - 1,
+                "failed_pages": 1,
+                "routes_with_warnings": 0,
+            },
+            "results": [],
+        }
+
+    monkeypatch.setattr("app.main.execute_scan", fake_execute)
+    with TestClient(app) as async_client:
+        started = time.perf_counter()
+        created = async_client.post("/api/scans", json={
+            "target": "https://portal.example.com",
+            "max_pages": max_pages,
+        })
+        assert created.status_code == 202
+        assert time.perf_counter() - started < 0.5
+        scan_id = created.json()["scan_id"]
+        states = []
+        for _ in range(100):
+            status = async_client.get(f"/api/scans/{scan_id}")
+            assert status.status_code == 200
+            states.append(status.json()["state"])
+            if status.json()["state"] in {"PARTIAL", "COMPLETED", "FAILED"}:
+                break
+            time.sleep(0.01)
+        assert states[-1] == "PARTIAL"
+        final_status = status.json()
+        assert final_status["validated"] == max_pages
+        report = async_client.get(f"/api/scans/{scan_id}/report")
+        assert report.status_code == 200
+        assert report.json()["pages"] == max_pages
+
+
+def test_async_scan_status_and_report_errors_are_json():
+    response = client.get("/api/scans/not-present")
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("application/json")
+
+
+def test_async_scan_cancellation_finalizes_a_partial_report(monkeypatch):
+    async def cancellable_execute(req, *, scan_id, progress_callback, cancel_event):
+        await progress_callback("VALIDATING", discovered=3, queued=3, validated=0)
+        await asyncio.wait_for(cancel_event.wait(), timeout=2)
+        return {
+            "scan_id": scan_id,
+            "run_id": scan_id,
+            "pages": 0,
+            "summary": {
+                "scan_completeness": "CANCELLED",
+                "termination_reason": "USER_CANCELLED",
+                "routes_discovered": 3,
+                "routes_validated": 0,
+                "healthy_routes": 0,
+                "failed_pages": 0,
+                "routes_with_warnings": 0,
+            },
+            "results": [],
+        }
+
+    monkeypatch.setattr("app.main.execute_scan", cancellable_execute)
+    with TestClient(app) as async_client:
+        created = async_client.post("/api/scans", json={
+            "target": "https://portal.example.com",
+        })
+        scan_id = created.json()["scan_id"]
+        cancelled = async_client.post(f"/api/scans/{scan_id}/cancel")
+        assert cancelled.status_code == 202
+        for _ in range(100):
+            status = async_client.get(f"/api/scans/{scan_id}").json()
+            if status["state"] == "CANCELLED":
+                break
+            time.sleep(0.01)
+        assert status["state"] == "CANCELLED"
+        report = async_client.get(f"/api/scans/{scan_id}/report").json()
+        assert report["summary"]["termination_reason"] == "USER_CANCELLED"
 
 
 @pytest.mark.parametrize(("candidate", "root", "subdomains", "expected"), [

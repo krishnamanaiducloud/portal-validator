@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 import urllib.request
 
 
@@ -17,12 +18,26 @@ payload = json.dumps({
     "authentication": {"mode": "none"},
 }).encode("utf-8")
 request = urllib.request.Request(
-    f"{base_url}/api/scan",
+    f"{base_url}/api/scans",
     data=payload,
     headers={"Content-Type": "application/json"},
     method="POST",
 )
-with urllib.request.urlopen(request, timeout=90) as response:
+with urllib.request.urlopen(request, timeout=15) as response:
+    created = json.load(response)
+assert response.status == 202, created
+scan_id = created["scan_id"]
+deadline = time.monotonic() + 90
+while True:
+    with urllib.request.urlopen(f"{base_url}/api/scans/{scan_id}", timeout=15) as response:
+        status = json.load(response)
+    if status["state"] in {"COMPLETED", "PARTIAL", "FAILED", "CANCELLED"}:
+        break
+    if time.monotonic() >= deadline:
+        raise TimeoutError(f"Scan did not finish: {status}")
+    time.sleep(0.5)
+assert status["state"] in {"COMPLETED", "PARTIAL"}, status
+with urllib.request.urlopen(f"{base_url}/api/scans/{scan_id}/report", timeout=15) as response:
     report = json.load(response)
 
 assert report["pages"] == 1, report

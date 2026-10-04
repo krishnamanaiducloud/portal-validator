@@ -44,10 +44,35 @@
 .evidence-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #9db0a7; font: 500 10px/1.5 ui-monospace, monospace; }
 .api-endpoint { border: 0; background: transparent; color: var(--blue); cursor: pointer; font: 600 10px ui-monospace, monospace; text-align: left; }
 .api-endpoint:hover,.api-endpoint:focus-visible { color: var(--lime); text-decoration: underline; }
+.progress-copy { flex: 1; min-width: 0; }
+.progress-route { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.api-tools { display: grid; grid-template-columns: minmax(240px, 1fr) repeat(3, minmax(140px, .45fr)) auto auto; align-items: end; gap: 10px; margin: 14px 0 12px; }
+.filter-check { display: flex; align-items: center; gap: 7px; min-height: 42px; color: var(--muted); font-size: 11px; }
+.inventory-count { align-self: center; color: var(--lime); font: 700 11px ui-monospace, monospace; white-space: nowrap; }
+.scroll-sync { height: 15px; margin: 0 2px 6px; overflow-x: auto; overflow-y: hidden; scrollbar-color: #668779 #0a1411; }
+.scroll-sync[hidden] { display: none; }
+.scroll-sync>div { height: 1px; }
+.route-table th:first-child,.route-table td:first-child { position: sticky; left: 0; z-index: 2; background: #0b1713; box-shadow: 1px 0 0 var(--line); }
+.route-table th:first-child { z-index: 4; background: #12211c; }
+.route-table th button:focus-visible { outline: 2px solid var(--lime); outline-offset: 3px; }
+.api-endpoint { display: block; max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recommendation-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(270px,1fr)); gap: 10px; margin-top: 13px; }
+.recommendation { border: 1px solid var(--line); border-radius: 10px; padding: 14px; background: #09130f; }
+.recommendation div { display: grid; gap: 3px; }
+.recommendation span { color: var(--warning); font: 750 9px ui-monospace,monospace; letter-spacing: .08em; }
+.recommendation strong { font-size: 13px; }
+.recommendation p { color: var(--muted); font-size: 11px; }
+.recommendation dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0; font-size: 10px; }
+.recommendation dt { color: #71877d; }.recommendation dd { margin: 0; color: #c3d1ca; }
+#api-inventory,#security-recommendations,#evidence-panel,.results { scroll-margin-top: 18px; }
 @media (max-width: 1050px) {
   .scope-grid,.report-tools { grid-template-columns: 1fr 1fr; }
+  .api-tools { grid-template-columns: 1fr 1fr 1fr; }
 }
 @media (max-width: 760px) {
   .scope-grid,.report-tools { grid-template-columns: 1fr; }
   .coverage { align-items: flex-start; flex-direction: column; }
+  .api-tools { grid-template-columns: 1fr; }
+  .progress { align-items: flex-start; flex-wrap: wrap; }
+  .progress .secondary { width: 100%; }
 }

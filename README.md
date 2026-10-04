@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.4.0 is an authenticated, read-only browser health validator for public,
+Portal Validator 1.5.0 is an authenticated, read-only browser health validator for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -138,10 +138,10 @@ compatible with an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.4.0 .
+docker build -t mohankrishna999/portal-validator:1.5.0 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.4.0 \
-  -t mohankrishna999/portal-validator:1.4.0-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.5.0 \
+  -t mohankrishna999/portal-validator:1.5.0-debug .
 ```
 
 The debug image adds `debugpy`, hot reload, and port 5678. It inherits the same
@@ -155,7 +155,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.4.0
+  mohankrishna999/portal-validator:1.5.0
 ```
 
 ## OpenShift
@@ -211,6 +211,27 @@ python -m pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest -q
 ```
 
+### Asynchronous scan API
+
+The UI does not keep a long-running request open through the OpenShift router.
+It creates a scan with `POST /api/scans`, polls `GET /api/scans/{scan_id}`, and
+retrieves the completed report from `GET /api/scans/{scan_id}/report`. Creation
+returns `202 Accepted` immediately. `POST /api/scans/{scan_id}/cancel` requests
+graceful cancellation; the current route finishes and the shared browser
+context is closed before a partial report is finalized. The legacy synchronous
+`POST /api/scan` remains available for compatible clients, but new integrations
+should use the asynchronous endpoints.
+
+States are `QUEUED`, `STARTING`, `AUTHENTICATING`, `DISCOVERING`, `VALIDATING`,
+`FINALIZING`, `COMPLETED`, `PARTIAL`, `FAILED`, and `CANCELLED`. Progress and
+errors contain only sanitized metadata. The configured total timeout is the
+application scan budget and produces `PARTIAL / SCAN_TIMEOUT`; it is not an
+HTTP request timeout.
+
+The job registry is bounded and process-local. The supplied deployment uses a
+single application replica. Multi-replica or restart-surviving job retrieval
+requires a shared job store such as an approved database or Redis deployment.
+
 Each result separates `page_load_status` (`LOADED`/`FAILED_TO_LOAD`) from
 `validation_status` (`PASS`/`WARNING`/`FAIL`/`NOT_TESTED`) and the authoritative
 page outcome (`PASS`, `PASS_WITH_WARNINGS`, authentication outcomes, or an
@@ -222,16 +243,20 @@ validation; it does not claim independent inspection of the origin certificate
 when an enterprise TLS proxy is present.
 
 The portal-health summary also reports discovered, eligible, queued, validated,
-skipped, and remaining routes with `COMPLETE`, `PARTIAL`, or `FAILED` coverage
+skipped, and not-tested routes with `COMPLETE`, `PARTIAL`, `FAILED`, or
+`CANCELLED` coverage
 and an explicit termination reason. The default maximum is 50 routes and the
-request-scoped `max_pages` value is the only route-count limit. Summary cards
+request-scoped `max_pages` value limits routes actually validated rather than
+routes discovered. Terminal counters follow `discovered = validated +
+not_tested + skipped`; unexecuted routes carry an explicit reason. Summary cards
 drill into route, API, resource, security, and coverage evidence.
 
 Observed API calls are aggregated by sanitized method/host/path with status
 distribution, timing, failure classification, and affected routes. Resources,
 APIs, and routes remain separate inventories. Browser APIs are observed only
 from natural application activity; the validator never probes or replays a
-discovered endpoint. Document-level security recommendations are evaluated on
+discovered endpoint. Observed API Inventory is therefore not an active API
+scanner. Document-level security recommendations are evaluated on
 actual document responses and are not repeated for each inherited SPA route.
 
 Logs are structured JSON with a per-scan ID. URLs, query secrets, credentials,

@@ -11,7 +11,7 @@ import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Awaitable, Callable, Literal
 from urllib.parse import urldefrag, urlparse
 
 from fastapi import FastAPI, HTTPException, Request
@@ -51,14 +51,17 @@ from app.navigation import (
     origin_for_url,
 )
 from app.reporting import (
+    aggregate_api_events,
     aggregate_api_inventory,
     aggregate_report,
+    aggregate_resource_events,
     aggregate_resource_inventory,
     aggregate_security_recommendations,
     classify_page_result,
     finding,
 )
 from app.session import RuntimeSessionStore, load_refresh_config, refresh_browser_session
+from app.scans import ScanCapacityError, ScanJob, ScanRegistry, TERMINAL_STATES
 from app.security import (
     DestinationError,
     normalized_host,
@@ -75,6 +78,8 @@ STATIC_DIR = APP_DIR / "static"
 AUTH_STATE_DIR = Path(os.getenv("SESSION_STATE_DIR", "/auth"))
 MAX_CONCURRENT_SCANS = max(1, int(os.getenv("MAX_CONCURRENT_SCANS", "2")))
 SCAN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+SCAN_REGISTRY = ScanRegistry(maximum_jobs=max(10, int(os.getenv("MAX_SCAN_JOBS", "100"))))
+ProgressCallback = Callable[..., Awaitable[None]]
 
 SAFE_READ_ONLY_METHODS = {"GET", "HEAD", "OPTIONS"}
 DANGEROUS_PATH_WORDS = (
@@ -95,12 +100,15 @@ COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     application.state.trust_status = inspect_trust_status()
-    yield
+    try:
+        yield
+    finally:
+        await SCAN_REGISTRY.shutdown()
 
 
 app = FastAPI(
     title="Portal Validator",
-    version="1.4.0",
+    version="1.5.0",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -587,9 +595,26 @@ async def _resolve_with_logging(host: str, req: ScanRequest, scan_id: str) -> li
     return addresses
 
 
-@app.post("/api/scan")
-async def scan(req: ScanRequest):
-    scan_id = str(uuid.uuid4())
+async def execute_scan(
+    req: ScanRequest,
+    *,
+    scan_id: str | None = None,
+    progress_callback: ProgressCallback | None = None,
+    cancel_event: asyncio.Event | None = None,
+):
+    scan_id = scan_id or str(uuid.uuid4())
+    scan_started = time.perf_counter()
+
+    async def publish_progress(state: str, **values) -> None:
+        if progress_callback is None:
+            return
+        values.setdefault("remaining_budget_ms", max(
+            0,
+            req.total_timeout_ms - round((time.perf_counter() - scan_started) * 1000),
+        ))
+        await progress_callback(state, **values)
+
+    await publish_progress("STARTING")
     requested_target = urldefrag(req.target.strip()).url
     log_event(logging.INFO, "SCAN_STARTED", scan_id=scan_id, requested_url=requested_target)
     try:
@@ -644,6 +669,7 @@ async def scan(req: ScanRequest):
             raise HTTPException(400, exc.public_message) from exc
         credential_hosts.add(host)
 
+    await publish_progress("AUTHENTICATING")
     try:
         authentication_manager = build_authentication_manager(
             mode=req.authentication.mode,
@@ -712,9 +738,17 @@ async def scan(req: ScanRequest):
     queued_routes: set[str] = {requested_route}
     depth_limited_routes: set[str] = set()
     total_timeout_reached = False
+    cancellation_requested = False
     document_evidence: dict[tuple[str, str, int | None], dict[str, object]] = {}
+    scan_api_events: list[dict] = []
+    scan_resource_events: list[dict] = []
     deadline = time.perf_counter() + (req.total_timeout_ms / 1000)
 
+    await publish_progress(
+        "DISCOVERING",
+        discovered=len(discovered_routes),
+        queued=len(queue),
+    )
     async with SCAN_SEMAPHORE:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(
@@ -732,6 +766,8 @@ async def scan(req: ScanRequest):
                 failed_resources: list[dict] = []
                 api_events: list[dict] = []
                 resource_events: list[dict] = []
+                scan_api_events = api_events
+                scan_resource_events = resource_events
                 websocket_events: list[dict] = []
                 event_streams: list[dict] = []
                 download_events: list[dict] = []
@@ -838,6 +874,8 @@ async def scan(req: ScanRequest):
                             "resource_type": request.resource_type,
                             "status": None,
                             "error": sanitized_diagnostic(request.failure or "Request failed"),
+                            "blocked_by_validator": block_reason is not None,
+                            "block_reason": block_reason,
                             "duration_ms": duration_ms,
                             "initiating_route": initiating_route,
                         })
@@ -1052,6 +1090,9 @@ async def scan(req: ScanRequest):
                         **session_refresh,
                     )
                 while queue and len(results) < req.max_pages:
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancellation_requested = True
+                        break
                     if time.perf_counter() >= deadline:
                         total_timeout_reached = True
                         break
@@ -1072,6 +1113,23 @@ async def scan(req: ScanRequest):
                         continue
                     seen.add(route_identity)
                     active_route_id = sanitized_url(route_identity)
+                    await publish_progress(
+                        "VALIDATING",
+                        discovered=len(discovered_routes),
+                        queued=len(queue) + 1,
+                        validated=len(results),
+                        healthy=sum(bool(item.get("passed")) for item in results),
+                        failed=sum(
+                            item.get("validation_status") == "FAIL"
+                            or item.get("page_load_status") == "FAILED_TO_LOAD"
+                            for item in results
+                        ),
+                        warnings=sum(
+                            item.get("classification") == "PASS_WITH_WARNINGS"
+                            for item in results
+                        ),
+                        current_route=active_route_id,
+                    )
                     current_tracker = NavigationTracker(req.max_redirects)
                     navigation_policy_error = None
                     navigation_hosts.clear()
@@ -1341,9 +1399,9 @@ async def scan(req: ScanRequest):
                                                 final_raw_url,
                                             )
                                             if mode in SAME_DOCUMENT_NAVIGATIONS:
-                                                # Validate same-document routes while their originating
-                                                # document, browser state, and response evidence are active.
-                                                queue.appendleft(route_item)
+                                                # Queue all branches breadth-first so one menu does not
+                                                # consume the validation budget before its peers.
+                                                queue.append(route_item)
                                             else:
                                                 queue.append(route_item)
                                             queued_routes.add(link)
@@ -1565,6 +1623,23 @@ async def scan(req: ScanRequest):
                         **classification,
                     }
                     results.append(result)
+                    await publish_progress(
+                        "VALIDATING",
+                        discovered=len(discovered_routes),
+                        queued=len(queue),
+                        validated=len(results),
+                        healthy=sum(bool(item.get("passed")) for item in results),
+                        failed=sum(
+                            item.get("validation_status") == "FAIL"
+                            or item.get("page_load_status") == "FAILED_TO_LOAD"
+                            for item in results
+                        ),
+                        warnings=sum(
+                            item.get("classification") == "PASS_WITH_WARNINGS"
+                            for item in results
+                        ),
+                        current_route=active_route_id,
+                    )
                     log_event(
                         logging.INFO,
                         (
@@ -1596,9 +1671,18 @@ async def scan(req: ScanRequest):
             finally:
                 await browser.close()
 
-    remaining_routes = discovered_routes - seen
-    if total_timeout_reached:
-        termination_reason = "TOTAL_TIMEOUT_REACHED"
+    await publish_progress(
+        "FINALIZING",
+        discovered=len(discovered_routes),
+        queued=len(queue),
+        validated=len(results),
+        current_route=None,
+    )
+    remaining_routes = (discovered_routes - seen) - depth_limited_routes
+    if cancellation_requested:
+        termination_reason = "USER_CANCELLED"
+    elif total_timeout_reached:
+        termination_reason = "SCAN_TIMEOUT"
     elif remaining_routes and len(results) >= req.max_pages:
         termination_reason = "MAX_ROUTES_REACHED"
     elif depth_limited_routes:
@@ -1622,18 +1706,33 @@ async def scan(req: ScanRequest):
         routes_skipped=len(depth_limited_routes),
         termination_reason=termination_reason,
     )
-    api_inventory = aggregate_api_inventory(results)
-    resource_inventory = aggregate_resource_inventory(results)
+    api_inventory = (
+        aggregate_api_events(scan_api_events)
+        if scan_api_events else aggregate_api_inventory(results)
+    )
+    resource_inventory = (
+        aggregate_resource_events(scan_resource_events)
+        if scan_resource_events else aggregate_resource_inventory(results)
+    )
     security_recommendations = aggregate_security_recommendations(results)
     summary["unique_apis"] = len(api_inventory)
     summary["api_calls"] = sum(item["calls"] for item in api_inventory)
+    summary["api_failures"] = sum(
+        item["status_4xx"] + item["status_5xx"] + item["network_failures"]
+        for item in api_inventory
+    )
     summary["unique_resources"] = len(resource_inventory)
     summary["resource_calls"] = sum(item["calls"] for item in resource_inventory)
+    summary["resource_failures"] = sum(item["failures"] for item in resource_inventory)
     summary["security_recommendations"] = len(security_recommendations)
     trust_status: TrustStatus = getattr(app.state, "trust_status", TrustStatus(enabled=False))
     log_event(
         logging.INFO,
-        "SCAN_COMPLETED",
+        (
+            "SCAN_CANCELLED" if termination_reason == "USER_CANCELLED" else
+            "SCAN_TIMEOUT" if termination_reason == "SCAN_TIMEOUT" else
+            "SCAN_COMPLETED"
+        ),
         scan_id=scan_id,
         pages=len(results),
         loaded=summary["loaded"],
@@ -1665,7 +1764,25 @@ async def scan(req: ScanRequest):
             "routes_validated": summary["routes_validated"],
             "routes_skipped": summary["routes_skipped"],
             "routes_remaining": summary["routes_remaining"],
+            "routes_not_tested": summary["routes_not_tested"],
+            "not_tested_reason_counts": summary["not_tested_reason_counts"],
         },
+        "not_tested_routes": [
+            {
+                "route": sanitized_url(route),
+                "reason": (
+                    "NOT_TESTED_MAX_ROUTES" if termination_reason == "MAX_ROUTES_REACHED" else
+                    "NOT_TESTED_TIMEOUT" if termination_reason == "SCAN_TIMEOUT" else
+                    "NOT_TESTED_CANCELLED" if termination_reason == "USER_CANCELLED" else
+                    "NOT_TESTED"
+                ),
+            }
+            for route in sorted(remaining_routes)
+        ],
+        "skipped_routes": [
+            {"route": sanitized_url(route), "reason": "SKIPPED_MAX_DEPTH"}
+            for route in sorted(depth_limited_routes)
+        ],
         "session": session_refresh,
         "safety": {
             "crawl_scope": root_host,
@@ -1683,3 +1800,119 @@ async def scan(req: ScanRequest):
             "corporate_ca_trust": trust_status.enabled,
         },
     }
+
+
+async def _run_scan_job(job: ScanJob, req: ScanRequest) -> None:
+    async def update_job(state: str, **values) -> None:
+        job.update(state, **values)
+
+    try:
+        report = await execute_scan(
+            req,
+            scan_id=job.scan_id,
+            progress_callback=update_job,
+            cancel_event=job.cancel_event,
+        )
+        job.report = report
+        summary = report.get("summary", {})
+        termination_reason = summary.get("termination_reason")
+        terminal_state = (
+            "CANCELLED" if termination_reason == "USER_CANCELLED" else
+            "COMPLETED" if summary.get("scan_completeness") == "COMPLETE" else
+            "PARTIAL"
+        )
+        job.update(
+            terminal_state,
+            discovered=int(summary.get("routes_discovered", 0)),
+            queued=0,
+            validated=int(summary.get("routes_validated", 0)),
+            healthy=int(summary.get("healthy_routes", 0)),
+            failed=int(summary.get("failed_pages", 0)),
+            warnings=int(summary.get("routes_with_warnings", 0)),
+            current_route=None,
+            remaining_budget_ms=0,
+        )
+    except asyncio.CancelledError:
+        job.error = "Scan was cancelled during application shutdown"
+        job.update("CANCELLED", current_route=None, remaining_budget_ms=0)
+        raise
+    except HTTPException as exc:
+        job.error = sanitize_text(str(exc.detail), limit=1000)
+        job.update("FAILED", current_route=None, remaining_budget_ms=0)
+        log_event(
+            logging.ERROR,
+            "SCAN_FAILED",
+            scan_id=job.scan_id,
+            error=job.error,
+        )
+    except Exception as exc:
+        job.error = sanitized_diagnostic(str(exc))
+        job.update("FAILED", current_route=None, remaining_budget_ms=0)
+        log_event(
+            logging.ERROR,
+            "SCAN_FAILED",
+            scan_id=job.scan_id,
+            error=job.error,
+        )
+
+
+def _scan_job_or_404(scan_id: str) -> ScanJob:
+    job = SCAN_REGISTRY.get(scan_id)
+    if job is None:
+        raise HTTPException(404, "Scan was not found or is no longer retained")
+    return job
+
+
+@app.post("/api/scans", status_code=202)
+async def create_scan(req: ScanRequest):
+    if req.allow_mutations:
+        raise HTTPException(400, "Portal health validation is read-only; mutations cannot be enabled")
+    try:
+        validate_http_url(urldefrag(req.target.strip()).url)
+    except DestinationError as exc:
+        raise HTTPException(400, exc.public_message) from exc
+    scan_id = str(uuid.uuid4())
+    try:
+        job = SCAN_REGISTRY.create(scan_id)
+    except ScanCapacityError as exc:
+        raise HTTPException(503, "Scan capacity is currently exhausted; retry later") from exc
+    job.task = asyncio.create_task(_run_scan_job(job, req), name=f"portal-scan-{scan_id}")
+    log_event(logging.INFO, "SCAN_CREATED", scan_id=scan_id)
+    return {
+        "scan_id": scan_id,
+        "state": "QUEUED",
+        "status_url": f"/api/scans/{scan_id}",
+        "report_url": f"/api/scans/{scan_id}/report",
+        "cancel_url": f"/api/scans/{scan_id}/cancel",
+    }
+
+
+@app.get("/api/scans/{scan_id}")
+async def scan_status(scan_id: str):
+    return _scan_job_or_404(scan_id).snapshot()
+
+
+@app.get("/api/scans/{scan_id}/report")
+async def scan_report(scan_id: str):
+    job = _scan_job_or_404(scan_id)
+    if job.report is not None:
+        return job.report
+    if job.state == "FAILED":
+        raise HTTPException(409, job.error or "Scan failed before a report was produced")
+    raise HTTPException(409, f"Scan report is not ready; current state is {job.state}")
+
+
+@app.post("/api/scans/{scan_id}/cancel", status_code=202)
+async def cancel_scan(scan_id: str):
+    job = SCAN_REGISTRY.request_cancel(scan_id)
+    if job is None:
+        raise HTTPException(404, "Scan was not found or is no longer retained")
+    if job.state not in TERMINAL_STATES:
+        log_event(logging.INFO, "SCAN_CANCELLATION_REQUESTED", scan_id=scan_id)
+    return job.snapshot()
+
+
+@app.post("/api/scan", deprecated=True)
+async def scan(req: ScanRequest):
+    """Backward-compatible synchronous endpoint; the UI uses /api/scans."""
+    return await execute_scan(req)
