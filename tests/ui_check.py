@@ -43,15 +43,20 @@ async def main():
             coverage:{scan_completeness:'PARTIAL',termination_reason:'MAX_ROUTES_REACHED',routes_discovered:3,routes_validated:1,routes_not_tested:2,routes_remaining:2},
             api_inventory:[{method:'GET',host:'api.example.net',endpoint:'/health',calls:1,status_2xx:1,
               status_3xx:0,status_4xx:0,status_5xx:0,network_failures:0,route_count:1,
+              blocked_count:0,discovery_phase_count:0,validation_phase_count:1,
               average_duration_ms:12,worst_duration_ms:12,health:'HEALTHY',routes_using_endpoint:['/health']},
               {method:'POST',host:'api.example.net',endpoint:'/query',calls:10,status_2xx:8,
               status_3xx:0,status_4xx:2,status_5xx:0,network_failures:0,route_count:1,
+              blocked_count:1,discovery_phase_count:2,validation_phase_count:8,
               average_duration_ms:25,worst_duration_ms:40,health:'DEGRADED',routes_using_endpoint:['/health']}],
             security_recommendations:[{type:'MISSING_SECURITY_HEADER',header:'content-security-policy',
               severity:'RECOMMENDATION',impact:'NON_BLOCKING',affected_document_count:1,
               affected_documents:['https://portal.example.com/health']}],
             results:[{url:'https://portal.example.com/health',requested_url:'https://portal.example.com/health',
-              final_url:'https://portal.example.com/health',route_label:'Health',route_source:'navigation',
+              discovered_url:'https://portal.example.com/health',final_url:'https://portal.example.com/health',
+              route_label:'Health',navigation_label:'Health',route_name:'Health',route_name_source:'NAVIGATION_LABEL',
+              route_name_confidence:'HIGH',route_source:'navigation',display_path:'/health',host:'portal.example.com',
+              canonical_route:'https://portal.example.com/health',discovery_sources:[],duplicate_discovery_count:0,
               classification:'PASS',page_load_status:'LOADED',validation_status:'PASS',tls_status:'TRUSTED',
               security_headers_status:'PASS',navigation_status:'SUCCESS',render_status:'PASS',api_status:'PASS',
               resource_status:'PASS',console_status:'PASS',authentication_status:'PASS',read_only_status:'ENFORCED',
@@ -62,6 +67,8 @@ async def main():
           })
         """)
         assert await page.locator("#result-list tr").count() == 1
+        assert await page.locator("#result-list .route-name-cell strong").text_content() == "Health"
+        assert await page.locator("#result-list .route-cell code").text_content() == "/health"
         assert await page.locator(".metric").count() >= 10
         assert await page.locator("#api-list tr").count() == 2
         assert await page.locator("#security-list .recommendation").count() == 1
@@ -76,11 +83,18 @@ async def main():
             "element => element.closest('th').getAttribute('aria-sort')"
         ) == "descending"
         assert await page.locator("#api-list tr td:nth-child(4)").first.text_content() == "10"
+        blocked_sort = page.get_by_role("button", name="Blocked", exact=True)
+        assert await blocked_sort.count() == 1
+        await blocked_sort.click()
+        assert await page.locator('[data-api-sort="blocked_count"]').evaluate(
+            "element => element.closest('th').getAttribute('aria-sort')"
+        ) == "ascending"
         route_scroller = page.locator('[data-scroll-for="route-table-wrap"]')
         assert await route_scroller.is_visible()
         await route_scroller.evaluate("element => { element.scrollLeft = 120; element.dispatchEvent(new Event('scroll')); }")
         assert await page.locator("#route-table-wrap").evaluate("element => element.scrollLeft") == 120
-        await page.get_by_role("button", name="Show Discovered evidence").click()
+        await route_scroller.evaluate("element => { element.scrollLeft = 0; element.dispatchEvent(new Event('scroll')); }")
+        await page.get_by_role("button", name="Show Discovered routes evidence").click()
         assert await page.locator("#evidence-panel").is_visible()
         assert not await page.locator(".raw-report").get_attribute("open")
         main_width = await page.locator("main").evaluate("element => element.getBoundingClientRect().width")
@@ -115,10 +129,36 @@ async def main():
         """)
         assert large_inventory["rows"] == 1000
         assert large_inventory["milliseconds"] < 3000
-        await page.set_viewport_size({"width": 390, "height": 844})
-        assert await page.get_by_role("button", name="Run validation →").is_visible()
-        page_overflow = await page.evaluate("document.documentElement.scrollWidth - document.documentElement.clientWidth")
-        assert page_overflow <= 1
+        for viewport in (
+            {"width": 1920, "height": 1080},
+            {"width": 1366, "height": 768},
+            {"width": 768, "height": 1024},
+            {"width": 390, "height": 844},
+        ):
+            await page.set_viewport_size(viewport)
+            assert await page.get_by_role("button", name="Run validation →").is_visible()
+            page_overflow = await page.evaluate(
+                "document.documentElement.scrollWidth - document.documentElement.clientWidth"
+            )
+            overflow_elements = await page.locator("body *").evaluate_all(
+                """elements => elements
+                  .map(element => ({
+                    tag: element.tagName,
+                    id: element.id,
+                    className: String(element.className || ''),
+                    parentClassName: String(element.parentElement?.className || ''),
+                    text: String(element.textContent || '').trim().slice(0, 80),
+                    right: element.getBoundingClientRect().right,
+                    width: element.getBoundingClientRect().width,
+                  }))
+                  .filter(item => item.right > document.documentElement.clientWidth + 1)
+                  .slice(0, 10)"""
+            )
+            assert page_overflow <= 1, {
+                "viewport": viewport,
+                "page_overflow": page_overflow,
+                "overflow_elements": overflow_elements,
+            }
         actionable_errors = [
             error for error in console_errors
             if "Cross-Origin-Opener-Policy header has been ignored" not in error

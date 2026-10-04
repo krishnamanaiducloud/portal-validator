@@ -10,9 +10,10 @@ import time
 import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Literal
-from urllib.parse import urldefrag, urlparse
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -32,10 +33,14 @@ from app.discovery import (
     ROUTE_OBSERVER_SCRIPT,
     SAME_DOCUMENT_NAVIGATIONS,
     DiscoveredRoute,
+    collect_route_name_evidence,
     discover_page_routes,
     expand_safe_navigation,
+    finalize_duplicate_route_names,
     normalize_route_url,
     perform_route_navigation,
+    resolve_route_name,
+    route_identity_fields,
 )
 from app.health import (
     api_health_findings,
@@ -95,6 +100,8 @@ SECURITY_HEADERS = (
 COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
     "ac", "co", "com", "edu", "gov", "net", "org",
 })
+VALIDATOR_VERSION = "1.6.0"
+REPORT_SCHEMA_VERSION = "2.0"
 
 
 @asynccontextmanager
@@ -108,7 +115,7 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(
     title="Portal Validator",
-    version="1.5.0",
+    version=VALIDATOR_VERSION,
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -615,7 +622,7 @@ async def execute_scan(
         await progress_callback(state, **values)
 
     await publish_progress("STARTING")
-    requested_target = urldefrag(req.target.strip()).url
+    requested_target = req.target.strip()
     log_event(logging.INFO, "SCAN_STARTED", scan_id=scan_id, requested_url=requested_target)
     try:
         root_host, _port = validate_http_url(requested_target)
@@ -719,6 +726,9 @@ async def execute_scan(
         )
     except (OSError, ValueError, json.JSONDecodeError, DestinationError) as exc:
         raise HTTPException(400, "Session refresh configuration is invalid") from exc
+    authentication_duration_ms = round((time.perf_counter() - scan_started) * 1000)
+    discovery_duration_ms = 0
+    validation_duration_ms = 0
     results: list[dict] = []
     requested_route = normalize_route_url(
         requested_target,
@@ -732,11 +742,44 @@ async def execute_scan(
         "target",
         DOCUMENT_NAVIGATION,
         None,
+        "DOCUMENT_NAVIGATION",
+        "target",
+        None,
     )])
     seen: set[str] = set()
     discovered_routes: set[str] = {requested_route}
     queued_routes: set[str] = {requested_route}
     depth_limited_routes: set[str] = set()
+    route_provenance: dict[str, dict[str, object]] = {
+        requested_route: {
+            "observations": 1,
+            "sources": [{
+                "source": "target",
+                "discovery_type": "DOCUMENT_NAVIGATION",
+                "label": "Requested route",
+                "label_source": "target",
+                "discovered_from": None,
+            }],
+        },
+    }
+
+    def remember_route_discovery(
+        identity: str,
+        route: DiscoveredRoute,
+        discovered_from: str | None,
+    ) -> None:
+        entry = route_provenance.setdefault(identity, {"observations": 0, "sources": []})
+        entry["observations"] = int(entry["observations"]) + 1
+        source = {
+            "source": route.source,
+            "discovery_type": route.discovery_type,
+            "label": sanitize_text(route.label, limit=160) if route.label else None,
+            "label_source": route.label_source,
+            "discovered_from": sanitized_url(discovered_from) if discovered_from else None,
+        }
+        sources = entry["sources"]
+        if source not in sources:
+            sources.append(source)
     total_timeout_reached = False
     cancellation_requested = False
     document_evidence: dict[tuple[str, str, int | None], dict[str, object]] = {}
@@ -775,12 +818,14 @@ async def execute_scan(
                 popup_routes: list[DiscoveredRoute] = []
                 request_started: dict[int, float] = {}
                 request_routes: dict[int, str | None] = {}
+                request_observation: dict[int, tuple[str, str]] = {}
                 active_route_id: str | None = None
                 current_tracker: NavigationTracker | None = None
                 navigation_policy_error: DestinationError | None = None
                 navigation_hosts: set[str] = set()
                 authentication_navigation = AuthenticationNavigationPolicy()
                 validator_blocks: dict[tuple[str, str, str, bool], deque[str]] = defaultdict(deque)
+                observation_phase = "AUTHENTICATION"
 
                 def record_console_error(message):
                     if message.type == "error":
@@ -791,6 +836,34 @@ async def execute_scan(
 
                 def api_protocol(url: str) -> str:
                     return "GRAPHQL" if "/graphql" in urlparse(url).path.lower() else "REST"
+
+                def observed_at() -> str:
+                    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+                def is_api_observation(request) -> bool:
+                    return (
+                        request.resource_type in {"xhr", "fetch"}
+                        or request.method.upper() not in SAFE_READ_ONLY_METHODS
+                    )
+
+                def api_importance(request) -> str:
+                    if observation_phase == "AUTHENTICATION" or (
+                        request.method.upper() not in SAFE_READ_ONLY_METHODS
+                        and is_main_navigation(request)
+                        and authentication_navigation.active
+                    ):
+                        return "AUTHENTICATION"
+                    path = urlparse(request.url).path.lower()
+                    if any(marker in path for marker in (
+                        "/analytics", "/beacon", "/collect", "/metrics", "/telemetry",
+                    )):
+                        return "OPTIONAL"
+                    return "REQUIRED" if observation_phase == "VALIDATION" else "BACKGROUND"
+
+                def request_phase(request) -> str:
+                    if api_importance(request) == "AUTHENTICATION":
+                        return "AUTHENTICATION"
+                    return observation_phase
 
                 def is_main_navigation(request) -> bool:
                     try:
@@ -815,15 +888,25 @@ async def execute_scan(
                 def record_request(request):
                     request_started[id(request)] = time.perf_counter()
                     request_routes[id(request)] = active_route_id
+                    request_observation[id(request)] = (
+                        request_phase(request),
+                        api_importance(request),
+                    )
 
-                def request_timing(request) -> tuple[int | None, str | None]:
+                def request_timing(
+                    request,
+                ) -> tuple[int | None, str | None, str, str]:
                     started_at = request_started.pop(id(request), None)
                     route_id = request_routes.pop(id(request), None)
+                    phase, importance = request_observation.pop(
+                        id(request),
+                        (request_phase(request), api_importance(request)),
+                    )
                     duration = (
                         round((time.perf_counter() - started_at) * 1000)
                         if started_at is not None else None
                     )
-                    return duration, route_id
+                    return duration, route_id, phase, importance
 
                 async def abort_by_validator(route: Route, reason: str) -> None:
                     request = route.request
@@ -840,7 +923,7 @@ async def execute_scan(
                     await route.abort("blockedbyclient")
 
                 def record_failed_request(request):
-                    duration_ms, initiating_route = request_timing(request)
+                    duration_ms, initiating_route, phase, importance = request_timing(request)
                     key = request_event_key(request)
                     reasons = validator_blocks.get(key)
                     block_reason = reasons.popleft() if reasons else None
@@ -857,7 +940,7 @@ async def execute_scan(
                         "duration_ms": duration_ms,
                         "initiating_route": initiating_route,
                     })
-                    if request.resource_type in {"xhr", "fetch"}:
+                    if is_api_observation(request):
                         api_events.append({
                             "url": sanitized_url(request.url),
                             "method": request.method.upper(),
@@ -865,6 +948,10 @@ async def execute_scan(
                             "error": sanitized_diagnostic(request.failure or "Request failed"),
                             "blocked_by_validator": block_reason is not None,
                             "protocol": api_protocol(request.url),
+                            "resource_type": request.resource_type,
+                            "phase": phase,
+                            "importance": importance,
+                            "observed_at": observed_at(),
                             "duration_ms": duration_ms,
                             "initiating_route": initiating_route,
                         })
@@ -876,6 +963,8 @@ async def execute_scan(
                             "error": sanitized_diagnostic(request.failure or "Request failed"),
                             "blocked_by_validator": block_reason is not None,
                             "block_reason": block_reason,
+                            "phase": phase,
+                            "observed_at": observed_at(),
                             "duration_ms": duration_ms,
                             "initiating_route": initiating_route,
                         })
@@ -887,8 +976,8 @@ async def execute_scan(
                         })
 
                 def record_response(response):
-                    duration_ms, initiating_route = request_timing(response.request)
-                    if response.request.resource_type in {"xhr", "fetch"}:
+                    duration_ms, initiating_route, phase, importance = request_timing(response.request)
+                    if is_api_observation(response.request):
                         api_events.append({
                             "url": sanitized_url(response.url),
                             "method": response.request.method.upper(),
@@ -896,6 +985,10 @@ async def execute_scan(
                             "error": None,
                             "blocked_by_validator": False,
                             "protocol": api_protocol(response.url),
+                            "resource_type": response.request.resource_type,
+                            "phase": phase,
+                            "importance": importance,
+                            "observed_at": observed_at(),
                             "duration_ms": duration_ms,
                             "initiating_route": initiating_route,
                         })
@@ -905,6 +998,8 @@ async def execute_scan(
                             "resource_type": response.request.resource_type,
                             "status": response.status,
                             "error": None,
+                            "phase": phase,
+                            "observed_at": observed_at(),
                             "duration_ms": duration_ms,
                             "initiating_route": initiating_route,
                         })
@@ -1055,6 +1150,10 @@ async def execute_scan(
                             await abort_by_validator(route, "read_only_mutation_policy")
                             return
                         if auth_navigation_allowed:
+                            request_observation[id(request)] = (
+                                "AUTHENTICATION",
+                                "AUTHENTICATION",
+                            )
                             log_event(
                                 logging.INFO,
                                 "AUTHENTICATION_NAVIGATION_ALLOWED",
@@ -1089,6 +1188,7 @@ async def execute_scan(
                         scan_id=scan_id,
                         **session_refresh,
                     )
+                authentication_duration_ms = round((time.perf_counter() - scan_started) * 1000)
                 while queue and len(results) < req.max_pages:
                     if cancel_event is not None and cancel_event.is_set():
                         cancellation_requested = True
@@ -1103,6 +1203,9 @@ async def execute_scan(
                         route_source,
                         navigation_mode,
                         discovered_from,
+                        discovery_type,
+                        route_label_source,
+                        route_accessible_name,
                     ) = queue.popleft()
                     route_identity = normalize_route_url(
                         url,
@@ -1134,6 +1237,7 @@ async def execute_scan(
                     navigation_policy_error = None
                     navigation_hosts.clear()
                     authentication_navigation = AuthenticationNavigationPolicy()
+                    observation_phase = "VALIDATION"
                     requested_url = sanitized_url(url)
                     requested_host = normalized_host(urlparse(url).hostname or "")
                     final_url: str | None = None
@@ -1163,7 +1267,9 @@ async def execute_scan(
                     external_links: list[str] = []
                     redirects: list[dict] = []
                     render_health: dict[str, object] | None = None
+                    name_evidence = {"primary_heading": "", "breadcrumb": ""}
                     navigation_actions = {"activated": 0, "skipped": 0}
+                    route_discovery_ms = 0
                     frame_observations: list[dict[str, object]] = []
                     final_in_scope = False
                     remaining_ms = max(0, round((deadline - time.perf_counter()) * 1000))
@@ -1221,6 +1327,7 @@ async def execute_scan(
                                 inherited_strict_tls = bool(evidence["strict_tls"])
                                 security_headers_inherited = True
                             title = sanitize_text(await page.title(), limit=512)
+                            name_evidence = await collect_route_name_evidence(page)
                             final_in_scope = url_in_scan_scope(
                                 final_raw_url,
                                 root_host,
@@ -1293,6 +1400,15 @@ async def execute_scan(
                                 and final_in_scope
                                 and authentication_classification == "PASS"
                             ):
+                                observation_phase = "DISCOVERY"
+                                discovery_started = time.perf_counter()
+                                await publish_progress(
+                                    "DISCOVERING",
+                                    discovered=len(discovered_routes),
+                                    queued=len(queue),
+                                    validated=len(results),
+                                    current_route=active_route_id,
+                                )
                                 if req.max_navigation_actions:
                                     navigation_actions = await expand_safe_navigation(
                                         page,
@@ -1306,7 +1422,6 @@ async def execute_scan(
                                             scan_id=scan_id,
                                             count=navigation_actions["activated"],
                                         )
-                                        await page.wait_for_timeout(min(500, req.render_settle_ms or 250))
                                     if navigation_actions["skipped"]:
                                         log_event(
                                             logging.INFO,
@@ -1329,7 +1444,10 @@ async def execute_scan(
                                         allowed_query_parameters=set(req.allowed_query_parameters),
                                     )
                                     if identity is not None:
-                                        unique_discovered.setdefault(identity, route)
+                                        remember_route_discovery(identity, route, final_raw_url)
+                                        existing = unique_discovered.get(identity)
+                                        if existing is None or (not existing.label and route.label):
+                                            unique_discovered[identity] = route
                                 discovered = list(unique_discovered.values())
                                 download_routes = [
                                     route for route in discovered
@@ -1356,7 +1474,7 @@ async def execute_scan(
                                         count=len(external_links),
                                     )
                                 if final_in_scope:
-                                    metadata: dict[str, tuple[str, str, str]] = {}
+                                    metadata: dict[str, DiscoveredRoute] = {}
                                     for route in discovered:
                                         identity = normalize_route_url(
                                             route.url,
@@ -1364,21 +1482,25 @@ async def execute_scan(
                                             allowed_query_parameters=set(req.allowed_query_parameters),
                                         )
                                         if identity is not None:
-                                            metadata.setdefault(identity, (
-                                                route.label or "Discovered route",
-                                                route.source,
-                                                route.navigation_mode,
-                                            ))
+                                            metadata.setdefault(identity, route)
                                     for link in crawl_links:
                                         path = urlparse(link).path.lower()
                                         if (
                                             not any(word in path for word in DANGEROUS_PATH_WORDS)
                                             and link not in discovered_routes
                                         ):
-                                            label, source, mode = metadata.get(
-                                                link,
-                                                ("Discovered route", "semantic", DOCUMENT_NAVIGATION),
+                                            discovered_route = metadata.get(link) or DiscoveredRoute(
+                                                url=link,
+                                                label="Discovered route",
+                                                source="semantic",
+                                                navigation_mode=DOCUMENT_NAVIGATION,
                                             )
+                                            label = (
+                                                sanitize_text(discovered_route.label, limit=160)
+                                                if discovered_route.label else "Discovered route"
+                                            )
+                                            source = discovered_route.source
+                                            mode = discovered_route.navigation_mode
                                             discovered_routes.add(link)
                                             if depth >= req.max_depth:
                                                 depth_limited_routes.add(link)
@@ -1397,6 +1519,12 @@ async def execute_scan(
                                                 source,
                                                 mode,
                                                 final_raw_url,
+                                                discovered_route.discovery_type,
+                                                discovered_route.label_source,
+                                                (
+                                                    sanitize_text(discovered_route.accessible_name, limit=160)
+                                                    if discovered_route.accessible_name else None
+                                                ),
                                             )
                                             if mode in SAME_DOCUMENT_NAVIGATIONS:
                                                 # Queue all branches breadth-first so one menu does not
@@ -1413,6 +1541,11 @@ async def execute_scan(
                                                 crawl_depth=depth + 1,
                                                 navigation_type=mode,
                                             )
+                                route_discovery_ms = round(
+                                    (time.perf_counter() - discovery_started) * 1000
+                                )
+                                discovery_duration_ms += route_discovery_ms
+                                observation_phase = "VALIDATION"
                         except Exception as exc:
                             if navigation_policy_error is not None:
                                 error = navigation_policy_error.public_message
@@ -1445,8 +1578,14 @@ async def execute_scan(
                             )
 
                     elapsed = round((time.perf_counter() - started) * 1000)
-                    page_console = console_errors[console_start:] if req.check_console else []
-                    page_script_errors = page_errors[page_error_start:] if req.check_console else []
+                    route_validation_ms = max(0, elapsed - route_discovery_ms)
+                    validation_duration_ms += route_validation_ms
+                    page_console = list(dict.fromkeys(
+                        console_errors[console_start:]
+                    )) if req.check_console else []
+                    page_script_errors = list(dict.fromkeys(
+                        page_errors[page_error_start:]
+                    )) if req.check_console else []
                     page_failures = failed_resources[failed_start:] if req.check_resources else []
                     page_api_events = api_events[api_start:] if req.check_resources else []
                     page_resource_events = resource_events[resource_start:] if req.check_resources else []
@@ -1558,39 +1697,90 @@ async def execute_scan(
                         for event in page_api_events
                         if not event.get("blocked_by_validator")
                     )
+                    failed_api_events = [
+                        event for event in page_api_events
+                        if not event.get("blocked_by_validator") and (
+                            bool(event.get("error"))
+                            or (isinstance(event.get("status"), int) and event["status"] >= 400)
+                        )
+                    ]
+                    failed_required_api_count = sum(
+                        event.get("importance") == "REQUIRED" for event in failed_api_events
+                    )
+                    failed_optional_api_count = len(failed_api_events) - failed_required_api_count
+                    api_network_failure_count = sum(
+                        bool(event.get("error")) for event in failed_api_events
+                    )
                     read_only_blocks = sum(
                         failure.get("block_reason") == "read_only_mutation_policy"
                         for failure in page_failures
                     )
-                    display_url = final_url or requested_url
-                    display_parts = urlparse(display_url)
-                    route_display_path = (
-                        (display_parts.path or "/")
-                        + (f"?{display_parts.query}" if display_parts.query else "")
-                        + (f"#{display_parts.fragment}" if display_parts.fragment else "")
+                    final_identity = normalize_route_url(
+                        final_raw_url,
+                        query_policy=req.query_parameter_policy,
+                        allowed_query_parameters=set(req.allowed_query_parameters),
+                    ) or route_identity
+                    identity = route_identity_fields(
+                        final_identity,
+                        query_policy=req.query_parameter_policy,
+                        allowed_query_parameters=set(req.allowed_query_parameters),
                     )
+                    requested_identity = route_identity_fields(
+                        route_identity,
+                        query_policy=req.query_parameter_policy,
+                        allowed_query_parameters=set(req.allowed_query_parameters),
+                    )
+                    display_url = sanitized_url(final_identity)
+                    route_name, route_name_source, route_name_confidence = resolve_route_name(
+                        navigation_label=route_label,
+                        accessible_name=route_accessible_name,
+                        primary_heading=name_evidence.get("primary_heading"),
+                        breadcrumb=name_evidence.get("breadcrumb"),
+                        metadata_name=None,
+                        document_title=title,
+                        display_path=identity["display_path"],
+                    )
+                    provenance = route_provenance.get(route_identity, {"observations": 1, "sources": []})
                     result = {
                         "url": display_url,
                         "requested_url": requested_url,
+                        "discovered_url": sanitized_url(route_identity),
                         "final_url": final_url,
-                        "origin": sanitized_url(display_url, include_path=False),
-                        "hostname": normalized_host(display_parts.hostname or ""),
-                        "pathname": display_parts.path or "/",
-                        "search": f"?{display_parts.query}" if display_parts.query else "",
-                        "hash": f"#{display_parts.fragment}" if display_parts.fragment else "",
-                        "route_display_path": route_display_path,
+                        "origin": identity["origin"],
+                        "host": identity["host"],
+                        "hostname": identity["host"],
+                        "pathname": identity["pathname"],
+                        "query_sanitized": identity["query_sanitized"],
+                        "search": identity["query_sanitized"],
+                        "fragment": identity["fragment"],
+                        "hash": identity["fragment"],
+                        "spa_route": identity["spa_route"],
+                        "canonical_route": requested_identity["canonical_route"],
+                        "display_path": identity["display_path"],
+                        "route_display_path": identity["display_path"],
                         "depth": depth,
                         "crawl_depth": depth,
                         "navigation_depth": depth,
                         "route_label": route_label,
+                        "navigation_label": route_label,
+                        "accessible_name": route_accessible_name,
+                        "route_label_source": route_label_source,
+                        "route_name": route_name,
+                        "route_name_source": route_name_source,
+                        "route_name_confidence": route_name_confidence,
+                        "document_title": title,
                         "route_source": route_source,
-                        "discovery_type": route_source,
+                        "discovery_type": discovery_type,
+                        "discovery_sources": provenance.get("sources", []),
+                        "duplicate_discovery_count": max(
+                            0, int(provenance.get("observations", 1)) - 1
+                        ),
                         "discovered_from": sanitized_url(discovered_from) if discovered_from else None,
                         "expected_origin": sanitized_url(url, include_path=False),
                         "normalized_route_identity": sanitized_url(route_identity),
                         "navigation_type": navigation_mode,
                         "status": status,
-                        "http_status_display": "SPA" if route_transition_succeeded else status,
+                        "http_status_display": "N/A (SPA)" if route_transition_succeeded else status,
                         "title": title,
                         "load_ms": elapsed if req.check_performance else None,
                         "error": error,
@@ -1606,6 +1796,10 @@ async def execute_scan(
                         "resource_failure_count": unexpected_subresource_failures,
                         "api_requests": page_api_events,
                         "api_failures": api_failure_count,
+                        "failed_api_count": api_failure_count,
+                        "failed_required_api_count": failed_required_api_count,
+                        "failed_optional_api_count": failed_optional_api_count,
+                        "api_network_failure_count": api_network_failure_count,
                         "resources": page_resource_events,
                         "websockets": page_websockets,
                         "event_streams": page_event_streams,
@@ -1614,6 +1808,8 @@ async def execute_scan(
                         "frame_navigations": page_frame_events,
                         "render_health": render_health,
                         "slow": elapsed > req.slow_page_threshold_ms,
+                        "discovery_ms": route_discovery_ms,
+                        "validation_ms": route_validation_ms,
                         "navigation_actions": navigation_actions,
                         "unsafe_actions_skipped": navigation_actions["skipped"],
                         "discovery_limitations": int(navigation_actions.get("skipped", 0)),
@@ -1678,6 +1874,16 @@ async def execute_scan(
         validated=len(results),
         current_route=None,
     )
+    finalization_started = time.perf_counter()
+    for result in results:
+        canonical = str(result.get("canonical_route") or "")
+        provenance = route_provenance.get(canonical)
+        if provenance:
+            result["discovery_sources"] = provenance.get("sources", [])
+            result["duplicate_discovery_count"] = max(
+                0, int(provenance.get("observations", 1)) - 1
+            )
+    finalize_duplicate_route_names(results)
     remaining_routes = (discovered_routes - seen) - depth_limited_routes
     if cancellation_requested:
         termination_reason = "USER_CANCELLED"
@@ -1725,6 +1931,28 @@ async def execute_scan(
     summary["resource_calls"] = sum(item["calls"] for item in resource_inventory)
     summary["resource_failures"] = sum(item["failures"] for item in resource_inventory)
     summary["security_recommendations"] = len(security_recommendations)
+    route_durations = sorted(
+        int(result.get("validation_ms") or 0) for result in results
+    )
+    summary["authentication_duration_ms"] = authentication_duration_ms
+    summary["discovery_duration_ms"] = discovery_duration_ms
+    summary["validation_duration_ms"] = validation_duration_ms
+    summary["average_route_duration_ms"] = (
+        round(sum(route_durations) / len(route_durations)) if route_durations else 0
+    )
+    summary["p50_route_duration_ms"] = (
+        route_durations[(len(route_durations) - 1) // 2] if route_durations else 0
+    )
+    summary["p95_route_duration_ms"] = (
+        route_durations[max(0, (95 * len(route_durations) + 99) // 100 - 1)]
+        if route_durations else 0
+    )
+    summary["finalization_duration_ms"] = round(
+        (time.perf_counter() - finalization_started) * 1000
+    )
+    summary["total_scan_duration_ms"] = round(
+        (time.perf_counter() - scan_started) * 1000
+    )
     trust_status: TrustStatus = getattr(app.state, "trust_status", TrustStatus(enabled=False))
     log_event(
         logging.INFO,
@@ -1744,6 +1972,8 @@ async def execute_scan(
         termination_reason=termination_reason,
     )
     return {
+        "report_schema_version": REPORT_SCHEMA_VERSION,
+        "validator_version": VALIDATOR_VERSION,
         "scan_id": scan_id,
         "run_id": scan_id,
         "target": sanitized_url(req.target),
@@ -1868,7 +2098,7 @@ async def create_scan(req: ScanRequest):
     if req.allow_mutations:
         raise HTTPException(400, "Portal health validation is read-only; mutations cannot be enabled")
     try:
-        validate_http_url(urldefrag(req.target.strip()).url)
+        validate_http_url(req.target.strip())
     except DestinationError as exc:
         raise HTTPException(400, exc.public_message) from exc
     scan_id = str(uuid.uuid4())

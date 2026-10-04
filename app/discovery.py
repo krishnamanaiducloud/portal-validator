@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import re
+from collections import Counter
 from dataclasses import dataclass
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from typing import Any
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 
 DOCUMENT_NAVIGATION = "DOCUMENT_NAVIGATION"
@@ -11,6 +14,10 @@ SPA_ROUTE_TRANSITION = "SPA_ROUTE_TRANSITION"
 HASH_ROUTE_TRANSITION = "HASH_ROUTE_TRANSITION"
 SAFE_CLICK_NAVIGATION = "SAFE_CLICK_NAVIGATION"
 DOWNLOAD_OBSERVED = "DOWNLOAD_OBSERVED"
+ANCHOR = "ANCHOR"
+HISTORY_ROUTE_TRANSITION = "HISTORY_ROUTE_TRANSITION"
+MENU_ITEM = "MENU_ITEM"
+TAB = "TAB"
 DOCUMENT_NAVIGATIONS = frozenset({
     DOCUMENT_NAVIGATION,
     SEMANTIC_LINK_NAVIGATION,
@@ -34,9 +41,11 @@ SENSITIVE_QUERY_KEYS = frozenset({
     "samlrequest", "samlresponse", "secret", "session", "session_id", "state", "token",
 })
 DANGEROUS_CONTROL_WORDS = frozenset({
-    "approve", "buy", "cancel", "checkout", "confirm", "create", "delete", "deploy",
-    "destroy", "disable", "enable", "logout", "pay", "purchase", "reboot", "remove",
-    "restart", "save", "sign out", "signout", "submit", "terminate", "update",
+    "add", "approve", "buy", "cancel", "checkout", "confirm", "create", "delete",
+    "deploy", "destroy", "disable", "edit", "enable", "execute", "export", "import",
+    "logout", "pay", "purchase", "reboot", "reject", "remove", "restart", "save",
+    "send", "sign out", "signout", "start", "stop", "submit", "terminate", "update",
+    "upload",
 })
 
 
@@ -46,6 +55,158 @@ class DiscoveredRoute:
     label: str
     source: str
     navigation_mode: str = DOCUMENT_NAVIGATION
+    discovery_type: str = ANCHOR
+    label_source: str | None = None
+    accessible_name: str | None = None
+
+
+GENERIC_ROUTE_LABELS = frozenset({
+    "discovered route", "new window", "requested route", "route", "unnamed route",
+})
+GENERIC_DOCUMENT_TITLES = frozenset({
+    "application", "dashboard", "home", "portal", "web application",
+})
+
+
+def route_identity_fields(
+    value: str,
+    *,
+    query_policy: str = "ignore",
+    allowed_query_parameters: set[str] | None = None,
+) -> dict[str, str | None]:
+    """Return safe, fragment-aware route identity fields for reports and UI."""
+    canonical = normalize_route_url(
+        value,
+        query_policy=query_policy,
+        allowed_query_parameters=allowed_query_parameters,
+    ) or value
+    parsed = urlsplit(canonical)
+    fragment = f"#{parsed.fragment}" if parsed.fragment else ""
+    spa_route = fragment if parsed.fragment.startswith(("/", "!/")) else None
+    query = f"?{parsed.query}" if parsed.query else ""
+    path = parsed.path or "/"
+    display_path = spa_route or f"{path}{query}"
+    origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    return {
+        "origin": origin,
+        "host": (parsed.hostname or "").rstrip(".").lower(),
+        "pathname": path,
+        "query_sanitized": query,
+        "fragment": fragment,
+        "spa_route": spa_route,
+        "canonical_route": canonical,
+        "display_path": display_path,
+    }
+
+
+def humanize_route_path(display_path: str | None) -> str | None:
+    candidate = str(display_path or "").split("?", 1)[0].rstrip("/")
+    candidate = candidate.removeprefix("#!").removeprefix("#")
+    segment = unquote(candidate.rsplit("/", 1)[-1]).strip()
+    if not segment:
+        return None
+    value = re.sub(r"[-_.]+", " ", segment)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value.title()[:160] or None
+
+
+def resolve_route_name(
+    *,
+    navigation_label: str | None,
+    accessible_name: str | None,
+    primary_heading: str | None,
+    breadcrumb: str | None,
+    metadata_name: str | None,
+    document_title: str | None,
+    display_path: str | None,
+) -> tuple[str, str, str]:
+    """Choose a deterministic name without letting generic titles erase route identity."""
+    ranked = (
+        (navigation_label, "NAVIGATION_LABEL", "HIGH"),
+        (accessible_name, "ACCESSIBLE_NAME", "HIGH"),
+        (primary_heading, "PRIMARY_HEADING", "HIGH"),
+        (breadcrumb, "BREADCRUMB", "MEDIUM"),
+        (metadata_name, "ROUTE_METADATA", "MEDIUM"),
+    )
+    for value, source, confidence in ranked:
+        cleaned = str(value or "").strip()
+        if cleaned and cleaned.casefold() not in GENERIC_ROUTE_LABELS:
+            return cleaned[:160], source, confidence
+    title = str(document_title or "").strip()
+    if title and title.casefold() not in GENERIC_DOCUMENT_TITLES:
+        return title[:160], "DOCUMENT_TITLE", "LOW"
+    route_name = humanize_route_path(display_path)
+    if route_name:
+        return route_name, "ROUTE_SEGMENT", "MEDIUM"
+    if title:
+        return title[:160], "DOCUMENT_TITLE", "LOW"
+    return "Unnamed route", "FALLBACK", "LOW"
+
+
+def finalize_duplicate_route_names(results: list[dict[str, Any]]) -> None:
+    """Replace repeated generic document-title names with meaningful route segments."""
+    title_counts = Counter(
+        str(item.get("document_title") or "").strip().casefold()
+        for item in results
+        if item.get("document_title")
+    )
+    for item in results:
+        title_key = str(item.get("document_title") or "").strip().casefold()
+        if item.get("route_name_source") != "DOCUMENT_TITLE" or title_counts[title_key] < 2:
+            continue
+        fallback = humanize_route_path(item.get("display_path"))
+        if fallback:
+            item.update(
+                route_name=fallback,
+                route_name_source="ROUTE_SEGMENT",
+                route_name_confidence="MEDIUM",
+            )
+
+
+ROUTE_NAME_EVIDENCE_SCRIPT = r"""
+() => {
+  const visibleText = (selector) => {
+    for (const element of document.querySelectorAll(selector)) {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      if (style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0) {
+        const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text) return text.slice(0, 160);
+      }
+    }
+    return '';
+  };
+  return {
+    primaryHeading: visibleText('main h1, [role="main"] h1, h1'),
+    breadcrumb: visibleText('[aria-current="page"], nav[aria-label*="breadcrumb" i] li:last-child, [role="navigation"][aria-label*="breadcrumb" i] li:last-child'),
+  };
+}
+"""
+
+
+async def collect_route_name_evidence(page) -> dict[str, str]:
+    result = await page.evaluate(ROUTE_NAME_EVIDENCE_SCRIPT)
+    return {
+        "primary_heading": str(result.get("primaryHeading") or "")[:160],
+        "breadcrumb": str(result.get("breadcrumb") or "")[:160],
+    }
+
+
+def discovery_type_for(source: str, navigation_mode: str) -> str:
+    normalized = source.lower()
+    if navigation_mode == HASH_ROUTE_TRANSITION:
+        return HASH_ROUTE_TRANSITION
+    if source == "browser-history":
+        return HISTORY_ROUTE_TRANSITION
+    if source == "safe-click":
+        return "SAFE_CLICK"
+    if normalized == "tab":
+        return TAB
+    if normalized == "menuitem":
+        return MENU_ITEM
+    if source == "popup":
+        return POPUP_NAVIGATION
+    return ANCHOR
 
 
 def navigation_mode_for_route(url: str, source: str, document_url: str) -> str:
@@ -123,8 +284,25 @@ def normalize_route_url(
     fragment = parsed.fragment
     if not (fragment.startswith("/") or fragment.startswith("!/")):
         fragment = ""
-    elif any(f"{key}=" in fragment.lower() for key in SENSITIVE_QUERY_KEYS):
-        fragment = ""
+    else:
+        fragment_path, separator, fragment_query = fragment.partition("?")
+        fragment_items: list[tuple[str, str]] = []
+        if separator and query_policy != "ignore":
+            for key, item_value in parse_qsl(fragment_query, keep_blank_values=True):
+                lowered = key.lower()
+                if (
+                    lowered in SENSITIVE_QUERY_KEYS
+                    or lowered in TRACKING_QUERY_KEYS
+                    or lowered.startswith(TRACKING_QUERY_PREFIXES)
+                ):
+                    continue
+                if query_policy == "allowlist" and lowered not in allowed:
+                    continue
+                fragment_items.append((key, item_value))
+        fragment = fragment_path
+        sanitized_fragment_query = urlencode(sorted(fragment_items), doseq=True)
+        if sanitized_fragment_query:
+            fragment = f"{fragment}?{sanitized_fragment_query}"
     path = parsed.path or "/"
     return urlunsplit((scheme, netloc, path, query, fragment))
 
@@ -204,11 +382,18 @@ async (maximumScrolls) => {
         try { url = new URL(raw, document.baseURI).href; } catch (_) { continue; }
         if (seen.has(url)) continue;
         seen.add(url);
-        const label = (element.getAttribute('aria-label') || element.textContent ||
-          element.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+        const labelledBy = (element.getAttribute('aria-labelledby') || '').split(/\s+/)
+          .map(id => document.getElementById(id)?.textContent || '').join(' ').replace(/\s+/g, ' ').trim();
+        const ariaLabel = (element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        const visibleLabel = (element.textContent || '').replace(/\s+/g, ' ').trim();
+        const titleLabel = (element.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
+        const label = (ariaLabel || labelledBy || visibleLabel || titleLabel).slice(0, 160);
         values.push({
           url,
           label,
+          accessibleName: (ariaLabel || labelledBy || '').slice(0, 160),
+          labelSource: ariaLabel ? 'aria-label' : labelledBy ? 'aria-labelledby' :
+            visibleLabel ? 'visible-text' : titleLabel ? 'title' : 'none',
           source: element.hasAttribute('download') ? 'download' :
             (element.getAttribute('role') || element.tagName.toLowerCase())
         });
@@ -248,9 +433,10 @@ async (maximumScrolls) => {
 EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
 async (maximum) => {
   const dangerous = new Set([
-    'approve','buy','cancel','checkout','confirm','create','delete','deploy','destroy','disable',
-    'enable','logout','pay','purchase','reboot','remove','restart','save','sign out','signout',
-    'submit','terminate','update'
+    'add','approve','buy','cancel','checkout','confirm','create','delete','deploy','destroy',
+    'disable','edit','enable','execute','export','import','logout','pay','purchase','reboot',
+    'reject','remove','restart','save','send','sign out','signout','start','stop','submit',
+    'terminate','update','upload'
   ]);
   const selector = [
     'nav [aria-expanded="false"][aria-controls]',
@@ -284,11 +470,14 @@ async (maximum) => {
     const element = candidates[0];
     visited.add(element);
     inspected += 1;
-    const label = (element.getAttribute('aria-label') || element.textContent ||
-      element.getAttribute('title') || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const ariaLabel = (element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+    const visibleLabel = (element.textContent || '').replace(/\s+/g, ' ').trim();
+    const titleLabel = (element.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
+    const label = (ariaLabel || visibleLabel || titleLabel).slice(0, 160);
+    const normalizedLabel = label.toLowerCase();
     const unsafe = element.closest('form') || element.hasAttribute('disabled') ||
       element.getAttribute('aria-disabled') === 'true' || element.hasAttribute('href') ||
-      Array.from(dangerous).some(word => label.includes(word));
+      Array.from(dangerous).some(word => normalizedLabel.includes(word));
     if (unsafe) { skipped += 1; continue; }
     const before = window.location.href;
     element.click();
@@ -297,7 +486,10 @@ async (maximum) => {
     if (after !== before) {
       transitions.push({
         url: after,
-        label: label.slice(0, 160),
+        label,
+        accessibleName: ariaLabel.slice(0, 160),
+        labelSource: ariaLabel ? 'aria-label' : visibleLabel ? 'visible-text' :
+          titleLabel ? 'title' : 'none',
         source: 'safe-click'
       });
     }
@@ -344,6 +536,9 @@ async def expand_safe_navigation(page, maximum: int) -> dict[str, object]:
                 label=str(item.get("label") or "")[:160],
                 source="safe-click",
                 navigation_mode=SAFE_CLICK_NAVIGATION,
+                discovery_type="SAFE_CLICK",
+                label_source=str(item.get("labelSource") or "none")[:32],
+                accessible_name=str(item.get("accessibleName") or "")[:160] or None,
             )
             for item in result.get("transitions", [])
             if isinstance(item, dict) and isinstance(item.get("url"), str)
@@ -358,21 +553,22 @@ async def discover_page_routes(page, maximum_scrolls: int = 3) -> list[Discovere
     for item in raw:
         if not isinstance(item, dict) or not isinstance(item.get("url"), str):
             continue
+        source = str(item.get("source") or "semantic")[:64]
+        navigation_mode = (
+            DOWNLOAD_OBSERVED
+            if item.get("source") == "download"
+            else HASH_ROUTE_TRANSITION
+            if item.get("observerMode") == "hash"
+            else navigation_mode_for_route(item["url"], source, document_url)
+        )
         routes.append(DiscoveredRoute(
             url=item["url"],
             label=str(item.get("label") or "")[:160],
-            source=str(item.get("source") or "semantic")[:64],
-            navigation_mode=(
-                DOWNLOAD_OBSERVED
-                if item.get("source") == "download"
-                else HASH_ROUTE_TRANSITION
-                if item.get("observerMode") == "hash"
-                else navigation_mode_for_route(
-                    item["url"],
-                    str(item.get("source") or "semantic"),
-                    document_url,
-                )
-            ),
+            source=source,
+            navigation_mode=navigation_mode,
+            discovery_type=discovery_type_for(source, navigation_mode),
+            label_source=str(item.get("labelSource") or "none")[:32],
+            accessible_name=str(item.get("accessibleName") or "")[:160] or None,
         ))
     return routes
 

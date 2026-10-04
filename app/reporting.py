@@ -175,6 +175,40 @@ def determine_page_outcome(
     return "PASS"
 
 
+FAILURE_DIMENSIONS = {
+    "API_SERVER_ERROR": "API",
+    "API_SERVER_ERROR_OPTIONAL": "API",
+    "HTTP_ERROR": "DOCUMENT_HTTP",
+    "MAIN_DOCUMENT_FAILED": "NAVIGATION",
+    "NAVIGATION_FAILURE": "NAVIGATION",
+    "BLANK_PAGE": "RENDER",
+    "APPLICATION_ERROR_SURFACE": "RENDER",
+    "PAGE_SCRIPT_ERROR": "CONSOLE",
+    "RESOURCE_FAILED": "RESOURCES",
+    "READ_ONLY_MUTATION_BLOCKED": "READ_ONLY_SAFETY",
+}
+
+
+def failure_metadata(
+    classification: str,
+    findings: list[dict[str, Any]],
+    error: str | None,
+) -> tuple[str | None, str | None, list[dict[str, Any]]]:
+    """Explain a failure independently of document HTTP status."""
+    blocking = [item for item in findings if item.get("blocking")]
+    evidence = blocking or (
+        [item for item in findings if item.get("severity") == "ERROR"]
+        if classification in FAILURE_OUTCOMES else []
+    )
+    if evidence:
+        primary = evidence[0]
+        dimension = FAILURE_DIMENSIONS.get(str(primary.get("type")), classification)
+        return str(primary.get("message") or classification), dimension, evidence
+    if classification in FAILURE_OUTCOMES:
+        return error or classification.replace("_", " ").title(), classification, []
+    return None, None, []
+
+
 def classify_page_result(
     *,
     url: str,
@@ -281,7 +315,7 @@ def classify_page_result(
         "API_AUTHENTICATION_FAILURE", "API_AUTHORIZATION_FAILURE", "API_BAD_REQUEST",
         "API_CLIENT_ERROR", "API_CONFLICT", "API_CORS_FAILURE", "API_DNS_FAILURE",
         "API_NETWORK_FAILURE", "API_NOT_FOUND", "API_RATE_LIMITED", "API_REQUEST_FAILED",
-        "API_TIMEOUT", "API_TLS_FAILURE",
+        "API_SERVER_ERROR_OPTIONAL", "API_TIMEOUT", "API_TLS_FAILURE",
     }
     api_status = (
         "FAIL" if "API_SERVER_ERROR" in finding_types else
@@ -305,6 +339,11 @@ def classify_page_result(
         classification if classification in AUTH_OUTCOMES else
         "CHALLENGE_REQUIRED" if classification == "CHALLENGE_REQUIRED" else
         "PASS" if loaded else "NOT_TESTED"
+    )
+    failure_reason, failure_dimension, failure_details = failure_metadata(
+        classification,
+        structured_findings,
+        error,
     )
     return {
         "classification": classification,
@@ -350,6 +389,9 @@ def classify_page_result(
         "read_only_status": (
             "PROTECTED" if "READ_ONLY_MUTATION_BLOCKED" in finding_types else "ENFORCED"
         ),
+        "failure_reason": failure_reason,
+        "failure_dimension": failure_dimension,
+        "failure_details": failure_details,
         "finding_details": structured_findings,
         "findings": len(structured_findings),
         "finding_occurrences": occurrence_count,
@@ -461,6 +503,18 @@ def aggregate_report(
             "COMPLETE" if not_tested_count == 0 else "PARTIAL"
         ),
     }
+    invariants = {
+        "validated_not_above_eligible": validated_count <= eligible_count,
+        "eligible_reconciled": (
+            validated_count + not_tested_count + skipped_count == eligible_count
+        ),
+        "warnings_are_subset_of_passed": (
+            classification_counts["PASS_WITH_WARNINGS"] <= passed_pages
+        ),
+    }
+    if not all(invariants.values()):
+        raise ValueError("Report counters are internally inconsistent")
+    summary["counter_invariants"] = invariants
     return summary
 
 
@@ -507,6 +561,9 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 "method": method,
                 "host": parsed.hostname.lower(),
                 "endpoint": parsed.path or "/",
+                "raw_sanitized_endpoint": parsed.path or "/",
+                "normalized_endpoint": parsed.path or "/",
+                "normalization_confidence": "EXACT",
                 "category": protocol,
                 "calls": 0,
                 "status_2xx": 0,
@@ -515,16 +572,35 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 "status_5xx": 0,
                 "network_failures": 0,
                 "validator_blocks": 0,
+                "blocked_count": 0,
+                "discovery_phase_count": 0,
+                "validation_phase_count": 0,
+                "authentication_phase_count": 0,
+                "first_seen": None,
+                "last_seen": None,
                 "durations_ms": [],
                 "routes": set(),
                 "failure_classifications": Counter(),
+                "importance": Counter(),
             })
             item["calls"] += 1
+            phase = str(event.get("phase") or "VALIDATION").upper()
+            phase_field = {
+                "DISCOVERY": "discovery_phase_count",
+                "AUTHENTICATION": "authentication_phase_count",
+            }.get(phase, "validation_phase_count")
+            item[phase_field] += 1
+            observed_at = event.get("observed_at")
+            if observed_at is not None:
+                item["first_seen"] = item["first_seen"] or observed_at
+                item["last_seen"] = observed_at
+            item["importance"][str(event.get("importance") or "UNKNOWN")] += 1
             route_id = event.get("initiating_route") or result_route_id
             if route_id:
                 item["routes"].add(route_id)
             if event.get("blocked_by_validator"):
                 item["validator_blocks"] += 1
+                item["blocked_count"] += 1
                 continue
             status = event.get("status")
             if isinstance(status, int) and 200 <= status < 600:
@@ -543,6 +619,7 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
         durations = item.pop("durations_ms")
         routes = sorted(item.pop("routes"))
         failures = dict(item.pop("failure_classifications"))
+        importance = dict(item.pop("importance"))
         item.update({
             "routes_using_endpoint": routes,
             "route_count": len(routes),
@@ -551,6 +628,7 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             ),
             "worst_duration_ms": max(durations) if durations else None,
             "failure_classifications": failures,
+            "importance_counts": importance,
             "health": (
                 "FAILED" if item["status_5xx"] or item["network_failures"] else
                 "DEGRADED" if item["status_4xx"] else

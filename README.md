@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.5.0 is an authenticated, read-only browser health validator for public,
+Portal Validator 1.6.0 is an authenticated, read-only browser health validator for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -138,10 +138,10 @@ compatible with an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.5.0 .
+docker build -t mohankrishna999/portal-validator:1.6.0 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.5.0 \
-  -t mohankrishna999/portal-validator:1.5.0-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.6.0 \
+  -t mohankrishna999/portal-validator:1.6.0-debug .
 ```
 
 The debug image adds `debugpy`, hot reload, and port 5678. It inherits the same
@@ -155,7 +155,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.5.0
+  mohankrishna999/portal-validator:1.6.0
 ```
 
 ## OpenShift
@@ -242,6 +242,16 @@ document into a load failure. `tls_status=TRUSTED` means Chromium completed cert
 validation; it does not claim independent inspection of the origin certificate
 when an enterprise TLS proxy is present.
 
+Report schema `2.0` keeps route identity independent from the rendered title.
+It preserves canonical hash/hashbang/history paths and exposes `route_name`,
+`route_name_source`, `route_name_confidence`, `display_path`, `spa_route`, and
+deduplicated discovery provenance. Navigation labels and accessible names rank
+ahead of headings and document titles, so a shared SPA title cannot collapse
+distinct routes. A failed validation also includes `failure_dimension`,
+`failure_reason`, and sanitized supporting findings while retaining document
+HTTP status as independent evidence. Client-only transitions display
+`N/A (SPA)` rather than fabricating an HTTP response.
+
 The portal-health summary also reports discovered, eligible, queued, validated,
 skipped, and not-tested routes with `COMPLETE`, `PARTIAL`, `FAILED`, or
 `CANCELLED` coverage
@@ -252,7 +262,12 @@ not_tested + skipped`; unexecuted routes carry an explicit reason. Summary cards
 drill into route, API, resource, security, and coverage evidence.
 
 Observed API calls are aggregated by sanitized method/host/path with status
-distribution, timing, failure classification, and affected routes. Resources,
+distribution, timing, failure classification, affected routes, read-only block
+count, and discovery/validation/authentication phase counts. Naturally observed
+authentication POSTs are visible, but bodies, credentials, and sensitive
+headers are never captured. Required route APIs and optional/background APIs
+are attributed separately so an explained critical dependency failure can fail
+a route without treating telemetry as equivalent. Resources,
 APIs, and routes remain separate inventories. Browser APIs are observed only
 from natural application activity; the validator never probes or replays a
 discovered endpoint. Observed API Inventory is therefore not an active API

@@ -110,13 +110,24 @@ def sanitize_url(value: str, *, include_path: bool = True) -> str:
         (key, "[REDACTED]" if is_sensitive_key(key) else item_value)
         for key, item_value in parse_qsl(parsed.query, keep_blank_values=True)
     ], doseq=True)
+    fragment = ""
+    if include_path and parsed.fragment.startswith(("/", "!/")):
+        fragment_path, separator, fragment_query = parsed.fragment.partition("?")
+        sanitized_fragment_query = urlencode([
+            (key, "[REDACTED]" if is_sensitive_key(key) else item_value)
+            for key, item_value in parse_qsl(fragment_query, keep_blank_values=True)
+        ], doseq=True)
+        fragment = fragment_path
+        if separator and sanitized_fragment_query:
+            fragment = f"{fragment}?{sanitized_fragment_query}"
+        fragment = JWT_RE.sub("[REDACTED_JWT]", fragment)[:2048]
     return urlunparse((
         parsed.scheme.lower(),
         netloc,
         parsed.path if include_path else "",
         "",
         query,
-        "",
+        fragment,
     ))
 
 

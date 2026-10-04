@@ -179,12 +179,17 @@ def api_health_findings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 resource=resource,
             ))
         elif isinstance(status, int) and status >= 500:
+            required = event.get("importance", "REQUIRED") == "REQUIRED"
             findings.append(finding(
-                "API_SERVER_ERROR",
-                "ERROR",
-                f"An observed application API returned HTTP {status}.",
+                "API_SERVER_ERROR" if required else "API_SERVER_ERROR_OPTIONAL",
+                "ERROR" if required else "WARNING",
+                (
+                    f"A required route API returned HTTP {status}."
+                    if required else
+                    f"A background or optional API returned HTTP {status}."
+                ),
                 resource=resource,
-                blocking=True,
+                blocking=required,
             ))
         elif isinstance(status, int) and status >= 400:
             failure_type = {

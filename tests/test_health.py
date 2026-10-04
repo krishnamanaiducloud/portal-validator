@@ -123,6 +123,26 @@ def test_spa_api_failure_fails_health_without_failing_page_load():
     assert result["page_load_status"] == "LOADED"
     assert result["classification"] == "VALIDATION_FAILED"
     assert result["validation_status"] == "FAIL"
+    assert result["api_status"] == "FAIL"
+    assert result["failure_dimension"] == "API"
+    assert "HTTP 502" in result["failure_reason"]
+
+
+def test_optional_background_api_failure_is_explained_without_failing_route():
+    findings = api_health_findings([{
+        "url": "https://telemetry.example.net/collect",
+        "status": 503,
+        "error": None,
+        "importance": "OPTIONAL",
+    }])
+    result = classify_page_result(
+        url="https://portal.example.com/reports", status=200, error=None,
+        missing_security_headers=[], console_errors=[], failed_resources=[],
+        security_headers_tested=True, additional_findings=findings,
+    )
+    assert result["classification"] == "PASS_WITH_WARNINGS"
+    assert result["api_status"] == "WARNING"
+    assert result["failure_reason"] is None
 
 
 def test_failed_spa_transition_is_a_navigation_failure():
@@ -267,10 +287,13 @@ def test_scan_wide_api_events_preserve_early_and_route_correlated_requests():
     inventory = aggregate_api_events([
         {
             "url": "https://identity.example.net/session?code=REDACTED",
-            "method": "GET",
+            "method": "POST",
             "protocol": "REST",
             "status": 200,
             "error": None,
+            "phase": "AUTHENTICATION",
+            "importance": "AUTHENTICATION",
+            "observed_at": "2026-01-01T00:00:00+00:00",
             "initiating_route": None,
         },
         {
@@ -279,6 +302,9 @@ def test_scan_wide_api_events_preserve_early_and_route_correlated_requests():
             "protocol": "REST",
             "status": 200,
             "error": None,
+            "phase": "VALIDATION",
+            "importance": "REQUIRED",
+            "observed_at": "2026-01-01T00:00:01+00:00",
             "initiating_route": "https://portal.example.com/items",
         },
     ])
@@ -289,6 +315,11 @@ def test_scan_wide_api_events_preserve_early_and_route_correlated_requests():
     assert inventory[0]["routes_using_endpoint"] == [
         "https://portal.example.com/items",
     ]
+    auth_item = inventory[1]
+    assert auth_item["method"] == "POST"
+    assert auth_item["authentication_phase_count"] == 1
+    assert auth_item["validation_phase_count"] == 0
+    assert auth_item["first_seen"] == "2026-01-01T00:00:00+00:00"
     assert "REDACTED" not in str(inventory)
 
 
@@ -304,6 +335,7 @@ def test_validator_blocks_are_auditable_but_not_target_api_failures():
     }])
     assert inventory[0]["calls"] == 1
     assert inventory[0]["validator_blocks"] == 1
+    assert inventory[0]["blocked_count"] == 1
     assert inventory[0]["network_failures"] == 0
     assert inventory[0]["health"] == "HEALTHY"
 

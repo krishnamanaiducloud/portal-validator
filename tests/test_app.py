@@ -53,7 +53,7 @@ def test_home_health_and_security_headers():
     assert "Know your portal" in response.text
     assert response.headers["x-frame-options"] == "DENY"
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
-    assert client.get("/healthz").json() == {"status": "ok", "version": "1.5.0"}
+    assert client.get("/healthz").json() == {"status": "ok", "version": "1.6.0"}
 
 
 @pytest.mark.parametrize("max_pages", [5, 10, 40])
@@ -330,6 +330,9 @@ def test_credentials_do_not_cross_origins():
 def test_sanitization_and_structured_log_redaction():
     secret_url = "https://user:password@example.com/path?token=secret&safe=value#fragment"
     assert sanitized_url(secret_url) == "https://example.com/path?token=%5BREDACTED%5D&safe=value"
+    assert sanitized_url(
+        "https://example.com/#/reports?token=secret&view=summary"
+    ) == "https://example.com/#/reports?token=%5BREDACTED%5D&view=summary"
     data = sanitize_data({"authorization": "Bearer abc", "nested": {"password": "secret"}})
     assert data == {"authorization": "[REDACTED]", "nested": {"password": "[REDACTED]"}}
     old_level = LOGGER.level

@@ -13,9 +13,12 @@ from app.discovery import (
     SPA_ROUTE_TRANSITION,
     ROUTE_OBSERVER_SCRIPT,
     discover_page_routes,
+    finalize_duplicate_route_names,
     navigation_mode_for_route,
     normalize_route_url,
     perform_route_navigation,
+    resolve_route_name,
+    route_identity_fields,
     safe_navigation_control,
 )
 from app.main import partition_links, url_in_scan_scope
@@ -62,7 +65,7 @@ def test_relative_and_invalid_route_normalization():
     assert normalize_route_url("javascript:alert(1)", base_url="https://example.com") is None
     assert normalize_route_url("file:///etc/passwd") is None
     assert normalize_route_url("https://user:secret@example.com/private") is None
-    assert normalize_route_url("https://example.com/#/callback?code=secret") == "https://example.com/"
+    assert normalize_route_url("https://example.com/#/callback?code=secret") == "https://example.com/#/callback"
 
 
 def test_duplicate_and_query_loop_routes_collapse():
@@ -79,6 +82,41 @@ def test_duplicate_and_query_loop_routes_collapse():
     )
     assert crawl == ["https://example.com/items"]
     assert external == ["https://outside.example.net/"]
+
+
+def test_hash_and_hashbang_routes_keep_distinct_identity_and_display_paths():
+    reports = route_identity_fields("https://portal.example.com/#/reports")
+    accounts = route_identity_fields("https://portal.example.com/#!/accounts")
+    assert reports["canonical_route"] == "https://portal.example.com/#/reports"
+    assert reports["spa_route"] == "#/reports"
+    assert reports["display_path"] == "#/reports"
+    assert accounts["canonical_route"] == "https://portal.example.com/#!/accounts"
+    assert accounts["display_path"] == "#!/accounts"
+    assert reports["canonical_route"] != accounts["canonical_route"]
+
+
+def test_route_name_prefers_navigation_evidence_over_generic_document_title():
+    assert resolve_route_name(
+        navigation_label="Audit Dashboard",
+        accessible_name=None,
+        primary_heading=None,
+        breadcrumb=None,
+        metadata_name=None,
+        document_title="Portal",
+        display_path="#/workqueue/audit-dashboard",
+    ) == ("Audit Dashboard", "NAVIGATION_LABEL", "HIGH")
+
+
+def test_repeated_document_titles_fall_back_to_distinct_route_segments():
+    results = [
+        {"document_title": "Shared Portal", "route_name": "Shared Portal", "route_name_source": "DOCUMENT_TITLE", "display_path": "#/reports"},
+        {"document_title": "Shared Portal", "route_name": "Shared Portal", "route_name_source": "DOCUMENT_TITLE", "display_path": "#/accounts"},
+    ]
+    finalize_duplicate_route_names(results)
+    assert [(item["route_name"], item["route_name_source"]) for item in results] == [
+        ("Reports", "ROUTE_SEGMENT"),
+        ("Accounts", "ROUTE_SEGMENT"),
+    ]
 
 
 def test_explicit_portal_hosts_are_crawlable_without_broadening_subdomains():
