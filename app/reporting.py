@@ -179,8 +179,12 @@ def classify_page_result(
     authentication_classification: str | None = None,
     render_classification: str | None = None,
     additional_findings: list[dict[str, Any]] | None = None,
+    route_transition_succeeded: bool = False,
+    navigation_mode: str = "DOCUMENT_NAVIGATION",
+    inherited_strict_tls: bool = False,
+    security_headers_inherited: bool = False,
 ) -> dict[str, Any]:
-    loaded = error is None and status is not None
+    loaded = error is None and (status is not None or route_transition_succeeded)
     base_classification = authentication_classification
     if base_classification is None:
         if error:
@@ -212,6 +216,13 @@ def classify_page_result(
         tls_status = "UNTRUSTED"
         tls_validation = "BROWSER"
         tls_detail = "Chromium rejected the HTTPS certificate chain with strict verification enabled."
+    elif loaded and urlparse(url).scheme == "https" and inherited_strict_tls:
+        tls_status = "TRUSTED"
+        tls_validation = "INHERITED_BROWSER"
+        tls_detail = (
+            "Same-document route inherited the strict TLS browser context from its "
+            "successfully validated HTTPS document; no new handshake is claimed."
+        )
     elif loaded and urlparse(url).scheme == "https":
         tls_status = "TRUSTED"
         tls_validation = "BROWSER"
@@ -254,16 +265,28 @@ def classify_page_result(
         "validation_status": validation_status,
         "category": category,
         "tls_status": tls_status,
-        "tls_basis": "CHROMIUM_STRICT" if tls_validation == "BROWSER" else tls_validation,
+        "tls_basis": (
+            "CHROMIUM_STRICT" if tls_validation == "BROWSER" else
+            "INHERITED_STRICT_BROWSER_CONTEXT" if tls_validation == "INHERITED_BROWSER" else
+            tls_validation
+        ),
         "tls_detail": tls_detail,
         "tls": {
             "status": tls_status,
             "validation": tls_validation,
-            "certificate_verification": tls_validation == "BROWSER",
+            "certificate_verification": tls_validation in {"BROWSER", "INHERITED_BROWSER"},
             "bypass_used": False,
             "independent_certificate_inspection": False,
+            "inherited": tls_validation == "INHERITED_BROWSER",
+            "new_handshake": tls_validation == "BROWSER",
         },
         "security_headers_status": security_headers_status,
+        "security_headers_basis": (
+            "INHERITED_DOCUMENT_RESPONSE" if security_headers_inherited else
+            "DOCUMENT_RESPONSE" if security_headers_tested else
+            "NOT_TESTED"
+        ),
+        "navigation_type": navigation_mode,
         "finding_details": structured_findings,
         "findings": len(structured_findings),
         "finding_occurrences": occurrence_count,

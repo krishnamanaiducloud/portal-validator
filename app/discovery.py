@@ -4,6 +4,17 @@ from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 
+DOCUMENT_NAVIGATION = "DOCUMENT_NAVIGATION"
+SPA_ROUTE_TRANSITION = "SPA_ROUTE_TRANSITION"
+HASH_ROUTE_TRANSITION = "HASH_ROUTE_TRANSITION"
+SAFE_CLICK_NAVIGATION = "SAFE_CLICK_NAVIGATION"
+SAME_DOCUMENT_NAVIGATIONS = frozenset({
+    SPA_ROUTE_TRANSITION,
+    HASH_ROUTE_TRANSITION,
+    SAFE_CLICK_NAVIGATION,
+})
+
+
 TRACKING_QUERY_PREFIXES = ("utm_",)
 TRACKING_QUERY_KEYS = frozenset({
     "dclid", "fbclid", "gclid", "mc_cid", "mc_eid", "msclkid", "ref", "source",
@@ -24,6 +35,36 @@ class DiscoveredRoute:
     url: str
     label: str
     source: str
+    navigation_mode: str = DOCUMENT_NAVIGATION
+
+
+def navigation_mode_for_route(url: str, source: str, document_url: str) -> str:
+    """Classify route execution without broadening the portal crawl boundary."""
+    try:
+        candidate = urlsplit(url)
+        document = urlsplit(document_url)
+    except ValueError:
+        return DOCUMENT_NAVIGATION
+    same_document = (
+        candidate.scheme.lower(),
+        (candidate.hostname or "").rstrip(".").lower(),
+        candidate.port,
+        candidate.path or "/",
+        candidate.query,
+    ) == (
+        document.scheme.lower(),
+        (document.hostname or "").rstrip(".").lower(),
+        document.port,
+        document.path or "/",
+        document.query,
+    )
+    if same_document and candidate.fragment != document.fragment:
+        return HASH_ROUTE_TRANSITION
+    if source == "safe-click":
+        return SAFE_CLICK_NAVIGATION
+    if source == "browser-history":
+        return SPA_ROUTE_TRANSITION
+    return DOCUMENT_NAVIGATION
 
 
 def normalize_route_url(
@@ -102,23 +143,23 @@ ROUTE_OBSERVER_SCRIPT = r"""
 (() => {
   if (window.__portalValidatorRouteObserverInstalled) return;
   window.__portalValidatorRouteObserverInstalled = true;
-  window.__portalValidatorObservedRoutes = [window.location.href];
-  const remember = () => {
+  window.__portalValidatorObservedRoutes = [{url: window.location.href, mode: 'document'}];
+  const remember = (mode) => {
     const value = window.location.href;
-    if (!window.__portalValidatorObservedRoutes.includes(value)) {
-      window.__portalValidatorObservedRoutes.push(value);
+    if (!window.__portalValidatorObservedRoutes.some(item => item.url === value)) {
+      window.__portalValidatorObservedRoutes.push({url: value, mode});
     }
   };
   for (const method of ['pushState', 'replaceState']) {
     const original = history[method];
     history[method] = function(...args) {
       const result = original.apply(this, args);
-      remember();
+      remember('history');
       return result;
     };
   }
-  window.addEventListener('popstate', remember);
-  window.addEventListener('hashchange', remember);
+  window.addEventListener('popstate', () => remember('history'));
+  window.addEventListener('hashchange', () => remember('hash'));
 })();
 """
 
@@ -144,10 +185,12 @@ DISCOVER_ROUTES_SCRIPT = r"""
       element.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 160);
     values.push({url, label, source: element.getAttribute('role') || element.tagName.toLowerCase()});
   }
-  for (const url of (window.__portalValidatorObservedRoutes || [])) {
+  for (const observed of (window.__portalValidatorObservedRoutes || [])) {
+    const url = typeof observed === 'string' ? observed : observed.url;
+    if (!url) continue;
     if (!seen.has(url)) {
       seen.add(url);
-      values.push({url, label: '', source: 'browser-history'});
+      values.push({url, label: '', source: 'browser-history', observerMode: observed.mode || 'history'});
     }
   }
   return values;
@@ -172,6 +215,7 @@ EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
   ].join(',')));
   let activated = 0;
   let skipped = 0;
+  const transitions = [];
   for (const element of controls) {
     if (activated >= maximum) break;
     const label = (element.getAttribute('aria-label') || element.textContent ||
@@ -180,24 +224,68 @@ EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
       element.getAttribute('aria-disabled') === 'true' || element.hasAttribute('href') ||
       Array.from(dangerous).some(word => label.includes(word));
     if (unsafe) { skipped += 1; continue; }
+    const before = window.location.href;
     element.click();
+    const after = window.location.href;
+    if (after !== before) {
+      transitions.push({
+        url: after,
+        label: label.slice(0, 160),
+        source: 'safe-click'
+      });
+    }
     activated += 1;
   }
-  return {activated, skipped};
+  return {activated, skipped, transitions};
 }
 """
 
 
-async def expand_safe_navigation(page, maximum: int) -> dict[str, int]:
+SAME_DOCUMENT_TRANSITION_SCRIPT = r"""
+({target, mode}) => {
+  const destination = new URL(target, window.location.href);
+  if (destination.origin !== window.location.origin) return false;
+  if (mode === 'HASH_ROUTE_TRANSITION') {
+    const previous = window.location.href;
+    history.pushState(
+      history.state,
+      '',
+      `${destination.pathname}${destination.search}${destination.hash}`
+    );
+    window.dispatchEvent(new HashChangeEvent('hashchange', {
+      oldURL: previous,
+      newURL: destination.href
+    }));
+    return true;
+  }
+  history.pushState(history.state, '', destination.href);
+  window.dispatchEvent(new PopStateEvent('popstate', {state: history.state}));
+  return true;
+}
+"""
+
+
+async def expand_safe_navigation(page, maximum: int) -> dict[str, object]:
     result = await page.evaluate(EXPAND_SAFE_NAVIGATION_SCRIPT, maximum)
     return {
         "activated": int(result.get("activated", 0)),
         "skipped": int(result.get("skipped", 0)),
+        "routes": [
+            DiscoveredRoute(
+                url=item["url"],
+                label=str(item.get("label") or "")[:160],
+                source="safe-click",
+                navigation_mode=SAFE_CLICK_NAVIGATION,
+            )
+            for item in result.get("transitions", [])
+            if isinstance(item, dict) and isinstance(item.get("url"), str)
+        ],
     }
 
 
 async def discover_page_routes(page) -> list[DiscoveredRoute]:
     raw = await page.evaluate(DISCOVER_ROUTES_SCRIPT)
+    document_url = page.url
     routes: list[DiscoveredRoute] = []
     for item in raw:
         if not isinstance(item, dict) or not isinstance(item.get("url"), str):
@@ -206,5 +294,46 @@ async def discover_page_routes(page) -> list[DiscoveredRoute]:
             url=item["url"],
             label=str(item.get("label") or "")[:160],
             source=str(item.get("source") or "semantic")[:64],
+            navigation_mode=(
+                HASH_ROUTE_TRANSITION
+                if item.get("observerMode") == "hash"
+                else navigation_mode_for_route(
+                    item["url"],
+                    str(item.get("source") or "semantic"),
+                    document_url,
+                )
+            ),
         ))
     return routes
+
+
+async def perform_route_navigation(page, url: str, mode: str, timeout_ms: int):
+    """Navigate a document or transition an existing SPA document.
+
+    Playwright correctly returns no Response for same-document transitions; callers use
+    the returned boolean as the navigation signal instead of fabricating an HTTP result.
+    """
+    if mode == DOCUMENT_NAVIGATION:
+        response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        if response is None:
+            raise RuntimeError("Document navigation completed without an HTTP response")
+        return response, False
+    if mode not in SAME_DOCUMENT_NAVIGATIONS:
+        raise RuntimeError("Unsupported navigation mode")
+    transitioned = await page.evaluate(
+        SAME_DOCUMENT_TRANSITION_SCRIPT,
+        {"target": url, "mode": mode},
+    )
+    if not transitioned:
+        raise RuntimeError("Same-document route transition crossed an origin boundary")
+    try:
+        await page.wait_for_function(
+            "target => window.location.href === target",
+            arg=url,
+            timeout=timeout_ms,
+        )
+    except Exception as exc:
+        raise RuntimeError("Same-document route transition did not reach the requested route") from exc
+    if page.is_closed():
+        raise RuntimeError("Browser page closed during same-document route transition")
+    return None, True

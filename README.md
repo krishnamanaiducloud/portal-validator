@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.3.0 is an authenticated, read-only browser health validator for public,
+Portal Validator 1.3.1 is an authenticated, read-only browser health validator for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -131,10 +131,10 @@ compatible with an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.3.0 .
+docker build -t mohankrishna999/portal-validator:1.3.1 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.3.0 \
-  -t mohankrishna999/portal-validator:1.3.0-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.3.1 \
+  -t mohankrishna999/portal-validator:1.3.1-debug .
 ```
 
 The debug image adds `debugpy`, hot reload, and port 5678. It inherits the same
@@ -148,7 +148,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.3.0
+  mohankrishna999/portal-validator:1.3.1
 ```
 
 ## OpenShift

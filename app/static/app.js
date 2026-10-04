@@ -113,16 +113,17 @@ function renderRows() {
     ].filter(Boolean);
     const detail = {
       requested_url:item.requested_url, final_url:item.final_url, redirects:item.redirects,
+      navigation_type:item.navigation_type, tls_basis:item.tls_basis,
       render_health:item.render_health, api_requests:item.api_requests, failed_resources:item.failed_resources,
       frames:item.frames, security_headers:item.security_headers, external_links:item.external_links,
     };
     return `<tr class="route-row outcome-${statusClass(item.classification)}">
       <td class="route-cell"><strong>${escapeHtml(item.route_label || item.title || route.path)}</strong><span>${escapeHtml(route.host)}</span><code>${escapeHtml(route.path)}</code></td>
       <td><span class="outcome-badge ${statusClass(item.classification)}">${escapeHtml(item.classification)}</span></td>
-      <td><strong class="http-status">${escapeHtml(item.status ?? '—')}</strong></td>
+      <td><strong class="http-status">${escapeHtml(item.http_status_display ?? item.status ?? 'N/A')}</strong></td>
       <td><span class="time-value ${item.slow ? 'slow' : ''}">${escapeHtml(item.load_ms ?? '—')} ms</span></td>
       <td><div class="signal-list">${signals.length ? signals.map((signal) => `<span>${escapeHtml(signal)}</span>`).join('') : '<span class="quiet">Clean</span>'}</div></td>
-      <td><details class="route-detail"><summary>Inspect</summary><div class="detail-drawer"><div class="result-overview"><div><span>Page load</span><strong class="state ${statusClass(item.page_load_status)}">${escapeHtml(item.page_load_status)}</strong></div><div><span>Validation</span><strong class="state ${statusClass(item.validation_status)}">${escapeHtml(item.validation_status)}</strong></div><div><span>TLS</span><strong class="state ${statusClass(item.tls_status)}">${escapeHtml(item.tls_status)}</strong></div><div><span>Security headers</span><strong class="state ${statusClass(item.security_headers_status)}">${escapeHtml(item.security_headers_status)}</strong></div><div><span>Discovery</span><strong>${escapeHtml(item.route_source || 'route')}</strong></div><div><span>Depth</span><strong>${escapeHtml(item.depth)}</strong></div></div><h3>Findings</h3>${findingsMarkup(item)}<details class="technical-detail"><summary>Technical route data</summary><pre>${escapeHtml(JSON.stringify(detail, null, 2))}</pre></details></div></details></td>
+      <td><details class="route-detail"><summary>Inspect</summary><div class="detail-drawer"><div class="result-overview"><div><span>Page load</span><strong class="state ${statusClass(item.page_load_status)}">${escapeHtml(item.page_load_status)}</strong></div><div><span>Validation</span><strong class="state ${statusClass(item.validation_status)}">${escapeHtml(item.validation_status)}</strong></div><div><span>TLS</span><strong class="state ${statusClass(item.tls_status)}">${escapeHtml(item.tls_status)}</strong></div><div><span>Security headers</span><strong class="state ${statusClass(item.security_headers_status)}">${escapeHtml(item.security_headers_status)}</strong></div><div><span>Navigation</span><strong>${escapeHtml(item.navigation_type || 'DOCUMENT_NAVIGATION')}</strong></div><div><span>Discovery</span><strong>${escapeHtml(item.route_source || 'route')}</strong></div><div><span>Depth</span><strong>${escapeHtml(item.depth)}</strong></div></div><h3>Findings</h3>${findingsMarkup(item)}<details class="technical-detail"><summary>Technical route data</summary><pre>${escapeHtml(JSON.stringify(detail, null, 2))}</pre></details></div></details></td>
     </tr>`;
   }).join('') || '<tr><td colspan="6" class="empty-table">No routes match this filter.</td></tr>';
 }

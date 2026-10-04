@@ -23,11 +23,14 @@ from playwright.async_api import BrowserContext, Route, async_playwright
 
 from app.logging_config import LOGGER, log_event
 from app.discovery import (
+    DOCUMENT_NAVIGATION,
     ROUTE_OBSERVER_SCRIPT,
+    SAME_DOCUMENT_NAVIGATIONS,
     DiscoveredRoute,
     discover_page_routes,
     expand_safe_navigation,
     normalize_route_url,
+    perform_route_navigation,
 )
 from app.health import api_health_findings, assess_page_health, capture_render_health
 from app.navigation import (
@@ -35,6 +38,7 @@ from app.navigation import (
     NavigationTracker,
     classify_authentication,
     classify_navigation_error,
+    origin_for_url,
 )
 from app.reporting import aggregate_report, classify_page_result
 from app.session import RuntimeSessionStore, load_refresh_config, refresh_browser_session
@@ -79,7 +83,7 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(
     title="Portal Validator",
-    version="1.3.0",
+    version="1.3.1",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -637,9 +641,16 @@ async def scan(req: ScanRequest):
         query_policy=req.query_parameter_policy,
         allowed_query_parameters=set(req.allowed_query_parameters),
     ) or requested_target
-    queue = deque([(requested_target, 0, "Requested route", "target")])
+    queue = deque([(
+        requested_target,
+        0,
+        "Requested route",
+        "target",
+        DOCUMENT_NAVIGATION,
+    )])
     seen: set[str] = set()
     discovered_routes: set[str] = {requested_route}
+    document_evidence: dict[tuple[str, str, int | None], dict[str, object]] = {}
     deadline = time.perf_counter() + (req.total_timeout_ms / 1000)
 
     async with SCAN_SEMAPHORE:
@@ -868,7 +879,7 @@ async def scan(req: ScanRequest):
                         **session_refresh,
                     )
                 while queue and len(seen) < req.max_pages:
-                    url, depth, route_label, route_source = queue.popleft()
+                    url, depth, route_label, route_source, navigation_mode = queue.popleft()
                     route_identity = normalize_route_url(
                         url,
                         query_policy=req.query_parameter_policy,
@@ -896,6 +907,9 @@ async def scan(req: ScanRequest):
                     error_classification: str | None = None
                     authentication_classification: str | None = None
                     response_headers: dict[str, str] = {}
+                    route_transition_succeeded = False
+                    inherited_strict_tls = False
+                    security_headers_inherited = False
                     links: list[str] = []
                     discovered: list[DiscoveredRoute] = []
                     external_links: list[str] = []
@@ -917,27 +931,43 @@ async def scan(req: ScanRequest):
                             hostname=requested_host,
                             page_number=len(results) + 1,
                             crawl_depth=depth,
+                            navigation_type=navigation_mode,
                         )
                         try:
-                            response = await page.goto(
+                            response, route_transition_succeeded = await perform_route_navigation(
+                                page,
                                 url,
-                                wait_until="domcontentloaded",
-                                timeout=min(req.timeout_ms, remaining_ms),
+                                navigation_mode,
+                                min(req.timeout_ms, remaining_ms),
                             )
-                            if response is None:
-                                raise RuntimeError("Navigation completed without an HTTP response")
                             final_raw_url = page.url
                             final_url = sanitized_url(final_raw_url)
-                            await reconcile_http_redirect_chain(response, current_tracker)
+                            if response is not None:
+                                await reconcile_http_redirect_chain(response, current_tracker)
                             redirects = current_tracker.redirects()
                             for redirect in redirects:
                                 log_event(logging.INFO, "REDIRECT_DETECTED", scan_id=scan_id, **redirect)
                                 if not redirect["same_origin"]:
                                     log_event(logging.INFO, "CROSS_ORIGIN_REDIRECT", scan_id=scan_id, **redirect)
-                            status = response.status
-                            response_headers = {
-                                name.lower(): value for name, value in (await response.all_headers()).items()
-                            }
+                            if response is not None:
+                                status = response.status
+                                response_headers = {
+                                    name.lower(): value
+                                    for name, value in (await response.all_headers()).items()
+                                }
+                                document_evidence[origin_for_url(final_raw_url)] = {
+                                    "response_headers": response_headers.copy(),
+                                    "strict_tls": urlparse(final_raw_url).scheme == "https",
+                                }
+                            else:
+                                evidence = document_evidence.get(origin_for_url(final_raw_url))
+                                if evidence is None:
+                                    raise RuntimeError(
+                                        "Same-document route has no validated document context"
+                                    )
+                                response_headers = dict(evidence["response_headers"])
+                                inherited_strict_tls = bool(evidence["strict_tls"])
+                                security_headers_inherited = True
                             title = sanitize_text(await page.title(), limit=512)
                             final_in_scope = url_in_scan_scope(
                                 final_raw_url,
@@ -964,6 +994,7 @@ async def scan(req: ScanRequest):
                                 http_status=status,
                                 redirect_count=len(redirects),
                                 classification=authentication_classification,
+                                navigation_type=navigation_mode,
                             )
                             if authentication_classification != "PASS":
                                 log_event(
@@ -1000,10 +1031,23 @@ async def scan(req: ScanRequest):
                                         page,
                                         req.max_navigation_actions,
                                     )
+                                    safe_routes = list(navigation_actions.pop("routes", []))
                                     if navigation_actions["activated"]:
                                         await page.wait_for_timeout(min(500, req.render_settle_ms or 250))
-                                discovered = await discover_page_routes(page)
+                                else:
+                                    safe_routes = []
+                                discovered = safe_routes + await discover_page_routes(page)
                                 discovered.extend(popup_routes[popup_start:])
+                                unique_discovered: dict[str, DiscoveredRoute] = {}
+                                for route in discovered:
+                                    identity = normalize_route_url(
+                                        route.url,
+                                        query_policy=req.query_parameter_policy,
+                                        allowed_query_parameters=set(req.allowed_query_parameters),
+                                    )
+                                    if identity is not None:
+                                        unique_discovered.setdefault(identity, route)
+                                discovered = list(unique_discovered.values())
                                 links = [route.url for route in discovered]
                                 crawl_links, external_links = partition_links(
                                     links,
@@ -1021,26 +1065,41 @@ async def scan(req: ScanRequest):
                                         count=len(external_links),
                                     )
                                 if final_in_scope and depth < req.max_depth:
-                                    metadata = {
-                                        normalize_route_url(
+                                    metadata: dict[str, tuple[str, str, str]] = {}
+                                    for route in discovered:
+                                        identity = normalize_route_url(
                                             route.url,
                                             query_policy=req.query_parameter_policy,
                                             allowed_query_parameters=set(req.allowed_query_parameters),
-                                        ): (route.label or "Discovered route", route.source)
-                                        for route in discovered
-                                    }
+                                        )
+                                        if identity is not None:
+                                            metadata.setdefault(identity, (
+                                                route.label or "Discovered route",
+                                                route.source,
+                                                route.navigation_mode,
+                                            ))
                                     for link in crawl_links:
                                         path = urlparse(link).path.lower()
                                         if not any(word in path for word in DANGEROUS_PATH_WORDS) and link not in discovered_routes:
-                                            label, source = metadata.get(link, ("Discovered route", "semantic"))
+                                            label, source, mode = metadata.get(
+                                                link,
+                                                ("Discovered route", "semantic", DOCUMENT_NAVIGATION),
+                                            )
                                             discovered_routes.add(link)
-                                            queue.append((link, depth + 1, label, source))
+                                            route_item = (link, depth + 1, label, source, mode)
+                                            if mode in SAME_DOCUMENT_NAVIGATIONS:
+                                                # Validate same-document routes while their originating
+                                                # document, browser state, and response evidence are active.
+                                                queue.appendleft(route_item)
+                                            else:
+                                                queue.append(route_item)
                                             log_event(
                                                 logging.DEBUG,
                                                 "LINK_DISCOVERED",
                                                 scan_id=scan_id,
                                                 current_url=link,
                                                 crawl_depth=depth + 1,
+                                                navigation_type=mode,
                                             )
                         except Exception as exc:
                             if navigation_policy_error is not None:
@@ -1102,9 +1161,13 @@ async def scan(req: ScanRequest):
                     header_names = SECURITY_HEADERS
                     if urlparse(final_url or requested_url).scheme != "https":
                         header_names = tuple(name for name in SECURITY_HEADERS if name != "strict-transport-security")
+                    security_headers_tested = bool(
+                        req.check_security_headers
+                        and (status is not None or security_headers_inherited)
+                    )
                     header_report = {
                         name: response_headers.get(name) for name in header_names
-                    } if req.check_security_headers else {}
+                    } if security_headers_tested else {}
                     missing_headers = [name for name, value in header_report.items() if not value]
                     render_classification: str | None = None
                     health_findings: list[dict] = []
@@ -1125,10 +1188,14 @@ async def scan(req: ScanRequest):
                         missing_security_headers=missing_headers,
                         console_errors=page_console,
                         failed_resources=page_failures,
-                        security_headers_tested=req.check_security_headers,
+                        security_headers_tested=security_headers_tested,
                         authentication_classification=authentication_classification or error_classification,
                         render_classification=render_classification,
                         additional_findings=health_findings,
+                        route_transition_succeeded=route_transition_succeeded,
+                        navigation_mode=navigation_mode,
+                        inherited_strict_tls=inherited_strict_tls,
+                        security_headers_inherited=security_headers_inherited,
                     )
                     api_failure_count = sum(
                         bool(event.get("error"))
@@ -1147,7 +1214,9 @@ async def scan(req: ScanRequest):
                         "depth": depth,
                         "route_label": route_label,
                         "route_source": route_source,
+                        "navigation_type": navigation_mode,
                         "status": status,
+                        "http_status_display": "SPA" if route_transition_succeeded else status,
                         "title": title,
                         "load_ms": elapsed if req.check_performance else None,
                         "error": error,
