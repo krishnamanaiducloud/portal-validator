@@ -1,4 +1,4 @@
-ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.2.2
+ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.3.0
 FROM ${PRODUCTION_IMAGE} AS debug-dependencies
 
 USER 0

@@ -51,7 +51,7 @@ def test_home_health_and_security_headers():
     assert "Know your portal" in response.text
     assert response.headers["x-frame-options"] == "DENY"
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
-    assert client.get("/healthz").json() == {"status": "ok", "version": "1.2.2"}
+    assert client.get("/healthz").json() == {"status": "ok", "version": "1.3.0"}
 
 
 @pytest.mark.parametrize(("candidate", "root", "subdomains", "expected"), [
@@ -267,7 +267,7 @@ def test_basic_auth_and_input_guards(monkeypatch):
         "mutation_endpoint_allowlist": ["/test/"],
     })
     assert response.status_code == 400
-    assert "acknowledgement" in response.json()["detail"]
+    assert "read-only" in response.json()["detail"]
 
 
 def test_storage_profiles_are_validated_discovered_and_never_returned(monkeypatch, tmp_path):
@@ -436,3 +436,25 @@ def test_production_sources_contain_no_tls_bypass():
         "verify=False", "NODE_TLS_REJECT_UNAUTHORIZED=0",
     ):
         assert forbidden not in sources
+
+
+def test_portal_hosts_do_not_broaden_resource_or_credential_scope_implicitly():
+    request = ScanRequest(
+        target="https://portal.example.com",
+        portal_hosts=["app.example.net"],
+        resource_hosts=["cdn.example.org"],
+    )
+    assert request.portal_hosts == ["app.example.net"]
+    assert request.resource_hosts == ["cdn.example.org"]
+    assert request.credential_hosts == []
+
+
+def test_unexpected_mutations_are_not_configurable():
+    response = client.post("/api/scan", json={
+        "target": "https://example.com",
+        "allow_mutations": True,
+        "mutation_acknowledged": True,
+        "mutation_endpoint_allowlist": ["/sandbox/"],
+    })
+    assert response.status_code == 400
+    assert "read-only" in response.json()["detail"]

@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.2.2 is a browser-based HTTP/HTTPS validator for public,
+Portal Validator 1.3.0 is an authenticated, read-only browser health validator for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -20,16 +20,21 @@ Browser navigation and crawling intentionally have different boundaries:
   per-scan approval.
 - Redirect chains are bounded, loop-checked, sanitized, and returned in the
   report.
-- Discovered links are crawled only on the original hostname and its equivalent
-  `www` form. `Include subdomains` expands that crawl boundary using DNS-label
-  matching; external links are reported but not crawled.
+- Semantic links, navigation roles, safe menus/tabs, and SPA history/hash routes
+  are discovered in one browser context. Routes are crawled only on the original
+  hostname, its equivalent `www` form, or explicitly approved portal hosts.
+  `Include subdomains` expands the primary boundary using DNS-label matching;
+  external links are reported but not crawled.
+- Route identities use a configurable query policy and always remove tracking
+  and authentication parameters to prevent ID/pagination loops and report leaks.
 - Optional resource hosts allow only subresources, not recursive crawling.
 - Scan-supplied Basic, bearer, and custom-header credentials are sent only to
   approved credential hosts. Browser cookie domain rules remain in effect.
-- Mutating methods are blocked unless the caller explicitly acknowledges them
-  and supplies safe portal-scoped path prefixes. Main-frame SSO form POSTs are
-  handled separately: they are allowed only inside a detected authentication
-  chain and every new destination still passes the network/SSRF policy.
+- Normal validation permits only GET, HEAD, and OPTIONS. Unexpected mutating
+  requests are blocked and reported as `READ_ONLY_MUTATION_BLOCKED`. Main-frame
+  SSO form POSTs are handled separately: they are allowed only inside a detected
+  authentication chain and every new destination still passes the network/SSRF
+  policy.
 - Only ports 80, 443, 8080, and 8443 are accepted.
 
 Authentication modes are anonymous, HTTP Basic, bearer/token, custom headers,
@@ -44,6 +49,30 @@ read-only at `/auth`, restrict access, rotate them, and never commit them.
 The UI discovers valid `*.json` profiles from this mount; users cannot enter an
 arbitrary container path. Desktop browser sessions are separate from the
 Playwright Chromium session running in OpenShift.
+
+### Automatic session refresh
+
+For a profile named `/auth/approved.json`, an optional read-only companion file
+`/auth/approved.refresh.json` enables silent browser refresh:
+
+```json
+{
+  "refresh_url": "https://identity.example.net/session/refresh",
+  "timeout_ms": 60000,
+  "settle_ms": 1500
+}
+```
+
+The mounted state seeds a private `0600` runtime copy. Before crawling, the same
+Playwright context visits the configured refresh URL, allowing the identity
+provider's normal refresh cookie/token flow to run. After a successful portal
+validation, the updated browser state is atomically saved under
+`$HOME/.portal-validator/sessions` and reused by later scans in that pod. The
+refresh URL, cookies, tokens, and storage contents are never returned in a
+report. An interactive login or MFA challenge is not guessed or bypassed; it is
+reported as `SESSION_EXPIRED`, `AUTH_REQUIRED`, or `MFA_REQUIRED`. Pod-local
+state is intentionally ephemeral, so the mounted Secret remains the bootstrap
+source after a rollout.
 
 Run this service only for systems you are authorized to validate, and protect
 the service itself with organizational access controls.
@@ -102,10 +131,10 @@ compatible with an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.2.2 .
+docker build -t mohankrishna999/portal-validator:1.3.0 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.2.2 \
-  -t mohankrishna999/portal-validator:1.2.2-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.3.0 \
+  -t mohankrishna999/portal-validator:1.3.0-debug .
 ```
 
 The debug image adds `debugpy`, hot reload, and port 5678. It inherits the same
@@ -119,7 +148,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.2.2
+  mohankrishna999/portal-validator:1.3.0
 ```
 
 ## OpenShift
@@ -184,6 +213,12 @@ failed subresources remain warnings and do not turn a successfully loaded main
 document into a load failure. `tls_status=TRUSTED` means Chromium completed certificate-chain
 validation; it does not claim independent inspection of the origin certificate
 when an enterprise TLS proxy is present.
+
+The portal-health summary also reports discovered versus validated routes,
+healthy/warning/failing routes, authentication issues, observed API and
+resource failures, slow routes, skipped unsafe controls, and read-only request
+blocks. Browser APIs are observed from natural application activity; the
+validator never calls discovered APIs directly.
 
 Logs are structured JSON with a per-scan ID. URLs, query secrets, credentials,
 tokens, cookies, storage state, and certificate/private-key material are

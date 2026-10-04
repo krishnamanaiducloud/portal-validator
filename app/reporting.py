@@ -19,6 +19,8 @@ FAILURE_OUTCOMES = frozenset({
     "TIMEOUT",
     "NAVIGATION_ERROR",
     "VALIDATION_FAILED",
+    "PAGE_RENDER_ERROR",
+    "FAIL",
 })
 
 
@@ -78,8 +80,9 @@ def build_findings(
     missing_security_headers: list[str],
     console_errors: list[str],
     failed_resources: list[dict[str, Any]],
+    additional_findings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = list(additional_findings or [])
     for header in missing_security_headers:
         items.append(finding(
             "MISSING_SECURITY_HEADER",
@@ -92,14 +95,25 @@ def build_findings(
     for resource_failure in failed_resources:
         resource = resource_failure.get("url")
         if resource_failure.get("blocked_by_validator"):
-            items.append(finding(
-                "RESOURCE_SKIPPED",
-                "INFO",
-                "Resource was intentionally skipped by validator policy.",
-                resource=resource,
-                blocked_by_validator=True,
-                block_reason=resource_failure.get("block_reason"),
-            ))
+            reason = resource_failure.get("block_reason")
+            if reason == "read_only_mutation_policy":
+                items.append(finding(
+                    "READ_ONLY_MUTATION_BLOCKED",
+                    "WARNING",
+                    "A mutating request was blocked to preserve read-only validation.",
+                    resource=resource,
+                    blocked_by_validator=True,
+                    block_reason=reason,
+                ))
+            else:
+                items.append(finding(
+                    "RESOURCE_SKIPPED",
+                    "INFO",
+                    "Resource was intentionally skipped by validator policy.",
+                    resource=resource,
+                    blocked_by_validator=True,
+                    block_reason=reason,
+                ))
         elif resource_failure.get("main_document"):
             items.append(finding(
                 "MAIN_DOCUMENT_FAILED",
@@ -163,6 +177,8 @@ def classify_page_result(
     failed_resources: list[dict[str, Any]],
     security_headers_tested: bool,
     authentication_classification: str | None = None,
+    render_classification: str | None = None,
+    additional_findings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     loaded = error is None and status is not None
     base_classification = authentication_classification
@@ -185,7 +201,10 @@ def classify_page_result(
         missing_security_headers=missing_security_headers,
         console_errors=console_errors,
         failed_resources=failed_resources,
+        additional_findings=additional_findings,
     )
+    if base_classification == "PASS" and render_classification:
+        base_classification = render_classification
     classification = determine_page_outcome(base_classification, structured_findings)
     page_load_status = "LOADED" if loaded else "FAILED_TO_LOAD"
 
@@ -255,7 +274,11 @@ def classify_page_result(
     }
 
 
-def aggregate_report(results: list[dict[str, Any]]) -> dict[str, Any]:
+def aggregate_report(
+    results: list[dict[str, Any]],
+    *,
+    routes_discovered: int | None = None,
+) -> dict[str, Any]:
     load_counts = Counter(result["page_load_status"] for result in results)
     classification_counts = Counter(result["classification"] for result in results)
     validation_counts = Counter(result["validation_status"] for result in results)
@@ -294,6 +317,16 @@ def aggregate_report(results: list[dict[str, Any]]) -> dict[str, Any]:
         "not_tested": validation_counts["NOT_TESTED"],
         "total_load_time": sum(result.get("load_ms") or 0 for result in results),
         "duration_ms": sum(result.get("load_ms") or 0 for result in results),
+        "routes_discovered": routes_discovered if routes_discovered is not None else len(results),
+        "routes_validated": len(results),
+        "healthy_routes": classification_counts["PASS"],
+        "routes_with_warnings": classification_counts["PASS_WITH_WARNINGS"],
+        "auth_issues": sum(classification_counts[item] for item in AUTH_OUTCOMES),
+        "api_failures": sum(int(result.get("api_failures", 0)) for result in results),
+        "resource_failures": sum(int(result.get("resource_failure_count", 0)) for result in results),
+        "slow_pages": sum(bool(result.get("slow")) for result in results),
+        "unsafe_actions_skipped": sum(int(result.get("unsafe_actions_skipped", 0)) for result in results),
+        "read_only_blocks": sum(int(result.get("read_only_blocks", 0)) for result in results),
         "classifications": dict(classification_counts),
     }
     return summary
