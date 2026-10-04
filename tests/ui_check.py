@@ -30,6 +30,7 @@ async def main():
         assert await page.get_by_role("button", name="Run validation →").is_enabled()
         assert await page.locator("#auth-mode option").count() == 6
         assert await page.locator("#redirects").input_value() == "10"
+        assert await page.locator("#pages").input_value() == "50"
         await page.locator("#auth-mode").select_option("storage_state")
         assert await page.get_by_text("Mounted SSO profile", exact=True).is_visible()
         await page.evaluate("""
@@ -37,17 +38,29 @@ async def main():
             target:'https://portal.example.com', pages:1, run_id:'ui-check',
             summary:{routes_discovered:3,routes_validated:1,healthy_routes:1,routes_with_warnings:0,
               failed_pages:0,auth_issues:0,api_failures:0,resource_failures:0,slow_pages:0,
-              read_only_blocks:0,duration_ms:125},
+              read_only_blocks:0,duration_ms:125,not_tested_pages:0,console_failures:0,
+              unique_apis:1,security_recommendations:0},
+            coverage:{scan_completeness:'PARTIAL',termination_reason:'MAX_ROUTES_REACHED',routes_validated:1,routes_remaining:2},
+            api_inventory:[{method:'GET',host:'api.example.net',endpoint:'/health',calls:1,status_2xx:1,
+              status_3xx:0,status_4xx:0,status_5xx:0,network_failures:0,route_count:1,
+              average_duration_ms:12,worst_duration_ms:12,health:'HEALTHY',routes_using_endpoint:['/health']}],
+            security_recommendations:[],
             results:[{url:'https://portal.example.com/health',requested_url:'https://portal.example.com/health',
               final_url:'https://portal.example.com/health',route_label:'Health',route_source:'navigation',
               classification:'PASS',page_load_status:'LOADED',validation_status:'PASS',tls_status:'TRUSTED',
-              security_headers_status:'PASS',status:200,load_ms:125,depth:1,slow:false,api_failures:0,
+              security_headers_status:'PASS',navigation_status:'SUCCESS',render_status:'PASS',api_status:'PASS',
+              resource_status:'PASS',console_status:'PASS',authentication_status:'PASS',read_only_status:'ENFORCED',
+              navigation_type:'DOCUMENT_NAVIGATION',warning_findings:0,status:200,load_ms:125,depth:1,slow:false,api_failures:0,
               resource_failure_count:0,read_only_blocks:0,console_errors:[],finding_details:[],redirects:[],
               render_health:{text_length:120},api_requests:[],failed_resources:[],frames:[],security_headers:{},
               external_links:[]}]
           })
         """)
-        assert await page.locator(".route-table tbody tr").count() == 1
+        assert await page.locator("#result-list tr").count() == 1
+        assert await page.locator(".metric").count() >= 10
+        assert await page.locator("#api-list tr").count() == 1
+        await page.get_by_role("button", name="Show Discovered evidence").click()
+        assert await page.locator("#evidence-panel").is_visible()
         assert not await page.locator(".raw-report").get_attribute("open")
         main_width = await page.locator("main").evaluate("element => element.getBoundingClientRect().width")
         assert main_width > 1300

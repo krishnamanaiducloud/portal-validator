@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 
 from app.reporting import finding
@@ -26,12 +28,24 @@ RENDER_HEALTH_SCRIPT = r"""
       const style = getComputedStyle(element);
       return style.visibility !== 'hidden' && style.display !== 'none';
     }).length;
+  const challenge = Array.from(document.querySelectorAll([
+    '[data-sitekey]',
+    'iframe[src*="captcha" i]',
+    'iframe[title*="captcha" i]',
+    'iframe[title*="challenge" i]',
+    '[aria-label*="captcha" i]'
+  ].join(','))).filter((element) => {
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+  }).length;
   return {
     ready_state: document.readyState,
     title: document.title.slice(0, 256),
     text_length: text.length,
     visible_elements: visible.length,
     busy_indicators: busy,
+    challenge_indicators: challenge,
     alert_text: alertText,
   };
 }
@@ -55,8 +69,46 @@ async def capture_render_health(page) -> dict[str, Any]:
         "text_length": max(0, int(result.get("text_length", 0))),
         "visible_elements": max(0, int(result.get("visible_elements", 0))),
         "busy_indicators": max(0, int(result.get("busy_indicators", 0))),
+        "challenge_indicators": max(0, int(result.get("challenge_indicators", 0))),
         "alert_text": str(result.get("alert_text") or "")[:500],
     }
+
+
+async def wait_for_render_settle(
+    page,
+    *,
+    settle_ms: int,
+    maximum_ms: int,
+) -> dict[str, Any]:
+    """Wait for bounded DOM/render stability without relying on network-idle."""
+    if settle_ms <= 0:
+        return await capture_render_health(page)
+    maximum_ms = max(settle_ms, maximum_ms)
+    deadline = time.perf_counter() + (maximum_ms / 1000)
+    stable_since: float | None = None
+    previous: tuple[object, ...] | None = None
+    latest: dict[str, Any] = {}
+    while True:
+        latest = await capture_render_health(page)
+        signature = (
+            latest["ready_state"],
+            latest["text_length"],
+            latest["visible_elements"],
+            latest["busy_indicators"],
+            latest["challenge_indicators"],
+            latest["title"],
+        )
+        now = time.perf_counter()
+        if signature == previous:
+            stable_since = stable_since or now
+            if (now - stable_since) * 1000 >= settle_ms:
+                return latest
+        else:
+            previous = signature
+            stable_since = None
+        if now >= deadline:
+            return latest
+        await asyncio.sleep(min(0.1, max(0.01, deadline - now)))
 
 
 def assess_page_health(
@@ -67,7 +119,14 @@ def assess_page_health(
 ) -> tuple[str | None, list[dict[str, Any]]]:
     findings: list[dict[str, Any]] = []
     classification: str | None = None
-    if snapshot.get("text_length", 0) < 20 and snapshot.get("visible_elements", 0) < 3:
+    if snapshot.get("challenge_indicators", 0):
+        classification = "CHALLENGE_REQUIRED"
+        findings.append(finding(
+            "AUTOMATION_CHALLENGE_OBSERVED",
+            "INFO",
+            "A browser challenge requires user interaction and was not bypassed.",
+        ))
+    elif snapshot.get("text_length", 0) < 20 and snapshot.get("visible_elements", 0) < 3:
         classification = "PAGE_RENDER_ERROR"
         findings.append(finding(
             "BLANK_PAGE",
@@ -106,8 +165,15 @@ def api_health_findings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         status = event.get("status")
         resource = event.get("url")
         if event.get("error"):
+            upper_error = str(event["error"]).upper()
+            failure_type = (
+                "API_TLS_FAILURE" if "CERT" in upper_error or "TLS" in upper_error else
+                "API_DNS_FAILURE" if "NAME_NOT_RESOLVED" in upper_error else
+                "API_TIMEOUT" if "TIMEOUT" in upper_error else
+                "API_NETWORK_FAILURE"
+            )
             findings.append(finding(
-                "API_REQUEST_FAILED",
+                failure_type,
                 "WARNING",
                 "An observed application API request failed.",
                 resource=resource,
@@ -121,10 +187,44 @@ def api_health_findings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 blocking=True,
             ))
         elif isinstance(status, int) and status >= 400:
+            failure_type = {
+                400: "API_BAD_REQUEST",
+                401: "API_AUTHENTICATION_FAILURE",
+                403: "API_AUTHORIZATION_FAILURE",
+                404: "API_NOT_FOUND",
+                408: "API_TIMEOUT",
+                409: "API_CONFLICT",
+                429: "API_RATE_LIMITED",
+            }.get(status, "API_CLIENT_ERROR")
             findings.append(finding(
-                "API_CLIENT_ERROR",
+                failure_type,
                 "WARNING",
                 f"An observed application API returned HTTP {status}.",
                 resource=resource,
+            ))
+    return findings
+
+
+def realtime_health_findings(
+    websocket_events: list[dict[str, Any]],
+    event_streams: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for event in websocket_events:
+        if event.get("status") == "ERROR":
+            findings.append(finding(
+                "WEBSOCKET_CONNECTION_FAILED",
+                "WARNING",
+                "A naturally initiated WebSocket connection reported an error.",
+                resource=event.get("url"),
+            ))
+    for event in event_streams:
+        status = event.get("status")
+        if event.get("error") or (isinstance(status, int) and status >= 400):
+            findings.append(finding(
+                "EVENT_STREAM_FAILED",
+                "WARNING",
+                "A naturally initiated server-sent event stream failed.",
+                resource=event.get("url"),
             ))
     return findings

@@ -5,9 +5,17 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 
 DOCUMENT_NAVIGATION = "DOCUMENT_NAVIGATION"
+SEMANTIC_LINK_NAVIGATION = "SEMANTIC_LINK_NAVIGATION"
+POPUP_NAVIGATION = "POPUP_NAVIGATION"
 SPA_ROUTE_TRANSITION = "SPA_ROUTE_TRANSITION"
 HASH_ROUTE_TRANSITION = "HASH_ROUTE_TRANSITION"
 SAFE_CLICK_NAVIGATION = "SAFE_CLICK_NAVIGATION"
+DOWNLOAD_OBSERVED = "DOWNLOAD_OBSERVED"
+DOCUMENT_NAVIGATIONS = frozenset({
+    DOCUMENT_NAVIGATION,
+    SEMANTIC_LINK_NAVIGATION,
+    POPUP_NAVIGATION,
+})
 SAME_DOCUMENT_NAVIGATIONS = frozenset({
     SPA_ROUTE_TRANSITION,
     HASH_ROUTE_TRANSITION,
@@ -20,8 +28,10 @@ TRACKING_QUERY_KEYS = frozenset({
     "dclid", "fbclid", "gclid", "mc_cid", "mc_eid", "msclkid", "ref", "source",
 })
 SENSITIVE_QUERY_KEYS = frozenset({
-    "access_token", "authorization", "code", "id_token", "relaystate", "samlrequest",
-    "samlresponse", "session", "state", "token",
+    "access_token", "api_key", "apikey", "assertion", "authorization",
+    "authorization_code", "client_secret", "code", "code_challenge", "code_verifier",
+    "id_token", "key", "password", "passwd", "refresh_token", "relaystate",
+    "samlrequest", "samlresponse", "secret", "session", "session_id", "state", "token",
 })
 DANGEROUS_CONTROL_WORDS = frozenset({
     "approve", "buy", "cancel", "checkout", "confirm", "create", "delete", "deploy",
@@ -64,7 +74,9 @@ def navigation_mode_for_route(url: str, source: str, document_url: str) -> str:
         return SAFE_CLICK_NAVIGATION
     if source == "browser-history":
         return SPA_ROUTE_TRANSITION
-    return DOCUMENT_NAVIGATION
+    if source == "popup":
+        return POPUP_NAVIGATION
+    return SEMANTIC_LINK_NAVIGATION
 
 
 def normalize_route_url(
@@ -165,7 +177,7 @@ ROUTE_OBSERVER_SCRIPT = r"""
 
 
 DISCOVER_ROUTES_SCRIPT = r"""
-() => {
+async (maximumScrolls) => {
   const values = [];
   const seen = new Set();
   const selectors = [
@@ -173,18 +185,53 @@ DISCOVER_ROUTES_SCRIPT = r"""
     'nav [data-url]', '[role="navigation"] [data-url]', '[role="menuitem"][data-href]',
     '[role="tab"][data-href]'
   ];
-  for (const element of document.querySelectorAll(selectors.join(','))) {
-    const raw = element.getAttribute('href') || element.getAttribute('data-href') ||
-      element.getAttribute('data-url');
-    if (!raw) continue;
-    let url;
-    try { url = new URL(raw, document.baseURI).href; } catch (_) { continue; }
-    if (seen.has(url)) continue;
-    seen.add(url);
-    const label = (element.getAttribute('aria-label') || element.textContent ||
-      element.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 160);
-    values.push({url, label, source: element.getAttribute('role') || element.tagName.toLowerCase()});
+  const roots = () => {
+    const values = [document];
+    for (let index = 0; index < values.length; index += 1) {
+      for (const element of values[index].querySelectorAll('*')) {
+        if (element.shadowRoot) values.push(element.shadowRoot);
+      }
+    }
+    return values;
+  };
+  const collect = () => {
+    for (const root of roots()) {
+      for (const element of root.querySelectorAll(selectors.join(','))) {
+        const raw = element.getAttribute('href') || element.getAttribute('data-href') ||
+          element.getAttribute('data-url');
+        if (!raw) continue;
+        let url;
+        try { url = new URL(raw, document.baseURI).href; } catch (_) { continue; }
+        if (seen.has(url)) continue;
+        seen.add(url);
+        const label = (element.getAttribute('aria-label') || element.textContent ||
+          element.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+        values.push({
+          url,
+          label,
+          source: element.hasAttribute('download') ? 'download' :
+            (element.getAttribute('role') || element.tagName.toLowerCase())
+        });
+      }
+    }
+  };
+  collect();
+  const scrollables = roots().flatMap(root => Array.from(root.querySelectorAll(
+    'nav, [role="navigation"], [role="menu"], [role="menubar"]'
+  ))).filter(element => element.scrollHeight > element.clientHeight && element.clientHeight > 0);
+  const originalPositions = scrollables.map(element => element.scrollTop);
+  for (let step = 0; step < maximumScrolls; step += 1) {
+    let moved = false;
+    for (const element of scrollables) {
+      const before = element.scrollTop;
+      element.scrollTop = Math.min(element.scrollHeight, before + element.clientHeight);
+      moved = moved || element.scrollTop !== before;
+    }
+    if (!moved) break;
+    await new Promise(resolve => setTimeout(resolve, 50));
+    collect();
   }
+  scrollables.forEach((element, index) => { element.scrollTop = originalPositions[index]; });
   for (const observed of (window.__portalValidatorObservedRoutes || [])) {
     const url = typeof observed === 'string' ? observed : observed.url;
     if (!url) continue;
@@ -199,25 +246,44 @@ DISCOVER_ROUTES_SCRIPT = r"""
 
 
 EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
-(maximum) => {
+async (maximum) => {
   const dangerous = new Set([
     'approve','buy','cancel','checkout','confirm','create','delete','deploy','destroy','disable',
     'enable','logout','pay','purchase','reboot','remove','restart','save','sign out','signout',
     'submit','terminate','update'
   ]);
-  const controls = Array.from(document.querySelectorAll([
+  const selector = [
     'nav [aria-expanded="false"][aria-controls]',
     '[role="navigation"] [aria-expanded="false"][aria-controls]',
     '[role="menu"] [aria-expanded="false"][aria-controls]',
     'aside [aria-expanded="false"][aria-controls]',
     '[role="tab"][aria-selected="false"][aria-controls]',
     '[aria-haspopup="menu"][aria-expanded="false"]'
-  ].join(',')));
+  ].join(',');
+  const visited = new WeakSet();
+  const controls = () => {
+    const values = [];
+    const visit = (root) => {
+      for (const element of root.querySelectorAll(selector)) {
+        if (!visited.has(element)) values.push(element);
+      }
+      for (const element of root.querySelectorAll('*')) {
+        if (element.shadowRoot) visit(element.shadowRoot);
+      }
+    };
+    visit(document);
+    return values;
+  };
   let activated = 0;
   let skipped = 0;
+  let inspected = 0;
   const transitions = [];
-  for (const element of controls) {
-    if (activated >= maximum) break;
+  while (activated < maximum && inspected < Math.max(25, maximum * 5)) {
+    const candidates = controls();
+    if (!candidates.length) break;
+    const element = candidates[0];
+    visited.add(element);
+    inspected += 1;
     const label = (element.getAttribute('aria-label') || element.textContent ||
       element.getAttribute('title') || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const unsafe = element.closest('form') || element.hasAttribute('disabled') ||
@@ -226,6 +292,7 @@ EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
     if (unsafe) { skipped += 1; continue; }
     const before = window.location.href;
     element.click();
+    await new Promise(resolve => setTimeout(resolve, 50));
     const after = window.location.href;
     if (after !== before) {
       transitions.push({
@@ -236,7 +303,7 @@ EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
     }
     activated += 1;
   }
-  return {activated, skipped, transitions};
+  return {activated, skipped, inspected, transitions};
 }
 """
 
@@ -270,6 +337,7 @@ async def expand_safe_navigation(page, maximum: int) -> dict[str, object]:
     return {
         "activated": int(result.get("activated", 0)),
         "skipped": int(result.get("skipped", 0)),
+        "inspected": int(result.get("inspected", 0)),
         "routes": [
             DiscoveredRoute(
                 url=item["url"],
@@ -283,8 +351,8 @@ async def expand_safe_navigation(page, maximum: int) -> dict[str, object]:
     }
 
 
-async def discover_page_routes(page) -> list[DiscoveredRoute]:
-    raw = await page.evaluate(DISCOVER_ROUTES_SCRIPT)
+async def discover_page_routes(page, maximum_scrolls: int = 3) -> list[DiscoveredRoute]:
+    raw = await page.evaluate(DISCOVER_ROUTES_SCRIPT, max(0, min(maximum_scrolls, 20)))
     document_url = page.url
     routes: list[DiscoveredRoute] = []
     for item in raw:
@@ -295,7 +363,9 @@ async def discover_page_routes(page) -> list[DiscoveredRoute]:
             label=str(item.get("label") or "")[:160],
             source=str(item.get("source") or "semantic")[:64],
             navigation_mode=(
-                HASH_ROUTE_TRANSITION
+                DOWNLOAD_OBSERVED
+                if item.get("source") == "download"
+                else HASH_ROUTE_TRANSITION
                 if item.get("observerMode") == "hash"
                 else navigation_mode_for_route(
                     item["url"],
@@ -313,7 +383,7 @@ async def perform_route_navigation(page, url: str, mode: str, timeout_ms: int):
     Playwright correctly returns no Response for same-document transitions; callers use
     the returned boolean as the navigation signal instead of fabricating an HTTP result.
     """
-    if mode == DOCUMENT_NAVIGATION:
+    if mode in DOCUMENT_NAVIGATIONS:
         response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         if response is None:
             raise RuntimeError("Document navigation completed without an HTTP response")

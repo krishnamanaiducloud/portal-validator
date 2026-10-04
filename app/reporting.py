@@ -8,10 +8,15 @@ from app.navigation import classify_navigation_error
 
 
 PASS_OUTCOMES = frozenset({"PASS", "PASS_WITH_WARNINGS"})
-AUTH_OUTCOMES = frozenset({"AUTH_REQUIRED", "AUTH_TIMEOUT", "MFA_REQUIRED", "SESSION_EXPIRED"})
+AUTH_OUTCOMES = frozenset({
+    "ACCESS_RESTRICTED", "AUTH_FAILED", "AUTH_REQUIRED", "AUTH_TIMEOUT",
+    "MFA_REQUIRED", "SESSION_EXPIRED",
+})
+LIMITED_OUTCOMES = frozenset({
+    "CHALLENGE_REQUIRED", "DISCOVERED_BUT_NOT_SAFELY_ACTIVATABLE",
+    "DISCOVERY_LIMITATION", "DOWNLOAD_OBSERVED",
+})
 FAILURE_OUTCOMES = frozenset({
-    "AUTH_FAILED",
-    "ACCESS_RESTRICTED",
     "TLS_ERROR",
     "DNS_ERROR",
     "NETWORK_ERROR",
@@ -79,6 +84,7 @@ def build_findings(
     error: str | None,
     missing_security_headers: list[str],
     console_errors: list[str],
+    page_errors: list[str] | None,
     failed_resources: list[dict[str, Any]],
     additional_findings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -92,6 +98,8 @@ def build_findings(
         ))
     for message in console_errors:
         items.append(finding("CONSOLE_ERROR", "WARNING", message))
+    for message in page_errors or []:
+        items.append(finding("PAGE_SCRIPT_ERROR", "WARNING", message))
     for resource_failure in failed_resources:
         resource = resource_failure.get("url")
         if resource_failure.get("blocked_by_validator"):
@@ -179,10 +187,12 @@ def classify_page_result(
     authentication_classification: str | None = None,
     render_classification: str | None = None,
     additional_findings: list[dict[str, Any]] | None = None,
+    page_errors: list[str] | None = None,
     route_transition_succeeded: bool = False,
     navigation_mode: str = "DOCUMENT_NAVIGATION",
     inherited_strict_tls: bool = False,
     security_headers_inherited: bool = False,
+    include_security_header_findings: bool = True,
 ) -> dict[str, Any]:
     loaded = error is None and (status is not None or route_transition_succeeded)
     base_classification = authentication_classification
@@ -202,15 +212,22 @@ def classify_page_result(
         classification=base_classification,
         status=status,
         error=error,
-        missing_security_headers=missing_security_headers,
+        missing_security_headers=(
+            missing_security_headers if include_security_header_findings else []
+        ),
         console_errors=console_errors,
+        page_errors=page_errors,
         failed_resources=failed_resources,
         additional_findings=additional_findings,
     )
     if base_classification == "PASS" and render_classification:
         base_classification = render_classification
     classification = determine_page_outcome(base_classification, structured_findings)
-    page_load_status = "LOADED" if loaded else "FAILED_TO_LOAD"
+    page_load_status = (
+        "LOADED" if loaded else
+        "NOT_TESTED" if classification in LIMITED_OUTCOMES else
+        "FAILED_TO_LOAD"
+    )
 
     if classification == "TLS_ERROR":
         tls_status = "UNTRUSTED"
@@ -245,7 +262,7 @@ def classify_page_result(
     else:
         security_headers_status = "PASS"
 
-    if not loaded or classification in AUTH_OUTCOMES:
+    if not loaded or classification in AUTH_OUTCOMES or classification in LIMITED_OUTCOMES:
         validation_status = "NOT_TESTED"
     elif classification in FAILURE_OUTCOMES:
         validation_status = "FAIL"
@@ -258,6 +275,36 @@ def classify_page_result(
         "VALIDATION_FINDINGS" if classification == "PASS_WITH_WARNINGS" else (
             None if classification == "PASS" else classification
         )
+    )
+    finding_types = {item["type"] for item in structured_findings}
+    api_warning_types = {
+        "API_AUTHENTICATION_FAILURE", "API_AUTHORIZATION_FAILURE", "API_BAD_REQUEST",
+        "API_CLIENT_ERROR", "API_CONFLICT", "API_CORS_FAILURE", "API_DNS_FAILURE",
+        "API_NETWORK_FAILURE", "API_NOT_FOUND", "API_RATE_LIMITED", "API_REQUEST_FAILED",
+        "API_TIMEOUT", "API_TLS_FAILURE",
+    }
+    api_status = (
+        "FAIL" if "API_SERVER_ERROR" in finding_types else
+        "WARNING" if finding_types & api_warning_types else
+        "PASS" if loaded else "NOT_TESTED"
+    )
+    resource_status = (
+        "WARNING" if finding_types & {"RESOURCE_FAILED", "RESOURCE_SKIPPED"} else
+        "PASS" if loaded else "NOT_TESTED"
+    )
+    console_status = (
+        "WARNING" if finding_types & {"CONSOLE_ERROR", "PAGE_SCRIPT_ERROR"} else
+        "PASS" if loaded else "NOT_TESTED"
+    )
+    render_status = (
+        "FAIL" if classification == "PAGE_RENDER_ERROR" else
+        "NOT_TESTED" if not loaded or classification in LIMITED_OUTCOMES else
+        "WARNING" if "RENDER_STILL_BUSY" in finding_types else "PASS"
+    )
+    authentication_status = (
+        classification if classification in AUTH_OUTCOMES else
+        "CHALLENGE_REQUIRED" if classification == "CHALLENGE_REQUIRED" else
+        "PASS" if loaded else "NOT_TESTED"
     )
     return {
         "classification": classification,
@@ -287,6 +334,22 @@ def classify_page_result(
             "NOT_TESTED"
         ),
         "navigation_type": navigation_mode,
+        "navigation_status": (
+            "SUCCESS" if loaded else
+            "NOT_TESTED" if classification in LIMITED_OUTCOMES else
+            "FAILED"
+        ),
+        "render_status": render_status,
+        "authentication_status": authentication_status,
+        "api_status": api_status,
+        "resource_status": resource_status,
+        "console_status": console_status,
+        "performance_status": "WARNING" if "SLOW_PAGE" in finding_types else (
+            "PASS" if loaded else "NOT_TESTED"
+        ),
+        "read_only_status": (
+            "PROTECTED" if "READ_ONLY_MUTATION_BLOCKED" in finding_types else "ENFORCED"
+        ),
         "finding_details": structured_findings,
         "findings": len(structured_findings),
         "finding_occurrences": occurrence_count,
@@ -301,6 +364,11 @@ def aggregate_report(
     results: list[dict[str, Any]],
     *,
     routes_discovered: int | None = None,
+    routes_eligible: int | None = None,
+    routes_queued: int | None = None,
+    routes_remaining: int = 0,
+    routes_skipped: int = 0,
+    termination_reason: str = "DISCOVERY_EXHAUSTED",
 ) -> dict[str, Any]:
     load_counts = Counter(result["page_load_status"] for result in results)
     classification_counts = Counter(result["classification"] for result in results)
@@ -316,6 +384,8 @@ def aggregate_report(
         "loaded_pages": load_counts["LOADED"],
         "loaded": load_counts["LOADED"],
         "failed_to_load": load_counts["FAILED_TO_LOAD"],
+        "not_tested_pages": load_counts["NOT_TESTED"],
+        "skipped_pages": load_counts["NOT_TESTED"],
         "passed_pages": passed_pages,
         "passed": passed_pages,
         "pass": passed_pages,
@@ -341,15 +411,193 @@ def aggregate_report(
         "total_load_time": sum(result.get("load_ms") or 0 for result in results),
         "duration_ms": sum(result.get("load_ms") or 0 for result in results),
         "routes_discovered": routes_discovered if routes_discovered is not None else len(results),
+        "routes_eligible": routes_eligible if routes_eligible is not None else (
+            routes_discovered if routes_discovered is not None else len(results)
+        ),
+        "routes_queued": routes_queued if routes_queued is not None else len(results),
         "routes_validated": len(results),
-        "healthy_routes": classification_counts["PASS"],
+        "routes_remaining": routes_remaining,
+        "routes_skipped": routes_skipped,
+        "healthy_routes": passed_pages,
         "routes_with_warnings": classification_counts["PASS_WITH_WARNINGS"],
         "auth_issues": sum(classification_counts[item] for item in AUTH_OUTCOMES),
         "api_failures": sum(int(result.get("api_failures", 0)) for result in results),
         "resource_failures": sum(int(result.get("resource_failure_count", 0)) for result in results),
+        "console_failures": sum(
+            len(result.get("console_errors", [])) + len(result.get("page_errors", []))
+            for result in results
+        ),
         "slow_pages": sum(bool(result.get("slow")) for result in results),
         "unsafe_actions_skipped": sum(int(result.get("unsafe_actions_skipped", 0)) for result in results),
         "read_only_blocks": sum(int(result.get("read_only_blocks", 0)) for result in results),
+        "external_routes_skipped": sum(int(result.get("external_links_found", 0)) for result in results),
+        "discovery_limitations": sum(int(result.get("discovery_limitations", 0)) for result in results),
         "classifications": dict(classification_counts),
+        "termination_reason": termination_reason,
+        "scan_completeness": (
+            "COMPLETE" if termination_reason == "DISCOVERY_EXHAUSTED" and routes_remaining == 0
+            else "FAILED" if not results
+            else "PARTIAL"
+        ),
+        "discovery_status": (
+            "COMPLETE" if termination_reason == "DISCOVERY_EXHAUSTED" else "PARTIAL"
+        ),
+        "validation_status": (
+            "COMPLETE" if routes_remaining == 0 else "PARTIAL"
+        ),
     }
     return summary
+
+
+def classify_api_status(status: int | None, error: str | None) -> str:
+    if error:
+        upper = error.upper()
+        if "CERT" in upper or "TLS" in upper:
+            return "API_TLS_FAILURE"
+        if "NAME_NOT_RESOLVED" in upper:
+            return "API_DNS_FAILURE"
+        if "TIMEOUT" in upper:
+            return "API_TIMEOUT"
+        return "API_NETWORK_FAILURE"
+    if status is None:
+        return "UNKNOWN"
+    if 200 <= status < 300:
+        return "SUCCESS"
+    if 300 <= status < 400:
+        return "REDIRECT"
+    return {
+        400: "API_BAD_REQUEST",
+        401: "API_AUTHENTICATION_FAILURE",
+        403: "API_AUTHORIZATION_FAILURE",
+        404: "API_NOT_FOUND",
+        408: "API_TIMEOUT",
+        409: "API_CONFLICT",
+        429: "API_RATE_LIMITED",
+    }.get(status, "API_SERVER_FAILURE" if status >= 500 else "API_CLIENT_ERROR")
+
+
+def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate naturally observed API traffic without request headers or bodies."""
+    inventory: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for result in results:
+        result_route_id = result.get("normalized_route_identity") or result.get("url")
+        for event in result.get("api_requests", []):
+            parsed = urlparse(str(event.get("url") or ""))
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                continue
+            method = str(event.get("method") or "GET").upper()
+            protocol = str(event.get("protocol") or "REST")
+            key = (method, parsed.hostname.lower(), parsed.path or "/", protocol)
+            item = inventory.setdefault(key, {
+                "method": method,
+                "host": parsed.hostname.lower(),
+                "endpoint": parsed.path or "/",
+                "category": protocol,
+                "calls": 0,
+                "status_2xx": 0,
+                "status_3xx": 0,
+                "status_4xx": 0,
+                "status_5xx": 0,
+                "network_failures": 0,
+                "durations_ms": [],
+                "routes": set(),
+                "failure_classifications": Counter(),
+            })
+            item["calls"] += 1
+            route_id = event.get("initiating_route") or result_route_id
+            if route_id:
+                item["routes"].add(route_id)
+            status = event.get("status")
+            if isinstance(status, int) and 200 <= status < 600:
+                item[f"status_{status // 100}xx"] += 1
+            if event.get("error"):
+                item["network_failures"] += 1
+            classification = classify_api_status(status, event.get("error"))
+            if classification not in {"SUCCESS", "REDIRECT", "UNKNOWN"}:
+                item["failure_classifications"][classification] += 1
+            duration = event.get("duration_ms")
+            if isinstance(duration, (int, float)) and duration >= 0:
+                item["durations_ms"].append(round(duration))
+
+    output: list[dict[str, Any]] = []
+    for item in inventory.values():
+        durations = item.pop("durations_ms")
+        routes = sorted(item.pop("routes"))
+        failures = dict(item.pop("failure_classifications"))
+        item.update({
+            "routes_using_endpoint": routes,
+            "route_count": len(routes),
+            "average_duration_ms": (
+                round(sum(durations) / len(durations)) if durations else None
+            ),
+            "worst_duration_ms": max(durations) if durations else None,
+            "failure_classifications": failures,
+            "health": (
+                "FAILED" if item["status_5xx"] or item["network_failures"] else
+                "DEGRADED" if item["status_4xx"] else
+                "HEALTHY"
+            ),
+        })
+        output.append(item)
+    return sorted(output, key=lambda item: (item["host"], item["endpoint"], item["method"]))
+
+
+def aggregate_security_recommendations(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate document-level recommendations across inherited SPA routes."""
+    recommendations: dict[str, set[str]] = {}
+    for result in results:
+        if result.get("security_headers_basis") != "DOCUMENT_RESPONSE":
+            continue
+        route = result.get("normalized_route_identity") or result.get("url")
+        for header in result.get("missing_security_headers", []):
+            recommendations.setdefault(str(header), set()).add(str(route))
+    return [
+        {
+            "type": "MISSING_SECURITY_HEADER",
+            "header": header,
+            "severity": "RECOMMENDATION",
+            "impact": "NON_BLOCKING",
+            "affected_documents": sorted(routes),
+            "affected_document_count": len(routes),
+        }
+        for header, routes in sorted(recommendations.items())
+    ]
+
+
+def aggregate_resource_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate browser-loaded resources without request headers, bodies, or cookies."""
+    inventory: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for result in results:
+        result_route_id = result.get("normalized_route_identity") or result.get("url")
+        for event in result.get("resources", []):
+            parsed = urlparse(str(event.get("url") or ""))
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                continue
+            resource_type = str(event.get("resource_type") or "other").upper()
+            key = (parsed.hostname.lower(), parsed.path or "/", resource_type)
+            item = inventory.setdefault(key, {
+                "host": parsed.hostname.lower(),
+                "path": parsed.path or "/",
+                "type": resource_type,
+                "calls": 0,
+                "failures": 0,
+                "routes": set(),
+            })
+            item["calls"] += 1
+            if event.get("error") or (
+                isinstance(event.get("status"), int) and event["status"] >= 400
+            ):
+                item["failures"] += 1
+            route_id = event.get("initiating_route") or result_route_id
+            if route_id:
+                item["routes"].add(route_id)
+    output: list[dict[str, Any]] = []
+    for item in inventory.values():
+        routes = sorted(item.pop("routes"))
+        item.update({
+            "routes_using_resource": routes,
+            "route_count": len(routes),
+            "health": "DEGRADED" if item["failures"] else "HEALTHY",
+        })
+        output.append(item)
+    return sorted(output, key=lambda item: (item["host"], item["path"], item["type"]))

@@ -1,0 +1,53 @@
+.scope-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.report-tools { grid-template-columns: minmax(240px, 1fr) 220px 220px; }
+.route-table { min-width: 1540px; }
+.api-table { min-width: 1280px; }
+.metric {
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color .15s ease, background .15s ease, transform .15s ease;
+}
+.metric:hover { border-color: #587568; background: #101e19; transform: translateY(-1px); }
+.metric:focus-visible { outline: 2px solid var(--lime); outline-offset: 2px; }
+.metric.selected { border-color: var(--lime); background: #b7f34a12; }
+.coverage {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: -8px 0 16px;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #09130f;
+  color: var(--muted);
+  font-size: 11px;
+}
+.coverage strong { color: var(--lime); letter-spacing: .08em; }
+.dimension-state {
+  display: inline-flex;
+  border: 1px solid #40564d;
+  border-radius: 999px;
+  padding: 3px 6px;
+  color: #b8c8c1;
+  font: 700 9px ui-monospace, monospace;
+  white-space: nowrap;
+}
+.dimension-state.pass,.dimension-state.success,.dimension-state.healthy,.dimension-state.trusted,.dimension-state.enforced { border-color: #527329; color: var(--lime); }
+.dimension-state.warning,.dimension-state.degraded,.dimension-state.protected { border-color: #705c2e; color: var(--warning); }
+.dimension-state.fail,.dimension-state.failed,.dimension-state.untrusted { border-color: #7b423e; color: var(--danger); }
+.inventory,.evidence-panel { margin-top: 20px; border-top: 1px solid var(--line); padding-top: 18px; }
+.inventory h3,.evidence-panel h3 { margin: 0; font-size: 15px; }
+.inventory>p { color: var(--muted); font-size: 11px; }
+.evidence-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.evidence-panel pre { white-space: pre-wrap; overflow-wrap: anywhere; color: #9db0a7; font: 500 10px/1.5 ui-monospace, monospace; }
+.api-endpoint { border: 0; background: transparent; color: var(--blue); cursor: pointer; font: 600 10px ui-monospace, monospace; text-align: left; }
+.api-endpoint:hover,.api-endpoint:focus-visible { color: var(--lime); text-decoration: underline; }
+@media (max-width: 1050px) {
+  .scope-grid,.report-tools { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 760px) {
+  .scope-grid,.report-tools { grid-template-columns: 1fr; }
+  .coverage { align-items: flex-start; flex-direction: column; }
+}

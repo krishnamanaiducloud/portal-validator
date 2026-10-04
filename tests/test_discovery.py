@@ -7,6 +7,7 @@ from playwright.async_api import async_playwright
 
 from app.discovery import (
     DOCUMENT_NAVIGATION,
+    SEMANTIC_LINK_NAVIGATION,
     HASH_ROUTE_TRANSITION,
     SAFE_CLICK_NAVIGATION,
     SPA_ROUTE_TRANSITION,
@@ -110,7 +111,7 @@ def test_navigation_modes_distinguish_documents_spa_hash_and_safe_clicks():
     document = "https://portal.example.com/app"
     assert navigation_mode_for_route(
         "https://portal.example.com/help", "a", document,
-    ) == DOCUMENT_NAVIGATION
+    ) == SEMANTIC_LINK_NAVIGATION
     assert navigation_mode_for_route(
         "https://portal.example.com/reports", "browser-history", document,
     ) == SPA_ROUTE_TRANSITION

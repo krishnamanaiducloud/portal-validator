@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,8 @@ async def test_runtime_session_is_seeded_and_refreshed_atomically(tmp_path):
     mounted.write_text(json.dumps({"cookies": [], "origins": []}), encoding="utf-8")
     store = RuntimeSessionStore(tmp_path / "runtime")
     runtime = store.seed("approved", mounted)
-    assert runtime.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert runtime.stat().st_mode & 0o777 == 0o600
     updated = await store.persist(
         "approved",
         FakeContext(),

@@ -51,7 +51,7 @@ def test_home_health_and_security_headers():
     assert "Know your portal" in response.text
     assert response.headers["x-frame-options"] == "DENY"
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
-    assert client.get("/healthz").json() == {"status": "ok", "version": "1.3.1"}
+    assert client.get("/healthz").json() == {"status": "ok", "version": "1.4.0"}
 
 
 @pytest.mark.parametrize(("candidate", "root", "subdomains", "expected"), [

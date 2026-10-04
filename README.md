@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.3.1 is an authenticated, read-only browser health validator for public,
+Portal Validator 1.4.0 is an authenticated, read-only browser health validator for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -28,8 +28,10 @@ Browser navigation and crawling intentionally have different boundaries:
 - Route identities use a configurable query policy and always remove tracking
   and authentication parameters to prevent ID/pagination loops and report leaks.
 - Optional resource hosts allow only subresources, not recursive crawling.
-- Scan-supplied Basic, bearer, and custom-header credentials are sent only to
-  approved credential hosts. Browser cookie domain rules remain in effect.
+- Scan-supplied Basic, bearer, and custom-header credentials default to the
+  exact target host and are sent to another portal/API host only when that host
+  is explicitly credential-approved. Credential, crawl, and resource scopes
+  are independent. Browser cookie domain rules remain in effect.
 - Normal validation permits only GET, HEAD, and OPTIONS. Unexpected mutating
   requests are blocked and reported as `READ_ONLY_MUTATION_BLOCKED`. Main-frame
   SSO form POSTs are handled separately: they are allowed only inside a detected
@@ -42,6 +44,11 @@ cookies, and mounted Playwright `storage_state`. Reports use generic behavioral
 classifications such as `PASS`, `AUTH_REQUIRED`, `AUTH_FAILED`, `AUTH_TIMEOUT`,
 `MFA_REQUIRED`, `SESSION_EXPIRED`, `ACCESS_RESTRICTED`, `TLS_ERROR`,
 `DNS_ERROR`, `NETWORK_ERROR`, `TIMEOUT`, `HTTP_ERROR`, and `NAVIGATION_ERROR`.
+Bearer input accepts either a raw token or one leading `Bearer` scheme and is
+normalized to exactly one `Authorization: Bearer ...` header. The transient
+secret field is cleared after submission and secret values are never returned.
+In SSO mode, the validator owns no Authorization header and does not replace an
+application-generated bearer credential.
 
 Treat `storage_state` files as secrets: generate them through an approved
 authentication workflow, store them in an OpenShift Secret, mount them
@@ -131,10 +138,10 @@ compatible with an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.3.1 .
+docker build -t mohankrishna999/portal-validator:1.4.0 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.3.1 \
-  -t mohankrishna999/portal-validator:1.3.1-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.4.0 \
+  -t mohankrishna999/portal-validator:1.4.0-debug .
 ```
 
 The debug image adds `debugpy`, hot reload, and port 5678. It inherits the same
@@ -148,7 +155,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.3.1
+  mohankrishna999/portal-validator:1.4.0
 ```
 
 ## OpenShift
@@ -214,11 +221,18 @@ document into a load failure. `tls_status=TRUSTED` means Chromium completed cert
 validation; it does not claim independent inspection of the origin certificate
 when an enterprise TLS proxy is present.
 
-The portal-health summary also reports discovered versus validated routes,
-healthy/warning/failing routes, authentication issues, observed API and
-resource failures, slow routes, skipped unsafe controls, and read-only request
-blocks. Browser APIs are observed from natural application activity; the
-validator never calls discovered APIs directly.
+The portal-health summary also reports discovered, eligible, queued, validated,
+skipped, and remaining routes with `COMPLETE`, `PARTIAL`, or `FAILED` coverage
+and an explicit termination reason. The default maximum is 50 routes and the
+request-scoped `max_pages` value is the only route-count limit. Summary cards
+drill into route, API, resource, security, and coverage evidence.
+
+Observed API calls are aggregated by sanitized method/host/path with status
+distribution, timing, failure classification, and affected routes. Resources,
+APIs, and routes remain separate inventories. Browser APIs are observed only
+from natural application activity; the validator never probes or replays a
+discovered endpoint. Document-level security recommendations are evaluated on
+actual document responses and are not repeated for each inherited SPA route.
 
 Logs are structured JSON with a per-scan ID. URLs, query secrets, credentials,
 tokens, cookies, storage state, and certificate/private-key material are
