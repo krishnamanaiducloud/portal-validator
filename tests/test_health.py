@@ -351,7 +351,7 @@ def test_validator_blocks_are_auditable_but_not_target_api_failures():
     assert inventory[0]["validator_blocks"] == 1
     assert inventory[0]["blocked_count"] == 1
     assert inventory[0]["network_failures"] == 0
-    assert inventory[0]["health"] == "HEALTHY"
+    assert inventory[0]["health"] == "NOT_EXECUTED"
     assert inventory[0]["observation_outcome"] == "BLOCKED_BY_VALIDATOR"
     assert inventory[0]["allowed_calls"] == 0
     assert inventory[0]["blocked_calls"] == 1

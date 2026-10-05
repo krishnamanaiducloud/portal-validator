@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import re
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,24 @@ POLICY_CLASSIFICATIONS = frozenset({
     "SESSION_REFRESH",
     "ACCESS_GATE",
 })
+
+
+def _policy_hostname(value: Any) -> str:
+    host = normalized_host(str(value or ""))
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError("Policy rule host must be an exact hostname") from exc
+    if len(host) > 253 or not all(
+        re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+        for label in host.split(".")
+    ):
+        raise ValueError("Policy rule host must be an exact hostname without URL, credentials, port or wildcards")
+    return host
 
 
 def classify_traffic(
@@ -188,8 +208,25 @@ class ApprovedRequestRule:
             # Inventory normalization must never broaden an administrator-approved
             # execution path into a wildcard.
             return candidate == self.path
+        if "//" in candidate:
+            return False
         expected_segments = self.path.strip("/").split("/")
         candidate_segments = candidate.strip("/").split("/")
+        # A raw encoded slash can look like one segment here but become a
+        # different operation after a proxy/router decodes it. Likewise reject
+        # another escape layer rather than guessing how many times an upstream
+        # component decodes paths. Ordinary bounded IDs remain supported.
+        for segment in candidate_segments:
+            try:
+                decoded = unquote(segment, errors="strict")
+            except UnicodeDecodeError:
+                return False
+            if (
+                decoded in {".", ".."}
+                or any(marker in decoded for marker in ("/", "\\", "%", "?", "#"))
+                or any(ord(character) <= 32 or ord(character) == 127 for character in decoded)
+            ):
+                return False
         return len(expected_segments) == len(candidate_segments) and all(
             expected == "{segment}" or expected == actual
             for expected, actual in zip(expected_segments, candidate_segments)
@@ -223,9 +260,10 @@ def load_read_only_policy(
     raw: str | None = None,
     path: str | Path | None = None,
 ) -> ReadOnlyPolicy:
-    """Load administrator-owned read-only exceptions from JSON, never scan input."""
-    configured_raw = raw if raw is not None else os.getenv("PORTAL_VALIDATOR_READ_ONLY_POLICY")
-    configured_path = path if path is not None else os.getenv("PORTAL_VALIDATOR_READ_ONLY_POLICY_FILE")
+    """Load explicit read-only POST exceptions from administrator configuration."""
+    explicit_source = raw is not None or path is not None
+    configured_raw = raw if explicit_source else os.getenv("PORTAL_VALIDATOR_READ_ONLY_POLICY")
+    configured_path = path if explicit_source else os.getenv("PORTAL_VALIDATOR_READ_ONLY_POLICY_FILE")
     if configured_raw and configured_path:
         raise ValueError("Configure one read-only policy source, not both")
     if configured_path:
@@ -253,7 +291,7 @@ def load_read_only_policy(
         if not isinstance(item, dict):
             raise ValueError("Each safe application request rule must be an object")
         method = str(item.get("method") or "").strip().upper()
-        host = normalized_host(str(item.get("host") or ""))
+        host = _policy_hostname(item.get("host"))
         has_exact_path = "path" in item
         has_path_pattern = "path_pattern" in item
         if has_exact_path == has_path_pattern:
@@ -265,12 +303,19 @@ def load_read_only_policy(
             item.get("classification")
             or ("APPROVED_READ_POST" if method == "POST" else "APPROVED_READ_REQUEST")
         ).strip().upper()
-        if not VALID_METHOD_RE.fullmatch(method) or method in SAFE_HTTP_METHODS:
-            raise ValueError("Policy methods must be explicit mutation-capable HTTP methods")
+        if method != "POST":
+            raise ValueError("Read-only policy exceptions must use POST; other mutation methods remain blocked")
         if not host or "/" in host or "://" in host:
             raise ValueError("Policy rule host must be an exact hostname")
         if not raw_path.startswith("/") or "?" in raw_path or "#" in raw_path:
             raise ValueError("Policy rule path must be a query-free absolute path")
+        if (
+            len(raw_path) > 2048 or raw_path.startswith("//")
+            or "\\" in raw_path or any(ord(character) <= 32 for character in raw_path)
+            or any(segment in {".", ".."} for segment in unquote(raw_path).split("/"))
+            or re.search(r"%(?:2f|5c|00)", raw_path, re.IGNORECASE)
+        ):
+            raise ValueError("Policy rule path must be normalized and must not contain ambiguous separators")
         if has_exact_path and any(marker in raw_path for marker in ("*", "{", "}")):
             raise ValueError("Exact policy paths cannot contain wildcard syntax")
         if has_path_pattern:
@@ -317,7 +362,12 @@ class PassiveNetworkObserver:
 
     def __init__(self, events: list[dict[str, Any]]):
         self.events = events
-        self._events_by_request: dict[int, dict[str, Any]] = {}
+        # CPython object ids can be reused after Playwright disposes a completed
+        # request. Retaining id(request) forever aliases later POSTs to old GETs.
+        # Weak object keys preserve identity without keeping raw Request objects
+        # (which contain headers/bodies) alive for the duration of a scan.
+        self._events_by_request: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+        self._sequence = 0
 
     def observe_request(
         self,
@@ -327,12 +377,14 @@ class PassiveNetworkObserver:
         importance: str,
         initiating_route: str | None,
         main_document: bool,
+        route_activation_id: str | None = None,
     ) -> dict[str, Any]:
-        key = id(request)
+        key = self._request_key(request)
         existing = self._events_by_request.get(key)
         if existing is not None:
             return existing
         method = str(request.method).upper()
+        self._sequence += 1
         safe_url, host, endpoint = safe_api_identity(str(request.url))
         try:
             frame_identity = (
@@ -341,6 +393,7 @@ class PassiveNetworkObserver:
         except Exception:
             frame_identity = "UNKNOWN_FRAME"
         event: dict[str, Any] = {
+            "request_id": f"request-{self._sequence}",
             "url": safe_url,
             "host": host,
             "endpoint": endpoint,
@@ -356,6 +409,21 @@ class PassiveNetworkObserver:
             "observed_at": _observed_at(),
             "duration_ms": None,
             "initiating_route": initiating_route,
+            "route_activation_id": route_activation_id,
+            "observer_seen": True,
+            "policy_evaluated": False,
+            "policy_decision": "PENDING",
+            "policy_reason": None,
+            "route_handler_seen": False,
+            "request_reached_network": None,
+            "request_dispatched": False,
+            "response_seen": False,
+            "response_status": None,
+            "response_completed": False,
+            "request_failed": False,
+            "failure_category": None,
+            "aggregation_seen": False,
+            "serialized_to_report": False,
             "main_document": main_document,
             "frame_identity": frame_identity,
             "request_classification": "SAFE_METHOD" if method in SAFE_HTTP_METHODS else "UNKNOWN",
@@ -382,12 +450,13 @@ class PassiveNetworkObserver:
         phase: str | None = None,
         importance: str | None = None,
     ) -> dict[str, Any] | None:
-        event = self._events_by_request.get(id(request))
+        event = self._events_by_request.get(self._request_key(request))
         if event is None:
             return None
         event["request_classification"] = classification
         event["allowed_by_policy"] = True
         event["lifecycle"] = "ALLOWED"
+        event.update(policy_evaluated=True, policy_decision="ALLOW", policy_reason=classification)
         if phase is not None:
             event["phase"] = phase
         if importance is not None:
@@ -407,7 +476,7 @@ class PassiveNetworkObserver:
         *,
         classification: str = "BLOCKED_MUTATION",
     ) -> dict[str, Any] | None:
-        event = self._events_by_request.get(id(request))
+        event = self._events_by_request.get(self._request_key(request))
         if event is None:
             return None
         event.update({
@@ -418,12 +487,17 @@ class PassiveNetworkObserver:
             "target_reached": False,
             "lifecycle": "BLOCKED",
             "duration_ms": self._duration(event),
+            "policy_evaluated": True,
+            "policy_decision": "BLOCK",
+            "policy_reason": reason,
+            "request_reached_network": False,
+            "failure_category": reason,
         })
         event["traffic_category"] = "VALIDATOR_BLOCKED"
         return event
 
     def record_response(self, request: Any, status: int) -> dict[str, Any] | None:
-        event = self._events_by_request.get(id(request))
+        event = self._events_by_request.get(self._request_key(request))
         if event is None or event.get("lifecycle") == "BLOCKED":
             return event
         if event.get("lifecycle") == "RESPONSE":
@@ -435,22 +509,56 @@ class PassiveNetworkObserver:
             "target_reached": True,
             "lifecycle": "RESPONSE",
             "duration_ms": self._duration(event),
+            "request_reached_network": True,
+            "response_seen": True,
+            "response_status": int(status),
         })
         return event
 
     def record_failure(self, request: Any, error: str) -> dict[str, Any] | None:
-        event = self._events_by_request.get(id(request))
-        if event is None or event.get("lifecycle") in {"BLOCKED", "RESPONSE", "FAILED"}:
+        event = self._events_by_request.get(self._request_key(request))
+        if event is not None and event.get("lifecycle") == "BLOCKED":
+            event["request_failed"] = True
+            return event
+        if event is None or event.get("lifecycle") == "FAILED":
             return event
         if event.get("request_classification") == "UNKNOWN":
             event["request_classification"] = "APPLICATION_REQUEST"
         event.update({
             "error": sanitize_text(str(error).splitlines()[0], limit=1000),
-            "target_reached": True,
+            "target_reached": True if event.get("response_seen") else None,
             "lifecycle": "FAILED",
             "duration_ms": self._duration(event),
+            "request_reached_network": True if event.get("response_seen") else None,
+            "request_failed": True,
+            "failure_category": "RESPONSE_BODY_FAILURE" if event.get("response_seen") else "NETWORK_FAILURE",
+            "response_completed": False,
         })
         return event
+
+    def mark_route_handler(self, request: Any) -> None:
+        event = self._events_by_request.get(self._request_key(request))
+        if event is not None:
+            event["route_handler_seen"] = True
+
+    def mark_dispatched(self, request: Any) -> None:
+        event = self._events_by_request.get(self._request_key(request))
+        if event is not None:
+            event["request_dispatched"] = True
+
+    def record_finished(self, request: Any) -> None:
+        event = self._events_by_request.get(self._request_key(request))
+        if event is None or not event.get("response_seen") or event.get("blocked_by_validator"):
+            return
+        try:
+            response_end = request.timing.get("responseEnd")
+        except Exception:
+            response_end = None
+        event["duration_ms"] = (
+            round(response_end) if isinstance(response_end, (int, float)) and response_end >= 0
+            else self._duration(event)
+        )
+        event["response_completed"] = True
 
     def finalize_pending(self) -> None:
         for event in self.events:
@@ -460,6 +568,13 @@ class PassiveNetworkObserver:
                 event["lifecycle"] = "PENDING_AT_SCAN_END"
                 event["duration_ms"] = self._duration(event)
             event.pop("_started_at", None)
+
+    @staticmethod
+    def _request_key(request: Any) -> Any:
+        # Async API wrappers can themselves be recreated for one underlying
+        # request. The implementation's identity is stable throughout its
+        # lifecycle; the weak key does not retain its sensitive raw contents.
+        return getattr(request, "_impl_obj", request)
 
     @staticmethod
     def _duration(event: dict[str, Any]) -> int | None:

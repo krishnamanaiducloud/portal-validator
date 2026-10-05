@@ -91,7 +91,15 @@ async def wait_for_render_settle(
     maximum remains authoritative so polling portals cannot hold a scan open.
     """
     if settle_ms <= 0:
-        return await capture_render_health(page)
+        snapshot = await capture_render_health(page)
+        snapshot.update({
+            "settle_reason": "SETTLE_DISABLED",
+            "settle_elapsed_ms": 0,
+            "settle_render_ready_ms": 0,
+            "settle_application_ms": 0,
+            "settle_validator_observation_ms": 0,
+        })
+        return snapshot
     maximum_ms = max(settle_ms, maximum_ms)
     started = time.perf_counter()
     deadline = started + (maximum_ms / 1000)
@@ -101,6 +109,29 @@ async def wait_for_render_settle(
     initial_activity = network_activity() if network_activity is not None else {}
     last_generation = int(initial_activity.get("generation", 0))
     network_quiet_since = started
+    application_active_until = started
+    first_render_ready: float | None = None
+
+    def finish(reason: str, now: float, pending: int, generation: int) -> dict[str, Any]:
+        elapsed_ms = max(0, round((now - started) * 1000))
+        # The trailing stability/quiet confirmation is a validator observation,
+        # not application work. Only observed render changes, visible loading,
+        # and request activity contribute to application readiness.
+        application_ms = min(elapsed_ms, max(0, round((application_active_until - started) * 1000)))
+        latest.update({
+            "settle_reason": reason,
+            "network_pending": pending,
+            "network_activity_generation": generation,
+            "settle_elapsed_ms": elapsed_ms,
+            "settle_render_ready_ms": (
+                max(0, round((first_render_ready - started) * 1000))
+                if first_render_ready is not None else None
+            ),
+            "settle_application_ms": application_ms,
+            "settle_validator_observation_ms": elapsed_ms - application_ms,
+        })
+        return latest
+
     while True:
         latest = await capture_render_health(page)
         signature = (
@@ -115,9 +146,21 @@ async def wait_for_render_settle(
         activity = network_activity() if network_activity is not None else {}
         generation = int(activity.get("generation", 0))
         pending = int(activity.get("pending", 0))
+        if first_render_ready is None and (
+            latest["ready_state"] in {"interactive", "complete"}
+            and not latest["busy_indicators"]
+            and (latest["text_length"] >= 20 or latest["visible_elements"] >= 3)
+        ):
+            first_render_ready = now
+        if pending or latest["busy_indicators"] or latest["ready_state"] == "loading":
+            application_active_until = now
         if generation != last_generation:
             last_generation = generation
             network_quiet_since = now
+            last_activity = float(activity.get("last_activity", now))
+            application_active_until = max(
+                application_active_until, min(now, max(started, last_activity))
+            )
         if signature == previous:
             stable_since = stable_since or now
             dom_stable = (now - stable_since) * 1000 >= settle_ms
@@ -127,25 +170,48 @@ async def wait_for_render_settle(
                 and (now - network_quiet_since) * 1000 >= network_quiet_ms
             )
             if dom_stable and observed_minimum and network_quiet:
-                latest.update({
-                    "settle_reason": "DOM_AND_NETWORK_QUIET",
-                    "network_pending": pending,
-                    "network_activity_generation": generation,
-                    "settle_elapsed_ms": round((now - started) * 1000),
-                })
-                return latest
+                return finish("DOM_AND_NETWORK_QUIET", now, pending, generation)
         else:
+            if previous is not None:
+                application_active_until = now
             previous = signature
             stable_since = None
         if now >= deadline:
-            latest.update({
-                "settle_reason": "BOUNDED_TIMEOUT",
-                "network_pending": pending,
-                "network_activity_generation": generation,
-                "settle_elapsed_ms": round((now - started) * 1000),
-            })
-            return latest
+            return finish("BOUNDED_TIMEOUT", now, pending, generation)
         await asyncio.sleep(min(0.1, max(0.01, deadline - now)))
+
+
+def route_performance_timing(
+    *,
+    navigation_ms: int,
+    render_health: dict[str, Any] | None,
+    total_validation_ms: int,
+    render_start_ms: int | None = None,
+) -> dict[str, int | None | str]:
+    """Split application-readiness evidence from deliberate observation waits.
+
+    For same-document routes navigation_ms measures semantic activation/URL
+    transition, not a new document handshake. application_load_ms includes that
+    activation plus observed render/network work, but excludes the final
+    stability confirmation and discovery/reporting overhead. This is a passive
+    readiness estimate, not Core Web Vitals or a user-interaction benchmark.
+    """
+    navigation_ms = max(0, int(navigation_ms))
+    total_validation_ms = max(navigation_ms, int(total_validation_ms))
+    snapshot = render_health or {}
+    render_offset = max(navigation_ms, int(render_start_ms or navigation_ms))
+    application_settle_ms = max(0, int(snapshot.get("settle_application_ms") or 0))
+    observation_ms = max(0, int(snapshot.get("settle_validator_observation_ms") or 0))
+    ready_ms = snapshot.get("settle_render_ready_ms")
+    return {
+        "navigation_ms": navigation_ms,
+        "render_ready_ms": render_offset + max(0, int(ready_ms)) if ready_ms is not None else None,
+        "application_settle_ms": application_settle_ms,
+        "validator_observation_ms": observation_ms,
+        "total_validation_ms": total_validation_ms,
+        "application_load_ms": min(total_validation_ms, render_offset + application_settle_ms),
+        "performance_basis": "OBSERVED_APPLICATION_READINESS",
+    }
 
 
 def assess_page_health(
@@ -153,6 +219,7 @@ def assess_page_health(
     *,
     load_ms: int,
     slow_page_threshold_ms: int,
+    performance_enabled: bool = True,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     findings: list[dict[str, Any]] = []
     classification: str | None = None
@@ -187,11 +254,11 @@ def assess_page_health(
             "WARNING",
             "Visible loading indicators remained after the configured render-settle period.",
         ))
-    if load_ms > slow_page_threshold_ms:
+    if performance_enabled and load_ms > slow_page_threshold_ms:
         findings.append(finding(
             "SLOW_PAGE",
             "WARNING",
-            f"Page load exceeded the configured {slow_page_threshold_ms} ms threshold.",
+            f"Observed application readiness exceeded the configured {slow_page_threshold_ms} ms threshold; deliberate validator observation waits are excluded.",
         ))
     return classification, findings
 

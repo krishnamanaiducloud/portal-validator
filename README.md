@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.8.0 is an authenticated, read-only browser health validator for public,
+Portal Validator 1.9.0 is an authenticated, read-only browser health validator for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -50,8 +50,9 @@ target while their attempted method, sanitized host/path, route, and policy
 outcome remain visible. Request/response bodies, headers, cookies, tokens, and
 storage are never captured. Route totals and unique API totals are independent.
 
-Administrators may approve an exact method + hostname + query-free path for a
-logically read-only application request, session refresh, or access-gate action.
+Authorized application owners may approve an exact POST + hostname + query-free
+path for a logically read-only application request, session refresh, or
+access-gate action. PUT, PATCH, and DELETE cannot be approved.
 When an identifier varies, `path_pattern` may replace one or more complete path
 segments with `{segment}`. Patterns must contain at least three segments and two
 literal segments; globbing, `**`, prefix rules, and broad method rules are rejected.
@@ -87,6 +88,30 @@ its own safe-request rule. Authentication POSTs retain their separate narrow
 main-frame authentication-chain exception. Browser-native session refresh runs
 inside the same context; lost authenticated sessions terminate remaining route
 validation as `SESSION_EXPIRED` instead of creating misleading failures.
+
+For one scan, open **Discovery & health → Advanced → Approved read-only API
+operations** and add a POST hostname plus exact path (or a bounded `{segment}`
+pattern). Only add operations confirmed read-only by their application owner.
+These approvals are not stored in browser preferences and do not authorize
+unrelated requests, private-network access, or new crawl origins. The API field
+is `approved_read_post_operations`, for example:
+
+```json
+{
+  "target": "https://portal.example.net",
+  "approved_read_post_operations": [
+    {"method": "POST", "host": "api.example.net", "path": "/v1/read-query"}
+  ]
+}
+```
+
+The portal must naturally generate the call; the validator never creates or
+replays its body. Blocked calls remain in the inventory with `NOT_EXECUTED`, no
+HTTP response, and a read-only block count. `network_observation` reconciles the
+scan-wide observed methods and request count with the serialized API inventory,
+including calls made during discovery or outside a route snapshot. Request
+correlation follows the live underlying Playwright request rather than a reused
+Python object address.
 
 Authentication modes are anonymous, HTTP Basic, bearer/token, custom headers,
 cookies, and mounted Playwright `storage_state`. Reports use generic behavioral
@@ -178,23 +203,27 @@ Relevant environment variables:
 
 ## Images
 
-The production image uses the pinned Chainguard Python base and Playwright
-1.63.0 with its matching Chromium revision under `/ms-playwright`. A build-time
-assertion fails the build if the expected browser is missing. The runtime keeps
-`certutil`, removes build tooling, and runs as UID/GID 10001 while remaining
-compatible with an arbitrary OpenShift UID.
+The multi-stage production image uses a digest-pinned Chainguard Python builder
+and a digest-pinned Wolfi runtime. Only the application virtualenv, matching
+Playwright 1.63.0 Chromium under `/ms-playwright`, and required runtime libraries
+are shipped. Compiler/download tools, a second system browser, and package caches
+stay outside the final image. Browser permissions are set before copying to avoid
+duplicating the browser layer. A build-time check verifies the expected executable
+and launches Chromium in the final runtime. The runtime retains `certutil` and
+runs as UID/GID 10001 while supporting an arbitrary OpenShift UID.
 
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.8.0 .
+docker build -t mohankrishna999/portal-validator:1.9.0 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.8.0 \
-  -t mohankrishna999/portal-validator:1.8.0-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.9.0 \
+  -t mohankrishna999/portal-validator:1.9.0-debug .
 ```
 
-The debug image adds `debugpy`, hot reload, and port 5678. It inherits the same
-browser and trust initialization as production.
+The debug image incrementally adds `debugpy`, test tools, hot reload, and port
+5678 to the production virtualenv, rather than copying a second virtualenv.
+It inherits the same browser and trust initialization as production.
 
 For a local run, mount a complete managed bundle and approved corporate CA
 directory:
@@ -204,7 +233,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.8.0
+  mohankrishna999/portal-validator:1.9.0
 ```
 
 ## OpenShift
@@ -291,7 +320,7 @@ document into a load failure. `tls_status=TRUSTED` means Chromium completed cert
 validation; it does not claim independent inspection of the origin certificate
 when an enterprise TLS proxy is present.
 
-Report schema `2.2` keeps route identity independent from the rendered title and
+Report schema `2.3` keeps route identity independent from the rendered title and
 adds route-level application API coverage plus network-settle evidence.
 It preserves canonical hash/hashbang/history paths and exposes `route_name`,
 `route_name_source`, `route_name_confidence`, `display_path`, `spa_route`, and
@@ -333,6 +362,30 @@ route-scoped network quiet so delayed component and microfrontend requests are
 attributed before the route closes. Config traffic is reported separately from
 application API coverage; blocked business requests remain visible without being
 treated as target network failures.
+
+Route **Time** and slow warnings now use `application_load_ms`, a passive
+application-readiness estimate: navigation/SPA activation plus observed render
+and network work, excluding trailing stability confirmation, minimum observation
+waits, and discovery/reporting overhead. The report separately exposes
+`navigation_ms`, `render_ready_ms`, `application_settle_ms`,
+`validator_observation_ms`, and `total_validation_ms`. This is not a Core Web
+Vitals measurement. API **Avg Time**/**Worst Time** use completed responses only;
+blocked, pending, and failed requests cannot inflate response-time averages.
+
+API and route **Columns** controls independently persist only column visibility
+in `portal-validator.api-columns` and `portal-validator.route-columns`. All new
+columns default to visible, identifying columns remain available, and density
+defaults to Compact. Header tooltips describe each metric; route details expose
+sanitized warning categories and descriptions. Healthy still includes both PASS
+and PASS_WITH_WARNINGS.
+
+The collapsible **Resource Details** view reads the browser's natural
+ResourceTiming entries without additional downloads. Transfer size, encoded body
+size, and decoded body size are separate byte measurements; inaccessible timing
+data is unavailable, not a fabricated zero. Total transfer covers measurable
+resources only. Large images/resources remain warnings. Defaults are 512 KiB per
+image and 1 MiB per resource; scan fields `large_image_threshold_bytes` and
+`large_resource_threshold_bytes` (also exposed under Advanced) adjust them.
 
 Logs are structured JSON with a per-scan ID. URLs, query secrets, credentials,
 tokens, cookies, storage state, and certificate/private-key material are

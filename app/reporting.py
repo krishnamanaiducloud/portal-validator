@@ -555,6 +555,7 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
     for result in results:
         result_route_id = result.get("normalized_route_identity") or result.get("url")
         for event in result.get("api_requests", []):
+            event["aggregation_seen"] = True
             event_url = str(event.get("url") or "")
             _, safe_host, safe_endpoint = safe_api_identity(event_url)
             host = str(event.get("host") or safe_host).lower()
@@ -580,6 +581,7 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 "status_4xx": 0,
                 "status_5xx": 0,
                 "network_failures": 0,
+                "response_body_failures": 0,
                 "validator_blocks": 0,
                 "blocked_count": 0,
                 "discovery_phase_count": 0,
@@ -634,13 +636,23 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             status = event.get("status")
             if isinstance(status, int) and 200 <= status < 600:
                 item[f"status_{status // 100}xx"] += 1
-            if event.get("error"):
+            if event.get("error") and not isinstance(status, int):
                 item["network_failures"] += 1
-            classification = classify_api_status(status, event.get("error"))
+            elif event.get("error"):
+                item["response_body_failures"] += 1
+            classification = (
+                "API_RESPONSE_BODY_FAILURE" if event.get("error") and isinstance(status, int)
+                else classify_api_status(status, event.get("error"))
+            )
             if classification not in {"SUCCESS", "REDIRECT", "UNKNOWN"}:
                 item["failure_classifications"][classification] += 1
             duration = event.get("duration_ms")
-            if isinstance(duration, (int, float)) and duration >= 0:
+            if (
+                isinstance(status, int) and 200 <= status < 600
+                and not event.get("error")
+                and event.get("response_completed", True)
+                and isinstance(duration, (int, float)) and duration >= 0
+            ):
                 item["durations_ms"].append(round(duration))
 
     output: list[dict[str, Any]] = []
@@ -652,7 +664,7 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
         block_reasons = dict(item.pop("block_reasons"))
         importance = dict(item.pop("importance"))
         traffic_categories = dict(item.pop("traffic_categories"))
-        target_failures = item["status_4xx"] + item["status_5xx"] + item["network_failures"]
+        target_failures = item["status_4xx"] + item["status_5xx"] + item["network_failures"] + item["response_body_failures"]
         status_counts = {
             "2xx": item["status_2xx"],
             "3xx": item["status_3xx"],
@@ -662,7 +674,7 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
         }
         observation_outcome = (
             "FAILED" if item["status_5xx"] or item["network_failures"] else
-            "WARNING" if item["status_4xx"] else
+            "WARNING" if item["status_4xx"] or item["response_body_failures"] else
             "BLOCKED_BY_VALIDATOR"
             if item["blocked_calls"] and not item["allowed_calls"] else
             "WARNING" if item["blocked_calls"] else
@@ -678,6 +690,10 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             "worst_duration_ms": max(durations) if durations else None,
             "failure_classifications": failures,
             "classifications": sorted(classifications),
+            "policies": sorted({
+                "READ_ONLY_BLOCK" if name == "BLOCKED_MUTATION" else name
+                for name in classifications
+            }),
             "classification_counts": classifications,
             "block_reasons": block_reasons,
             "importance_counts": importance,
@@ -692,7 +708,8 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             "observation_outcome": observation_outcome,
             "health": (
                 "FAILED" if item["status_5xx"] or item["network_failures"] else
-                "DEGRADED" if item["status_4xx"] else
+                "DEGRADED" if item["status_4xx"] or item["response_body_failures"] else
+                "NOT_EXECUTED" if not item["status_2xx"] and not item["status_3xx"] else
                 "HEALTHY"
             ),
         })

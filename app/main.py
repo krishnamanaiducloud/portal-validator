@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from playwright.async_api import BrowserContext, Route, async_playwright
 
 from app.authentication import (
@@ -45,6 +45,7 @@ from app.health import (
     api_health_findings,
     assess_page_health,
     realtime_health_findings,
+    route_performance_timing,
     wait_for_render_settle,
 )
 from app.navigation import (
@@ -73,6 +74,7 @@ from app.reporting import (
     finding,
 )
 from app.session import RuntimeSessionStore, load_refresh_config, refresh_browser_session
+from app.resources import build_resource_report, enrich_resource_timings, large_resource_findings, resource_timing_key
 from app.scans import ScanCapacityError, ScanJob, ScanRegistry, TERMINAL_STATES
 from app.security import (
     DestinationError,
@@ -107,8 +109,8 @@ SECURITY_HEADERS = (
 COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
     "ac", "co", "com", "edu", "gov", "net", "org",
 })
-VALIDATOR_VERSION = "1.8.0"
-REPORT_SCHEMA_VERSION = "2.2"
+VALIDATOR_VERSION = "1.9.0"
+REPORT_SCHEMA_VERSION = "2.3"
 
 
 @asynccontextmanager
@@ -181,6 +183,24 @@ class Authentication(BaseModel):
         return headers
 
 
+class ApprovedReadPostOperation(BaseModel):
+    model_config = {"extra": "forbid"}
+    method: Literal["POST"] = "POST"
+    host: str = Field(min_length=1, max_length=253)
+    path: str | None = Field(default=None, max_length=2048)
+    path_pattern: str | None = Field(default=None, max_length=2048)
+    description: str | None = Field(default=None, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_explicit_operation(self):
+        # Use the same strict policy parser for UI and deployment rules.
+        rule = load_read_only_policy(raw=json.dumps({
+            "safe_application_requests": [self.model_dump(exclude_none=True)],
+        })).safe_application_requests[0]
+        self.host = rule.host
+        return self
+
+
 class ScanRequest(BaseModel):
     target: str = Field(min_length=1, max_length=4096)
     max_pages: int = Field(50, ge=1, le=250)
@@ -196,11 +216,16 @@ class ScanRequest(BaseModel):
     allow_subdomains: bool = False
     allow_private_networks: bool = False
     resource_hosts: list[str] = Field(default_factory=list, max_length=50)
+    approved_read_post_operations: list[ApprovedReadPostOperation] = Field(
+        default_factory=list, max_length=100,
+    )
     portal_hosts: list[str] = Field(default_factory=list, max_length=25)
     credential_hosts: list[str] = Field(default_factory=list, max_length=25)
     query_parameter_policy: Literal["ignore", "allowlist", "preserve"] = "ignore"
     allowed_query_parameters: list[str] = Field(default_factory=list, max_length=25)
     slow_page_threshold_ms: int = Field(5000, ge=500, le=120000)
+    large_resource_threshold_bytes: int = Field(1048576, ge=1024, le=104857600)
+    large_image_threshold_bytes: int = Field(524288, ge=1024, le=104857600)
     render_settle_ms: int = Field(750, ge=0, le=5000)
     max_navigation_actions: int = Field(20, ge=0, le=50)
     max_discovery_scrolls: int = Field(3, ge=0, le=20)
@@ -680,6 +705,24 @@ async def execute_scan(
             read_only_policy = load_read_only_policy()
         except (OSError, ValueError) as exc:
             raise HTTPException(500, "Administrator read-only policy is invalid") from exc
+    if req.approved_read_post_operations:
+        scan_policy = load_read_only_policy(raw=json.dumps({
+            "safe_application_requests": [
+                operation.model_dump(exclude_none=True)
+                for operation in req.approved_read_post_operations
+            ],
+        }))
+        read_only_policy = ReadOnlyPolicy(
+            tuple(dict.fromkeys(read_only_policy.safe_application_requests + scan_policy.safe_application_requests)),
+            read_only_policy.access_gates,
+        )
+    # Explicit operation approval never exempts its destination from SSRF checks
+    # and does not generally allow that host's unrelated assets or APIs.
+    for policy_host in {rule.host for rule in read_only_policy.safe_application_requests}:
+        try:
+            await _resolve_with_logging(policy_host, req, scan_id)
+        except DestinationError as exc:
+            raise HTTPException(400, exc.public_message) from exc
     log_event(
         logging.INFO,
         "READ_ONLY_POLICY_LOADED",
@@ -872,6 +915,7 @@ async def execute_scan(
                 request_routes: dict[int, str | None] = {}
                 request_observation: dict[int, tuple[str, str]] = {}
                 active_route_id: str | None = None
+                active_route_activation_id: str | None = None
                 current_tracker: NavigationTracker | None = None
                 navigation_policy_error: DestinationError | None = None
                 navigation_hosts: set[str] = set()
@@ -943,13 +987,17 @@ async def execute_scan(
                 def ensure_api_observed(request) -> dict | None:
                     if not is_api_observation(request):
                         return None
-                    return network_observer.observe_request(
+                    event = network_observer.observe_request(
                         request,
                         phase=request_phase(request),
                         importance=api_importance(request),
                         initiating_route=active_route_id,
                         main_document=is_main_navigation(request),
+                        route_activation_id=active_route_activation_id,
                     )
+                    if "_resource_timing_key" not in event:
+                        event["_resource_timing_key"] = resource_timing_key(request.url)
+                    return event
 
                 def record_request(request):
                     if id(request) in request_started:
@@ -968,6 +1016,8 @@ async def execute_scan(
                             logging.DEBUG,
                             "API_REQUEST_OBSERVED",
                             scan_id=scan_id,
+                            request_id=api_event["request_id"],
+                            route_activation_id=api_event["route_activation_id"],
                             method=api_event["method"],
                             hostname=api_event["host"],
                             endpoint=api_event["endpoint"],
@@ -1013,6 +1063,8 @@ async def execute_scan(
                             logging.WARNING,
                             "API_REQUEST_BLOCKED",
                             scan_id=scan_id,
+                            request_id=api_event["request_id"],
+                            route_activation_id=api_event["route_activation_id"],
                             method=api_event["method"],
                             hostname=api_event["host"],
                             endpoint=api_event["endpoint"],
@@ -1058,6 +1110,8 @@ async def execute_scan(
                                 logging.WARNING,
                                 "API_REQUEST_FAILED",
                                 scan_id=scan_id,
+                                request_id=api_event["request_id"],
+                                route_activation_id=api_event["route_activation_id"],
                                 method=api_event["method"],
                                 hostname=api_event["host"],
                                 endpoint=api_event["endpoint"],
@@ -1066,6 +1120,7 @@ async def execute_scan(
                     elif request.resource_type not in {"document", "eventsource"}:
                         resource_events.append({
                             "url": sanitized_url(request.url),
+                            "_resource_timing_key": resource_timing_key(request.url),
                             "resource_type": request.resource_type,
                             "status": None,
                             "error": sanitized_diagnostic(request.failure or "Request failed"),
@@ -1084,6 +1139,7 @@ async def execute_scan(
 
                 def record_request_finished(request):
                     route_network_activity.request_finished(request)
+                    network_observer.record_finished(request)
 
                 def record_response(response):
                     duration_ms, initiating_route, phase, importance = request_timing(response.request)
@@ -1097,6 +1153,8 @@ async def execute_scan(
                                 logging.DEBUG,
                                 "API_RESPONSE_OBSERVED",
                                 scan_id=scan_id,
+                                request_id=api_event["request_id"],
+                                route_activation_id=api_event["route_activation_id"],
                                 method=api_event["method"],
                                 hostname=api_event["host"],
                                 endpoint=api_event["endpoint"],
@@ -1118,6 +1176,7 @@ async def execute_scan(
                     elif response.request.resource_type not in {"document", "eventsource"}:
                         resource_events.append({
                             "url": sanitized_url(response.url),
+                            "_resource_timing_key": resource_timing_key(response.url),
                             "resource_type": response.request.resource_type,
                             "status": response.status,
                             "error": None,
@@ -1209,6 +1268,7 @@ async def execute_scan(
                     if id(request) not in request_started:
                         record_request(request)
                     api_event = ensure_api_observed(request)
+                    network_observer.mark_route_handler(request)
                     request_url = urlparse(request.url)
                     host = normalized_host(request_url.hostname or "")
                     portal_scoped = bool(host and host_in_scan_scope(
@@ -1218,6 +1278,7 @@ async def execute_scan(
                         approved_portal_hosts,
                     ))
                     resource_scoped = host in approved_resource_hosts
+                    approved_operation = read_only_policy.match(request.method, request.url)
                     main_navigation = is_main_navigation(request)
                     if main_navigation:
                         try:
@@ -1246,10 +1307,22 @@ async def execute_scan(
                             await abort_by_validator(route, "network_policy")
                             return
                     elif request_url.scheme not in {"http", "https"} or not (
-                        portal_scoped or resource_scoped or host in navigation_hosts
+                        portal_scoped or resource_scoped or host in navigation_hosts or approved_operation is not None
                     ):
                         await abort_by_validator(route, "third_party_resource_policy")
                         return
+                    elif approved_operation is not None and not (
+                        portal_scoped or resource_scoped or host in navigation_hosts
+                    ):
+                        # An operation exception is narrower than a resource
+                        # host allowlist and must independently validate the
+                        # actual URL's port and current DNS destination.
+                        try:
+                            validated_host, _ = validate_http_url(request.url)
+                            await _resolve_with_logging(validated_host, req, scan_id)
+                        except DestinationError:
+                            await abort_by_validator(route, "network_policy")
+                            return
 
                     method = request.method.upper()
                     if method not in SAFE_READ_ONLY_METHODS:
@@ -1266,7 +1339,7 @@ async def execute_scan(
                             )
                         approved_rule = (
                             None if auth_navigation_allowed else
-                            read_only_policy.match(method, request.url)
+                            approved_operation
                         )
                         if not auth_navigation_allowed and approved_rule is None:
                             await abort_by_validator(route, "read_only_mutation_policy")
@@ -1325,6 +1398,8 @@ async def execute_scan(
                                 endpoint=api_event.get("endpoint") if api_event else "/",
                                 method=method,
                                 classification=classification,
+                                request_id=api_event.get("request_id") if api_event else None,
+                                route_activation_id=active_route_activation_id,
                             )
                     elif api_event is not None:
                         network_observer.mark_allowed(request, "SAFE_METHOD")
@@ -1334,6 +1409,7 @@ async def execute_scan(
                         host,
                     )
                     await route.continue_(headers=headers)
+                    network_observer.mark_dispatched(request)
 
                 context.on("request", record_request)
                 context.on("requestfailed", record_failed_request)
@@ -1396,6 +1472,7 @@ async def execute_scan(
                         continue
                     seen.add(route_identity)
                     active_route_id = sanitized_url(route_identity)
+                    active_route_activation_id = f"activation-{len(results) + 1}"
                     await publish_progress(
                         "VALIDATING",
                         discovered=len(discovered_routes),
@@ -1454,6 +1531,8 @@ async def execute_scan(
                     name_evidence = {"primary_heading": "", "breadcrumb": ""}
                     navigation_actions = {"activated": 0, "skipped": 0}
                     route_discovery_ms = 0
+                    navigation_ms = 0
+                    render_start_ms = None
                     frame_observations: list[dict[str, object]] = []
                     final_in_scope = False
                     remaining_ms = max(0, round((deadline - time.perf_counter()) * 1000))
@@ -1484,6 +1563,7 @@ async def execute_scan(
                                 label=route_label,
                                 source=route_source,
                             )
+                            navigation_ms = round((time.perf_counter() - started) * 1000)
                             log_event(
                                 logging.INFO,
                                 "ROUTE_ACTIVATION_COMPLETED",
@@ -1584,6 +1664,7 @@ async def execute_scan(
                                     final_url=final_raw_url,
                                 )
                             log_event(logging.INFO, "PAGE_VALIDATION_STARTED", scan_id=scan_id, final_url=final_raw_url)
+                            render_start_ms = round((time.perf_counter() - started) * 1000)
                             render_health = await wait_for_render_settle(
                                 page,
                                 settle_ms=req.render_settle_ms,
@@ -1830,6 +1911,12 @@ async def execute_scan(
 
                     elapsed = round((time.perf_counter() - started) * 1000)
                     route_validation_ms = max(0, elapsed - route_discovery_ms)
+                    performance_timing = route_performance_timing(
+                        navigation_ms=navigation_ms,
+                        render_health=render_health,
+                        total_validation_ms=route_validation_ms,
+                        render_start_ms=render_start_ms,
+                    )
                     validation_duration_ms += route_validation_ms
                     page_console = list(dict.fromkeys(
                         console_errors[console_start:]
@@ -1840,6 +1927,13 @@ async def execute_scan(
                     page_failures = failed_resources[failed_start:] if req.check_resources else []
                     page_api_events = api_events[api_start:] if req.check_resources else []
                     page_resource_events = resource_events[resource_start:] if req.check_resources else []
+                    if render_health is not None and req.check_resources:
+                        await enrich_resource_timings(page, page_resource_events + page_api_events)
+                    page_resource_details, _ = build_resource_report(
+                        page_resource_events + page_api_events,
+                        large_resource_threshold_bytes=req.large_resource_threshold_bytes,
+                        large_image_threshold_bytes=req.large_image_threshold_bytes,
+                    )
                     page_websockets = websocket_events[websocket_start:] if req.check_resources else []
                     page_event_streams = event_streams[event_stream_start:] if req.check_resources else []
                     page_downloads = download_events[download_start:]
@@ -1882,8 +1976,9 @@ async def execute_scan(
                     if render_health is not None:
                         render_classification, health_findings = assess_page_health(
                             render_health,
-                            load_ms=elapsed,
+                            load_ms=int(performance_timing["application_load_ms"]),
                             slow_page_threshold_ms=req.slow_page_threshold_ms,
+                            performance_enabled=req.check_performance,
                         )
                     health_findings.extend(api_health_findings([
                         event for event in page_api_events
@@ -1893,6 +1988,7 @@ async def execute_scan(
                         page_websockets,
                         page_event_streams,
                     ))
+                    health_findings.extend(large_resource_findings(page_resource_details))
                     if navigation_actions.get("skipped", 0):
                         limitation = finding(
                             "DISCOVERED_BUT_NOT_SAFELY_ACTIVATABLE",
@@ -2035,7 +2131,8 @@ async def execute_scan(
                         "status": status,
                         "http_status_display": "N/A (SPA)" if route_transition_succeeded else status,
                         "title": title,
-                        "load_ms": elapsed if req.check_performance else None,
+                        "load_ms": performance_timing["application_load_ms"] if req.check_performance else None,
+                        **performance_timing,
                         "error": error,
                         "redirect_count": len(redirects),
                         "redirects": redirects,
@@ -2064,7 +2161,7 @@ async def execute_scan(
                         "frames": frame_observations,
                         "frame_navigations": page_frame_events,
                         "render_health": render_health,
-                        "slow": elapsed > req.slow_page_threshold_ms,
+                        "slow": req.check_performance and int(performance_timing["application_load_ms"]) > req.slow_page_threshold_ms,
                         "discovery_ms": route_discovery_ms,
                         "validation_ms": route_validation_ms,
                         "navigation_actions": navigation_actions,
@@ -2182,11 +2279,44 @@ async def execute_scan(
         aggregate_resource_events(scan_resource_events)
         if scan_resource_events else aggregate_resource_inventory(results)
     )
+    resource_details, resource_summary = build_resource_report(
+        scan_resource_events + scan_api_events,
+        large_resource_threshold_bytes=req.large_resource_threshold_bytes,
+        large_image_threshold_bytes=req.large_image_threshold_bytes,
+    )
+    for event in scan_resource_events + scan_api_events:
+        event.pop("_resource_timing_key", None)
     security_recommendations = aggregate_security_recommendations(results)
     summary["unique_apis"] = len(api_inventory)
     summary["api_calls"] = sum(item["calls"] for item in api_inventory)
+    # The scan-wide stream also contains discovery and late requests that may
+    # fall outside a route's snapshot. Never undercount their policy blocks.
+    summary["read_only_blocks"] = sum(
+        bool(event.get("blocked_by_validator"))
+        and event.get("block_reason") == "READ_ONLY_MUTATION_BLOCKED"
+        for event in scan_api_events
+    )
+    network_observation = {
+        "observed_requests": len(scan_api_events),
+        "observed_methods": sorted({event["method"] for event in scan_api_events}),
+        "policy_evaluated": sum(bool(event.get("policy_evaluated")) for event in scan_api_events),
+        "blocked_requests": sum(bool(event.get("blocked_by_validator")) for event in scan_api_events),
+        "responses_seen": sum(bool(event.get("response_seen")) for event in scan_api_events),
+        "responses_completed": sum(bool(event.get("response_completed")) for event in scan_api_events),
+        "requests_failed": sum(bool(event.get("request_failed")) for event in scan_api_events),
+        "route_handler_seen": sum(bool(event.get("route_handler_seen")) for event in scan_api_events),
+        "request_dispatched": sum(bool(event.get("request_dispatched")) for event in scan_api_events),
+        "read_only_blocks": summary["read_only_blocks"],
+        "aggregated_requests": sum(item["calls"] for item in api_inventory),
+    }
+    if network_observation["observed_requests"] != network_observation["aggregated_requests"]:
+        raise RuntimeError("Observed API request count does not reconcile with report inventory")
+    for event in scan_api_events:
+        event["serialized_to_report"] = True
+    log_event(logging.INFO, "NETWORK_OBSERVATION_COMPLETED", scan_id=scan_id, **network_observation)
     summary["api_failures"] = sum(
         item["status_4xx"] + item["status_5xx"] + item["network_failures"]
+        + item["response_body_failures"]
         for item in api_inventory
     )
     summary["unique_resources"] = len(resource_inventory)
@@ -2243,7 +2373,10 @@ async def execute_scan(
         "summary": summary,
         "results": results,
         "api_inventory": api_inventory,
+        "network_observation": network_observation,
         "resource_inventory": resource_inventory,
+        "resource_details": resource_details,
+        "resource_summary": resource_summary,
         "security_recommendations": security_recommendations,
         "coverage": {
             "discovery_status": summary["discovery_status"],

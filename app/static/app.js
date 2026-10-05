@@ -27,6 +27,127 @@ const terminalStates = new Set(['COMPLETED','PARTIAL','FAILED','CANCELLED']);
 const numericRouteKeys = new Set(['status','load_ms','api_failures','resource_failure_count','console_count','warning_findings']);
 const numericApiKeys = new Set(['calls','status_2xx','status_3xx','status_4xx','status_5xx','network_failures','route_count','allowed_calls','blocked_count','application_bootstrap_phase_count','authentication_phase_count','route_validation_phase_count','session_refresh_phase_count','average_duration_ms','worst_duration_ms']);
 
+// Preferences contain column names only, never scan data or credentials. Unknown
+// keys default to visible, so a newly introduced column is not silently hidden.
+const tableColumns = {
+  api: [
+    ['method','Method','HTTP method naturally attempted by the application.',true],
+    ['host','Host','Sanitized destination hostname.'],
+    ['endpoint','Endpoint','Normalized sanitized API path; queries and bodies are not captured.',true],
+    ['calls','Calls','Total naturally observed calls for this normalized API.'],
+    ['status_2xx','2xx','Successful HTTP responses.'],
+    ['status_3xx','3xx','Redirect HTTP responses.'],
+    ['status_4xx','4xx','Client-error HTTP responses.'],
+    ['status_5xx','5xx','Server-error HTTP responses.'],
+    ['network_failures','Network','Unblocked calls that failed without a valid HTTP response.'],
+    ['route_count','Routes','Number of distinct logical routes on which this API was observed.'],
+    ['allowed_calls','Allowed','Calls permitted by the validator policy.'],
+    ['blocked_count','Blocked','Calls prevented by the validator before reaching the target.'],
+    ['application_bootstrap_phase_count','Bootstrap Calls','Calls attributed to initial application or microfrontend bootstrap.'],
+    ['authentication_phase_count','Auth Calls','Calls attributed to authentication/session establishment.'],
+    ['route_validation_phase_count','Route Calls','Calls attributed to normal route activation.'],
+    ['session_refresh_phase_count','Refresh Calls','Calls attributed to browser/session refresh activity.'],
+    ['average_duration_ms','Avg Time','Mean actual completed API response duration in milliseconds; excludes blocked and no-response calls.'],
+    ['worst_duration_ms','Worst Time','Maximum actual completed API response duration in milliseconds.'],
+    ['observation_outcome','Health','Aggregated API health; policy-blocked-only calls are NOT_EXECUTED.'],
+    ['policies','Policy','Observed read-only approval/block decisions. No request bodies are inspected.'],
+  ],
+  route: [
+    ['classification','Status','PASS and PASS_WITH_WARNINGS both count as healthy routes.'],
+    ['route_name','Route Name','Route name derived from navigation labels or safe metadata.'],
+    ['display_path','Path','Sanitized logical portal route.',true],
+    ['navigation_type','Navigation','How the route was activated.'],
+    ['status','Document HTTP','Main-document HTTP response, or N/A for a same-document SPA transition.'],
+    ['load_ms','Time','Application performance time, excluding intentional validator observation; inspect route timings for the precise basis.'],
+    ['api_failures','API','API health for naturally observed route activity.'],
+    ['resource_failure_count','Resources','Observed subresource health; separate from main navigation.'],
+    ['console_count','Console','JavaScript console/page-error health.'],
+    ['authentication_status','Auth','Authentication/session classification.'],
+    ['tls_status','TLS','Verified browser TLS trust; not an origin-certificate inspection claim.'],
+    ['warning_findings','Warnings','Count and drill-down of sanitized non-fatal findings.'],
+    ['details','Details','Route evidence and timing breakdown.'],
+  ],
+};
+const columnPreferences = {};
+
+function loadColumnPreferences(kind) {
+  try {
+    const value = JSON.parse(localStorage.getItem(`portal-validator.${kind}-columns`) || '{}');
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch (_) { return {}; }
+}
+
+function applyColumnVisibility(kind) {
+  const columns = tableColumns[kind];
+  const table = byId(`${kind}-table-wrap`).querySelector('table');
+  columns.forEach(([key,,,required], index) => table.classList.toggle(`hide-column-${index + 1}`, !required && columnPreferences[kind][key] === false));
+  document.querySelectorAll(`[data-column-kind="${kind}"]`).forEach((input) => { input.checked = input.disabled || columnPreferences[kind][input.dataset.columnKey] !== false; });
+  refreshScrollSync();
+}
+
+function saveColumnPreferences(kind) {
+  try { localStorage.setItem(`portal-validator.${kind}-columns`, JSON.stringify(columnPreferences[kind])); }
+  catch (_) { /* Session-only preferences still work when browser storage is disabled. */ }
+  applyColumnVisibility(kind);
+}
+
+function setupTableControls(kind) {
+  columnPreferences[kind] = loadColumnPreferences(kind);
+  const tools = document.querySelector(kind === 'api' ? '.api-tools' : '.report-tools');
+  const headers = document.querySelectorAll(`#${kind}-table-wrap th`);
+  tableColumns[kind].forEach(([key,label,description], index) => {
+    const header = headers[index];
+    if (!header) return;
+    header.title = description;
+    const button = header.querySelector('button');
+    if (button) button.textContent = label;
+    else header.textContent = label;
+  });
+  const controls = document.createElement('div');
+  controls.className = 'table-controls';
+  controls.innerHTML = `<details class="columns-control" id="${kind}-columns"><summary>Columns</summary><div class="columns-panel"><div class="column-actions"><button type="button" data-column-action="all">Select all</button><button type="button" data-column-action="clear">Clear all</button><button type="button" data-column-action="reset">Reset default</button></div><p>Identifying columns remain visible.</p>${tableColumns[kind].map(([key,label,description,required]) => `<label title="${escapeHtml(description)}"><input type="checkbox" data-column-kind="${kind}" data-column-key="${key}" ${required ? 'disabled' : ''}> ${escapeHtml(label)}</label>`).join('')}</div></details><label class="field density-control"><span>Density</span><select id="${kind}-density" aria-label="${kind === 'api' ? 'API' : 'Route'} table density"><option value="compact">Compact</option><option value="comfortable">Comfortable</option></select></label>`;
+  tools.append(controls);
+  controls.querySelectorAll('[data-column-kind]').forEach((input) => input.addEventListener('change', () => {
+    columnPreferences[kind][input.dataset.columnKey] = input.checked;
+    saveColumnPreferences(kind);
+  }));
+  controls.querySelectorAll('[data-column-action]').forEach((button) => button.addEventListener('click', () => {
+    const action = button.dataset.columnAction;
+    columnPreferences[kind] = action === 'reset' ? {} : Object.fromEntries(tableColumns[kind].map(([key,,,required]) => [key, Boolean(required || action === 'all')]));
+    saveColumnPreferences(kind);
+  }));
+  const table = byId(`${kind}-table-wrap`).querySelector('table');
+  table.dataset.density = 'compact';
+  byId(`${kind}-density`).addEventListener('change', (event) => { table.dataset.density = event.target.value; refreshScrollSync(); });
+  applyColumnVisibility(kind);
+}
+
+function addReadPostOperation() {
+  const row = document.createElement('div');
+  row.className = 'read-post-operation';
+  row.innerHTML = '<label class="field"><span>Method</span><select class="operation-method" aria-label="Approved method"><option>POST</option></select></label><label class="field"><span>Host</span><input class="operation-host" placeholder="api.example.net" autocomplete="off" required></label><label class="field"><span>Path type</span><select class="operation-path-type"><option value="path">Exact path</option><option value="path_pattern">Bounded pattern</option></select></label><label class="field"><span>Path</span><input class="operation-path" placeholder="/v1/search" autocomplete="off" required></label><label class="field"><span>Description (optional)</span><input class="operation-description" maxlength="200" placeholder="Owner-approved read operation"></label><button type="button" class="secondary remove-operation">Remove</button>';
+  row.querySelector('.remove-operation').addEventListener('click', () => row.remove());
+  byId('read-post-operations').append(row);
+}
+
+function approvedReadPostOperations() {
+  const rows = [...document.querySelectorAll('.read-post-operation')];
+  if (rows.length > 100) throw new Error('At most 100 read-only POST operations may be approved.');
+  return rows.map((row) => {
+    const host = row.querySelector('.operation-host').value.trim().toLowerCase().replace(/\.$/, '');
+    const path = row.querySelector('.operation-path').value.trim();
+    const pathType = row.querySelector('.operation-path-type').value;
+    if (!host || /[\s/?#@:*]/.test(host) || !/^[a-z0-9.-]+$/.test(host) || host.split('.').some((label) => !label || label.startsWith('-') || label.endsWith('-'))) throw new Error('Approved POST host must be an exact hostname, without a scheme, credentials, port or wildcard.');
+    if (!path.startsWith('/') || /[\s?#*\\]/.test(path) || path.includes('//') || path.split('/').some((part) => ['.','..'].includes(part))) throw new Error('Approved POST path must be a normalized absolute path without queries, wildcards, or traversal.');
+    if (pathType === 'path_pattern') {
+      const segments = path.split('/').filter(Boolean);
+      if (segments.filter((segment) => segment !== '{segment}').length < 2 || segments.some((segment) => /[{}]/.test(segment) && segment !== '{segment}')) throw new Error('A bounded POST pattern requires at least two literal path segments and only {segment} placeholders.');
+    } else if (/[{}]/.test(path)) throw new Error('Use Bounded pattern for {segment} placeholders.');
+    const description = row.querySelector('.operation-description').value.trim();
+    return {method:'POST',host,[pathType]:path,...(description ? {description} : {})};
+  });
+}
+
 function notify(message, isError = false) {
   toast.textContent = message;
   toast.className = `toast show${isError ? ' error' : ''}`;
@@ -140,7 +261,7 @@ function matchesOutcome(item, filter) {
 
 function matchesDrilldown(item) {
   if (['all','discovered','validated'].includes(activeDrilldown)) return true;
-  if (activeDrilldown === 'healthy') return Boolean(item.passed);
+  if (activeDrilldown === 'healthy') return passOutcomes.has(item.classification);
   if (activeDrilldown === 'warnings') return item.classification === 'PASS_WITH_WARNINGS';
   if (activeDrilldown === 'failed') return !passOutcomes.has(item.classification) && !authOutcomes.has(item.classification) && item.page_load_status !== 'NOT_TESTED';
   if (activeDrilldown === 'auth') return authOutcomes.has(item.classification);
@@ -164,6 +285,16 @@ function detailSection(title, value) {
   return `<details class="technical-detail"><summary>${escapeHtml(title)}</summary><pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre></details>`;
 }
 
+function showRouteWarnings(item) {
+  const warnings = (item.finding_details || []).filter((finding) => !['ERROR','CRITICAL','FAIL'].includes(String(finding.severity || '').toUpperCase()));
+  const categories = [...new Set(warnings.map((finding) => finding.type).filter(Boolean))];
+  showEvidence(`Warnings: ${item.display_path || routeDisplay(item).path}`, {
+    warning_count:item.warning_findings || warnings.length,
+    warning_categories:categories,
+    warnings:warnings.map(({type,severity,message,resource,count}) => ({type,severity,message,resource,count})),
+  });
+}
+
 function renderRows() {
   if (!lastReport) return;
   const query = byId('result-search').value.trim().toLowerCase();
@@ -183,10 +314,28 @@ function renderRows() {
   byId('result-list').innerHTML = rows.map((item) => {
     const route = routeDisplay(item);
     const routeIdentity = {requested_url:item.requested_url,discovered_url:item.discovered_url,final_url:item.final_url,origin:item.origin,host:item.host,pathname:item.pathname,query_sanitized:item.query_sanitized,fragment:item.fragment,spa_route:item.spa_route,canonical_route:item.canonical_route,display_path:item.display_path,route_name:item.route_name,route_name_source:item.route_name_source,route_name_confidence:item.route_name_confidence,discovery_sources:item.discovery_sources,duplicate_discovery_count:item.duplicate_discovery_count};
-    const detail = {route_identity:routeIdentity,redirects:item.redirects,navigation_type:item.navigation_type,tls_basis:item.tls_basis,render_health:item.render_health,api_coverage:item.api_coverage,apis_observed:item.apis_observed,application_apis_observed:item.application_apis_observed,blocked_api_attempts:item.blocked_api_attempts,api_failures:item.api_failures,resource_failures:item.resource_failure_count,api_requests:item.api_requests,resources:item.resources,failed_resources:item.failed_resources,frames:item.frames,security_headers:item.security_headers,external_links:item.external_links};
+    const detail = {route_identity:routeIdentity,redirects:item.redirects,navigation_type:item.navigation_type,tls_basis:item.tls_basis,render_health:item.render_health,timings:{navigation_ms:item.navigation_ms,render_ready_ms:item.render_ready_ms,application_settle_ms:item.application_settle_ms,validator_observation_ms:item.validator_observation_ms,total_validation_ms:item.total_validation_ms,application_load_ms:item.application_load_ms},api_coverage:item.api_coverage,apis_observed:item.apis_observed,application_apis_observed:item.application_apis_observed,blocked_api_attempts:item.blocked_api_attempts,api_failures:item.api_failures,resource_failures:item.resource_failure_count,api_requests:item.api_requests,resources:item.resources,failed_resources:item.failed_resources,frames:item.frames,security_headers:item.security_headers,external_links:item.external_links};
     const failure = item.failure_reason ? `<small class="failure-reason"><b>${escapeHtml(item.failure_dimension || 'VALIDATION')}</b>${escapeHtml(item.failure_reason)}</small>` : '';
     return `<tr class="route-row outcome-${statusClass(item.classification)}"><td><span class="outcome-badge ${statusClass(item.classification)}">${escapeHtml(item.classification)}</span>${failure}</td><td class="route-name-cell"><strong>${escapeHtml(item.route_name || item.route_label || 'Unnamed route')}</strong><small>${escapeHtml(item.route_name_source || 'FALLBACK')}</small></td><td class="route-cell"><span>${escapeHtml(route.host)}</span><code>${escapeHtml(route.path)}</code></td><td><span class="dimension-state ${statusClass(item.navigation_status)}">${escapeHtml(item.navigation_type || 'DOCUMENT_NAVIGATION')}</span></td><td><strong class="http-status">${escapeHtml(item.http_status_display ?? item.status ?? 'N/A')}</strong></td><td><span class="time-value ${item.slow ? 'slow' : ''}">${escapeHtml(item.load_ms ?? '—')} ms</span></td><td><span class="dimension-state ${statusClass(item.api_status)}">${escapeHtml(item.api_status)}</span></td><td><span class="dimension-state ${statusClass(item.resource_status)}">${escapeHtml(item.resource_status)}</span></td><td><span class="dimension-state ${statusClass(item.console_status)}">${escapeHtml(item.console_status)}</span></td><td><span class="dimension-state ${statusClass(item.authentication_status)}">${escapeHtml(item.authentication_status)}</span></td><td><span class="dimension-state ${statusClass(item.tls_status)}">${escapeHtml(item.tls_status)}</span></td><td><strong>${escapeHtml(item.warning_findings || 0)}</strong></td><td><details class="route-detail"><summary>Inspect</summary><div class="detail-drawer"><div class="result-overview"><div><span>Page load</span><strong class="state ${statusClass(item.page_load_status)}">${escapeHtml(item.page_load_status)}</strong></div><div><span>Validation</span><strong class="state ${statusClass(item.validation_status)}">${escapeHtml(item.validation_status)}</strong></div><div><span>Render</span><strong class="state ${statusClass(item.render_status)}">${escapeHtml(item.render_status)}</strong></div><div><span>TLS</span><strong class="state ${statusClass(item.tls_status)}">${escapeHtml(item.tls_status)}</strong></div><div><span>Security headers</span><strong class="state ${statusClass(item.security_headers_status)}">${escapeHtml(item.security_headers_status)}</strong></div><div><span>Read-only</span><strong class="state ${statusClass(item.read_only_status)}">${escapeHtml(item.read_only_status)}</strong></div><div><span>Navigation</span><strong>${escapeHtml(item.navigation_type || 'DOCUMENT_NAVIGATION')}</strong></div><div><span>Discovery</span><strong>${escapeHtml(item.discovery_type || item.route_source || 'route')}</strong></div><div><span>Depth</span><strong>${escapeHtml(item.depth)}</strong></div></div>${item.failure_reason ? `<h3>Failure explanation</h3><p class="failure-explanation"><b>${escapeHtml(item.failure_dimension || 'VALIDATION')}</b>${escapeHtml(item.failure_reason)}</p>` : ''}<h3>Route identity</h3>${detailSection('Identity and provenance', routeIdentity)}<h3>Findings</h3>${findingsMarkup(item)}${detailSection('Navigation and redirects', {requested_url:item.requested_url,final_url:item.final_url,redirects:item.redirects})}${detailSection('API / XHR', item.api_requests)}${detailSection('Resources', item.resources)}${detailSection('Console', {console:item.console_errors,page_errors:item.page_errors})}${detailSection('Security headers', item.security_headers)}${detailSection('Performance', item.render_health)}${detailSection('Read-only safety', {status:item.read_only_status,blocks:item.read_only_blocks})}<details class="technical-detail"><summary>Technical route data</summary><pre>${escapeHtml(JSON.stringify(detail, null, 2))}</pre></details></div></details></td></tr>`;
   }).join('') || '<tr><td colspan="13" class="empty-table">No routes match this filter.</td></tr>';
+  byId('result-list').querySelectorAll('.route-row').forEach((row, index) => {
+    const item = rows[index];
+    if (!Number(item.warning_findings || 0)) return;
+    const cell = row.children[11];
+    const button = document.createElement('button');
+    button.type = 'button'; button.className = 'warning-count';
+    button.textContent = item.warning_findings;
+    button.setAttribute('aria-label', `Show ${item.warning_findings} warnings for ${item.route_name || item.display_path || 'route'}`);
+    button.addEventListener('click', () => showRouteWarnings(item));
+    cell.replaceChildren(button);
+    if (item.classification === 'PASS_WITH_WARNINGS') {
+      const badge = row.querySelector('.outcome-badge');
+      badge.tabIndex = 0; badge.setAttribute('role', 'button');
+      badge.title = 'Show warning count, categories, and descriptions';
+      badge.addEventListener('click', () => showRouteWarnings(item));
+      badge.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showRouteWarnings(item); } });
+    }
+  });
   refreshScrollSync();
 }
 
@@ -227,12 +376,63 @@ function renderApiInventory() {
   visible.sort((left, right) => compareValues(left[apiSort.key], right[apiSort.key], numericApiKeys.has(apiSort.key)) * apiSort.direction);
   updateAriaSort('[data-api-sort]', apiSort, 'apiSort');
   byId('api-count').textContent = visible.length === inventory.length ? `${inventory.length} unique APIs observed` : `${visible.length} of ${inventory.length} unique APIs observed`;
-  byId('api-list').innerHTML = visible.map((item, index) => { const outcome = item.observation_outcome || (item.health === 'DEGRADED' ? 'WARNING' : item.health); return `<tr><td><strong>${escapeHtml(item.method)}</strong></td><td>${escapeHtml(item.host)}</td><td><button class="api-endpoint" type="button" data-api-index="${index}" title="${escapeHtml(item.endpoint)}">${escapeHtml(item.endpoint)}</button></td><td>${escapeHtml(item.calls)}</td><td>${escapeHtml(item.status_2xx)}</td><td>${escapeHtml(item.status_3xx)}</td><td>${escapeHtml(item.status_4xx)}</td><td>${escapeHtml(item.status_5xx)}</td><td>${escapeHtml(item.network_failures)}</td><td>${escapeHtml(item.route_count)}</td><td>${escapeHtml(item.allowed_calls ?? Math.max(0, Number(item.calls || 0) - Number(item.blocked_count || 0)))}</td><td>${escapeHtml(item.blocked_count || 0)}</td><td>${escapeHtml(item.application_bootstrap_phase_count || 0)}</td><td>${escapeHtml(item.authentication_phase_count || 0)}</td><td>${escapeHtml(item.route_validation_phase_count ?? item.validation_phase_count ?? 0)}</td><td>${escapeHtml(item.session_refresh_phase_count || 0)}</td><td>${escapeHtml(item.average_duration_ms ?? 'N/A')}</td><td>${escapeHtml(item.worst_duration_ms ?? 'N/A')}</td><td><span class="dimension-state ${statusClass(outcome)}">${escapeHtml(outcome)}</span></td></tr>`; }).join('') || `<tr><td colspan="19" class="empty-table">${failedOnly ? 'No target API failures were observed during this scan.' : 'No API requests match these filters.'}</td></tr>`;
+  byId('api-list').innerHTML = visible.map((item, index) => {
+    const outcome = item.observation_outcome || (item.health === 'DEGRADED' ? 'WARNING' : item.health);
+    const healthLabel = item.health === 'NOT_EXECUTED' ? 'NOT_EXECUTED' : outcome;
+    const numbers = [item.calls,item.status_2xx,item.status_3xx,item.status_4xx,item.status_5xx,item.network_failures,item.route_count,item.allowed_calls ?? Math.max(0, Number(item.calls || 0) - Number(item.blocked_count || 0)),item.blocked_count || 0,item.application_bootstrap_phase_count || 0,item.authentication_phase_count || 0,item.route_validation_phase_count ?? item.validation_phase_count ?? 0,item.session_refresh_phase_count || 0,item.average_duration_ms ?? 'N/A',item.worst_duration_ms ?? 'N/A'];
+    const policies = item.policies || Object.keys(item.classification_counts || {});
+    return `<tr><td><strong>${escapeHtml(item.method)}</strong></td><td>${escapeHtml(item.host)}</td><td><button class="api-endpoint" type="button" data-api-index="${index}" title="${escapeHtml(item.endpoint)}">${escapeHtml(item.endpoint)}</button></td>${numbers.map((value) => `<td>${escapeHtml(value)}</td>`).join('')}<td><span class="dimension-state ${statusClass(healthLabel)}">${escapeHtml(healthLabel)}</span></td><td class="api-policy-cell">${escapeHtml(policies.join(', ') || 'N/A')}</td></tr>`;
+  }).join('') || `<tr><td colspan="20" class="empty-table">${failedOnly ? 'No target API failures were observed during this scan.' : 'No API requests match these filters.'}</td></tr>`;
   byId('api-list').querySelectorAll('[data-api-index]').forEach((button) => button.addEventListener('click', () => {
     const item = visible[Number(button.dataset.apiIndex)];
     showEvidence(`${item.method} ${item.host}${item.endpoint}`, item);
   }));
   refreshScrollSync();
+}
+
+function formatBytes(value) {
+  if (value === undefined || value === null || !Number.isFinite(Number(value))) return 'N/A';
+  if (Number(value) < 1024) return `${Number(value)} B`;
+  if (Number(value) < 1048576) return `${(Number(value) / 1024).toFixed(1)} KiB`;
+  return `${(Number(value) / 1048576).toFixed(2)} MiB`;
+}
+
+function resourceIsFailed(item) {
+  return Boolean(item.failed || item.failure_category || item.failure) || Number(item.status || 0) >= 400;
+}
+
+function renderResourceDetails() {
+  const details = lastReport?.resource_details || [];
+  const filter = byId('resource-type-filter').value;
+  const largeOnly = byId('resource-large-only').checked;
+  const knownTypes = new Set(['image','script','stylesheet','font','xhr','fetch']);
+  const visible = details.filter((item) => {
+    const type = String(item.type || item.resource_type || '').toLowerCase();
+    return (filter === 'all' || (filter === 'failed' ? resourceIsFailed(item) : filter === 'api' ? ['xhr','fetch'].includes(type) : filter === 'other' ? !knownTypes.has(type) : type === filter))
+      && (!largeOnly || Boolean(item.size_categories?.length));
+  }).sort((left, right) => Number(right.transfer_size_bytes ?? -1) - Number(left.transfer_size_bytes ?? -1));
+  byId('resource-count').textContent = `${visible.length} of ${details.length} resource observations`;
+  byId('resource-list').innerHTML = visible.map((item) => `<tr><td>${escapeHtml(item.type || item.resource_type || 'OTHER')}</td><td class="resource-path"><span>${escapeHtml(item.host || '')}</span><code>${escapeHtml(item.path || item.endpoint || item.url || '')}</code></td><td>${escapeHtml(formatBytes(item.transfer_size_bytes))}</td><td>${escapeHtml(formatBytes(item.encoded_body_size_bytes))}</td><td>${escapeHtml(formatBytes(item.decoded_body_size_bytes))}</td><td class="resource-path">${escapeHtml(item.route || '')}</td><td>${escapeHtml(item.status ?? (resourceIsFailed(item) ? 'FAILED' : 'N/A'))}</td><td>${escapeHtml(item.duration_ms == null ? 'N/A' : `${item.duration_ms} ms`)}</td><td>${escapeHtml((item.size_categories || []).join(', ') || '—')}</td></tr>`).join('') || '<tr><td colspan="9" class="empty-table">No observed resources match these filters.</td></tr>';
+}
+
+function renderResourceSummary() {
+  const details = lastReport?.resource_details || [];
+  const summary = lastReport?.resource_summary || {};
+  const measurable = details.filter((item) => item.transfer_size_bytes != null);
+  const total = summary.total_transfer_size_bytes ?? (measurable.length ? measurable.reduce((sum,item) => sum + Number(item.transfer_size_bytes),0) : null);
+  const cards = [
+    ['Resources Observed',summary.resources_observed ?? details.length],
+    ['Total Transfer',formatBytes(total)],
+    ['Large Resources',summary.large_resources ?? details.filter((item) => item.size_categories?.length).length],
+    ['Large Images',summary.large_images ?? details.filter((item) => item.size_categories?.includes('LARGE_IMAGE')).length],
+    ['Large JS Bundles',details.filter((item) => item.size_categories?.includes('LARGE_JS_BUNDLE')).length],
+    ['Large CSS / Fonts',`${details.filter((item) => String(item.type).toUpperCase() === 'STYLESHEET' && item.size_categories?.length).length} / ${details.filter((item) => String(item.type).toUpperCase() === 'FONT').length}`],
+    ['Resource Failures',summary.resource_failures ?? details.filter(resourceIsFailed).length],
+  ];
+  byId('resource-summary').innerHTML = cards.map(([label,value]) => `<div class="resource-card"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`).join('');
+  const transferCard = byId('resource-summary').children[1];
+  transferCard.title = `${summary.resources_with_transfer_size ?? measurable.length} of ${summary.resources_observed ?? details.length} resource observations expose transfer bytes; missing sizes are excluded, so this is a measured subtotal.`;
+  renderResourceDetails();
 }
 
 function renderSecurityRecommendations() {
@@ -263,7 +463,7 @@ function activateSummary(action, value, button) {
   renderApiInventory();
   if (action === 'apis' || action === 'api-failures') scrollAndFocus(byId('api-inventory'));
   else if (action === 'security') scrollAndFocus(byId('security-recommendations'));
-  else if (action === 'resources') showEvidence('Observed resource inventory', lastReport.resource_inventory || []);
+  else if (action === 'resources') scrollAndFocus(byId('resource-inventory'));
   else if (['discovered','validated','not-tested'].includes(action) && lastReport.coverage) showEvidence('Scan coverage', lastReport.coverage);
   else if (Number(value) === 0) showEvidence('No matching evidence', {message:`No ${action.replaceAll('-', ' ')} were observed during this scan.`});
 }
@@ -298,6 +498,7 @@ function renderReport(report) {
   updateApiRouteFilter(report.api_inventory || []);
   renderRows();
   renderApiInventory();
+  renderResourceSummary();
   renderSecurityRecommendations();
   results.hidden = false;
   scrollAndFocus(results);
@@ -381,6 +582,15 @@ if (!byId('api-route-filter')) {
   document.querySelector('.api-tools')?.append(label);
 }
 
+const apiPolicyHeader = document.createElement('th');
+apiPolicyHeader.textContent = 'Policy';
+document.querySelector('#api-table-wrap thead tr').append(apiPolicyHeader);
+setupTableControls('route');
+setupTableControls('api');
+byId('add-read-post').addEventListener('click', addReadPostOperation);
+byId('resource-type-filter').addEventListener('change', renderResourceDetails);
+byId('resource-large-only').addEventListener('change', renderResourceDetails);
+
 authMode.addEventListener('change', renderAuthFields);
 byId('result-search').addEventListener('input', renderRows);
 byId('result-filter').addEventListener('change', renderRows);
@@ -399,10 +609,14 @@ byId('cancel-button').addEventListener('click', async () => {
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
+  if ([...document.querySelectorAll('.read-post-operation input[required]')].some((input) => !input.validity.valid)) byId('read-post-settings').open = true;
   if (!form.reportValidity()) return;
   let payload;
   try {
     payload = {target:byId('target').value.trim(),max_pages:Number(byId('pages').value),max_depth:Number(byId('depth').value),max_redirects:Number(byId('redirects').value),timeout_ms:Number(byId('timeout').value),total_timeout_ms:Number(byId('total-timeout').value),check_links:byId('links').checked,check_console:byId('console').checked,check_resources:byId('resources').checked,check_performance:byId('performance').checked,check_security_headers:byId('headers').checked,allow_subdomains:byId('subdomains').checked,allow_private_networks:byId('private-network').checked,portal_hosts:splitList(byId('portal-hosts').value),resource_hosts:splitList(byId('resource-hosts').value),credential_hosts:splitList(byId('credential-hosts').value),query_parameter_policy:byId('query-policy').value,allowed_query_parameters:splitList(byId('query-parameters').value),slow_page_threshold_ms:Number(byId('slow-threshold').value),render_settle_ms:Number(byId('render-settle').value),max_navigation_actions:Number(byId('navigation-actions').value),max_discovery_scrolls:Number(byId('discovery-scrolls').value),authentication:authenticationPayload(),allow_mutations:false};
+    payload.approved_read_post_operations = approvedReadPostOperations();
+    payload.large_resource_threshold_bytes = Number(byId('large-resource-threshold').value) * 1024;
+    payload.large_image_threshold_bytes = Number(byId('large-image-threshold').value) * 1024;
   } catch (error) { notify(error.message, true); return; }
   clearTransientCredentials();
   runButton.disabled = true;
