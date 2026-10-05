@@ -58,7 +58,9 @@ from app.network import (
     SAFE_HTTP_METHODS,
     PassiveNetworkObserver,
     ReadOnlyPolicy,
+    RouteNetworkActivity,
     load_read_only_policy,
+    summarize_route_api_coverage,
 )
 from app.reporting import (
     aggregate_api_events,
@@ -105,8 +107,8 @@ SECURITY_HEADERS = (
 COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
     "ac", "co", "com", "edu", "gov", "net", "org",
 })
-VALIDATOR_VERSION = "1.7.0"
-REPORT_SCHEMA_VERSION = "2.1"
+VALIDATOR_VERSION = "1.8.0"
+REPORT_SCHEMA_VERSION = "2.2"
 
 
 @asynccontextmanager
@@ -857,6 +859,7 @@ async def execute_scan(
                 failed_resources: list[dict] = []
                 api_events: list[dict] = []
                 network_observer = PassiveNetworkObserver(api_events)
+                route_network_activity = RouteNetworkActivity()
                 resource_events: list[dict] = []
                 scan_api_events = api_events
                 scan_resource_events = resource_events
@@ -954,6 +957,7 @@ async def execute_scan(
                         return
                     request_started[id(request)] = time.perf_counter()
                     request_routes[id(request)] = active_route_id
+                    route_network_activity.request_started(request, active_route_id)
                     request_observation[id(request)] = (
                         request_phase(request),
                         api_importance(request),
@@ -1026,6 +1030,7 @@ async def execute_scan(
                     await route.abort("blockedbyclient")
 
                 def record_failed_request(request):
+                    route_network_activity.request_finished(request)
                     duration_ms, initiating_route, phase, importance = request_timing(request)
                     key = request_event_key(request)
                     reasons = validator_blocks.get(key)
@@ -1076,6 +1081,9 @@ async def execute_scan(
                             "status": None,
                             "error": sanitized_diagnostic(request.failure or "Request failed"),
                         })
+
+                def record_request_finished(request):
+                    route_network_activity.request_finished(request)
 
                 def record_response(response):
                     duration_ms, initiating_route, phase, importance = request_timing(response.request)
@@ -1329,6 +1337,7 @@ async def execute_scan(
 
                 context.on("request", record_request)
                 context.on("requestfailed", record_failed_request)
+                context.on("requestfinished", record_request_finished)
                 context.on("response", record_response)
                 await context.route("**/*", route_guard)
                 page = await context.new_page()
@@ -1467,11 +1476,20 @@ async def execute_scan(
                             navigation_type=navigation_mode,
                         )
                         try:
-                            response, route_transition_succeeded = await perform_route_navigation(
+                            response, route_transition_succeeded, activation_method = await perform_route_navigation(
                                 page,
                                 url,
                                 navigation_mode,
                                 min(req.timeout_ms, remaining_ms),
+                                label=route_label,
+                                source=route_source,
+                            )
+                            log_event(
+                                logging.INFO,
+                                "ROUTE_ACTIVATION_COMPLETED",
+                                scan_id=scan_id,
+                                current_route=active_route_id,
+                                activation_method=activation_method,
                             )
                             final_raw_url = page.url
                             final_url = sanitized_url(final_raw_url)
@@ -1573,6 +1591,25 @@ async def execute_scan(
                                     req.timeout_ms,
                                     max(1000, req.render_settle_ms * 4),
                                 ),
+                                network_activity=lambda: route_network_activity.snapshot(
+                                    active_route_id
+                                ),
+                                minimum_observation_ms=min(
+                                    req.timeout_ms,
+                                    max(500, min(1000, req.render_settle_ms + 250)),
+                                ),
+                                network_quiet_ms=max(
+                                    500, min(1000, req.render_settle_ms)
+                                ),
+                            )
+                            log_event(
+                                logging.INFO,
+                                "ROUTE_SETTLE_COMPLETED",
+                                scan_id=scan_id,
+                                current_route=active_route_id,
+                                settle_reason=render_health.get("settle_reason"),
+                                settle_elapsed_ms=render_health.get("settle_elapsed_ms"),
+                                network_pending=render_health.get("network_pending"),
                             )
                             frame_observations = [
                                 {
@@ -1930,6 +1967,7 @@ async def execute_scan(
                         and event.get("block_reason") == "READ_ONLY_MUTATION_BLOCKED"
                         for event in page_api_events
                     )
+                    api_coverage = summarize_route_api_coverage(page_api_events)
                     final_identity = normalize_route_url(
                         final_raw_url,
                         query_policy=req.query_parameter_policy,
@@ -2015,6 +2053,10 @@ async def execute_scan(
                         "failed_required_api_count": failed_required_api_count,
                         "failed_optional_api_count": failed_optional_api_count,
                         "api_network_failure_count": api_network_failure_count,
+                        **api_coverage,
+                        "route_render_coverage": (
+                            "ROUTE_RENDERED" if render_health is not None else "NOT_RENDERED"
+                        ),
                         "resources": page_resource_events,
                         "websockets": page_websockets,
                         "event_streams": page_event_streams,

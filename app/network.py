@@ -32,6 +32,102 @@ POLICY_CLASSIFICATIONS = frozenset({
 })
 
 
+def classify_traffic(
+    *,
+    method: str,
+    endpoint: str,
+    resource_type: str,
+    phase: str,
+    blocked_by_validator: bool = False,
+) -> str:
+    """Classify safe network metadata without inspecting headers or bodies."""
+    if blocked_by_validator:
+        return "VALIDATOR_BLOCKED"
+    normalized_type = resource_type.lower()
+    normalized_path = endpoint.lower()
+    normalized_phase = phase.upper()
+    if normalized_type == "document":
+        return "DOCUMENT"
+    if normalized_phase == "AUTHENTICATION":
+        return "AUTH_API"
+    if normalized_phase == "SESSION_REFRESH":
+        return "SESSION_REFRESH"
+    if normalized_type not in {"xhr", "fetch"}:
+        return "STATIC_RESOURCE"
+    if normalized_path.endswith("/config.json") or normalized_path == "/config.json":
+        return "MICROFRONTEND_CONFIG"
+    if any(marker in normalized_path for marker in (
+        "/analytics", "/beacon", "/collect", "/metrics", "/telemetry",
+    )):
+        return "TELEMETRY"
+    return "APPLICATION_API"
+
+
+class RouteNetworkActivity:
+    """Track bounded route activity without retaining request secrets."""
+
+    def __init__(self) -> None:
+        self._pending: dict[int, str | None] = {}
+        self._last_activity: dict[str | None, float] = {}
+        self._generation: dict[str | None, int] = {}
+
+    def request_started(self, request: Any, route_id: str | None) -> None:
+        if str(request.resource_type).lower() in {"websocket", "eventsource"}:
+            return
+        key = id(request)
+        if key in self._pending:
+            return
+        self._pending[key] = route_id
+        self._touch(route_id)
+
+    def request_finished(self, request: Any) -> None:
+        key = id(request)
+        if key not in self._pending:
+            return
+        route_id = self._pending.pop(key)
+        self._touch(route_id)
+
+    def snapshot(self, route_id: str | None) -> dict[str, int | float]:
+        return {
+            "generation": self._generation.get(route_id, 0),
+            "pending": sum(value == route_id for value in self._pending.values()),
+            "last_activity": self._last_activity.get(route_id, 0.0),
+        }
+
+    def _touch(self, route_id: str | None) -> None:
+        self._last_activity[route_id] = time.perf_counter()
+        self._generation[route_id] = self._generation.get(route_id, 0) + 1
+
+
+def summarize_route_api_coverage(events: list[dict[str, Any]]) -> dict[str, int | str]:
+    """Report business-API coverage separately from config and authentication."""
+    application_events = [
+        event for event in events
+        if (
+            event.get("traffic_category") == "APPLICATION_API"
+            or (
+                event.get("traffic_category") == "VALIDATOR_BLOCKED"
+                and event.get("resource_type") in {"xhr", "fetch"}
+                and not str(event.get("endpoint") or "").lower().endswith("/config.json")
+                and event.get("phase") not in {"AUTHENTICATION", "SESSION_REFRESH"}
+            )
+        )
+    ]
+    blocked = sum(bool(event.get("blocked_by_validator")) for event in application_events)
+    executed = len(application_events) - blocked
+    return {
+        "api_coverage": (
+            "APPLICATION_API_OBSERVED" if executed else
+            "APPLICATION_API_BLOCKED" if blocked else
+            "NO_APPLICATION_API_OBSERVED"
+        ),
+        "apis_observed": len(events),
+        "application_apis_observed": len(application_events),
+        "application_apis_executed": executed,
+        "blocked_api_attempts": blocked,
+    }
+
+
 def normalize_api_endpoint(path: str) -> str:
     """Return a query-free, conservatively normalized and redacted API path."""
     if not path:
@@ -78,15 +174,25 @@ class ApprovedRequestRule:
     host: str
     path: str
     classification: str
+    path_pattern: bool = False
 
     def matches(self, method: str, url: str) -> bool:
         parsed = urlparse(url)
-        return (
-            method.upper() == self.method
-            and normalized_host(parsed.hostname or "") == self.host
-            # The execution policy is exact. Inventory normalization must never
-            # broaden an administrator-approved path into a wildcard.
-            and (parsed.path or "/") == self.path
+        if (
+            method.upper() != self.method
+            or normalized_host(parsed.hostname or "") != self.host
+        ):
+            return False
+        candidate = parsed.path or "/"
+        if not self.path_pattern:
+            # Inventory normalization must never broaden an administrator-approved
+            # execution path into a wildcard.
+            return candidate == self.path
+        expected_segments = self.path.strip("/").split("/")
+        candidate_segments = candidate.strip("/").split("/")
+        return len(expected_segments) == len(candidate_segments) and all(
+            expected == "{segment}" or expected == actual
+            for expected, actual in zip(expected_segments, candidate_segments)
         )
 
 
@@ -148,7 +254,13 @@ def load_read_only_policy(
             raise ValueError("Each safe application request rule must be an object")
         method = str(item.get("method") or "").strip().upper()
         host = normalized_host(str(item.get("host") or ""))
-        raw_path = str(item.get("path") or "").strip()
+        has_exact_path = "path" in item
+        has_path_pattern = "path_pattern" in item
+        if has_exact_path == has_path_pattern:
+            raise ValueError("Policy rule must configure exactly one path or path_pattern")
+        raw_path = str(
+            item.get("path") if has_exact_path else item.get("path_pattern")
+        ).strip()
         classification = str(
             item.get("classification")
             or ("APPROVED_READ_POST" if method == "POST" else "APPROVED_READ_REQUEST")
@@ -158,7 +270,24 @@ def load_read_only_policy(
         if not host or "/" in host or "://" in host:
             raise ValueError("Policy rule host must be an exact hostname")
         if not raw_path.startswith("/") or "?" in raw_path or "#" in raw_path:
-            raise ValueError("Policy rule path must be an exact query-free absolute path")
+            raise ValueError("Policy rule path must be a query-free absolute path")
+        if has_exact_path and any(marker in raw_path for marker in ("*", "{", "}")):
+            raise ValueError("Exact policy paths cannot contain wildcard syntax")
+        if has_path_pattern:
+            segments = [segment for segment in raw_path.split("/") if segment]
+            literals = [segment for segment in segments if segment != "{segment}"]
+            if (
+                len(segments) < 3
+                or len(literals) < 2
+                or segments[0] == "{segment}"
+                or any(
+                    segment != "{segment}" and not re.fullmatch(r"[A-Za-z0-9._~-]+", segment)
+                    for segment in segments
+                )
+            ):
+                raise ValueError(
+                    "Policy path_pattern must be segment-bounded with at least two literal segments"
+                )
         if classification not in POLICY_CLASSIFICATIONS:
             raise ValueError("Policy rule classification is not supported")
         rules.append(ApprovedRequestRule(
@@ -166,6 +295,7 @@ def load_read_only_policy(
             host=host,
             path=raw_path,
             classification=classification,
+            path_pattern=has_path_pattern,
         ))
 
     gates: list[AccessGateRule] = []
@@ -204,6 +334,12 @@ class PassiveNetworkObserver:
             return existing
         method = str(request.method).upper()
         safe_url, host, endpoint = safe_api_identity(str(request.url))
+        try:
+            frame_identity = (
+                "MAIN_FRAME" if request.frame.parent_frame is None else "CHILD_FRAME"
+            )
+        except Exception:
+            frame_identity = "UNKNOWN_FRAME"
         event: dict[str, Any] = {
             "url": safe_url,
             "host": host,
@@ -221,10 +357,17 @@ class PassiveNetworkObserver:
             "duration_ms": None,
             "initiating_route": initiating_route,
             "main_document": main_document,
+            "frame_identity": frame_identity,
             "request_classification": "SAFE_METHOD" if method in SAFE_HTTP_METHODS else "UNKNOWN",
             "allowed_by_policy": method in SAFE_HTTP_METHODS,
             "target_reached": None,
             "lifecycle": "REQUESTED",
+            "traffic_category": classify_traffic(
+                method=method,
+                endpoint=endpoint,
+                resource_type=str(request.resource_type),
+                phase=phase,
+            ),
             "_started_at": time.perf_counter(),
         }
         self._events_by_request[key] = event
@@ -249,6 +392,12 @@ class PassiveNetworkObserver:
             event["phase"] = phase
         if importance is not None:
             event["importance"] = importance
+        event["traffic_category"] = classify_traffic(
+            method=str(event.get("method") or "GET"),
+            endpoint=str(event.get("endpoint") or "/"),
+            resource_type=str(event.get("resource_type") or "other"),
+            phase=str(event.get("phase") or "VALIDATION"),
+        )
         return event
 
     def mark_blocked(
@@ -270,6 +419,7 @@ class PassiveNetworkObserver:
             "lifecycle": "BLOCKED",
             "duration_ms": self._duration(event),
         })
+        event["traffic_category"] = "VALIDATOR_BLOCKED"
         return event
 
     def record_response(self, request: Any, status: int) -> dict[str, Any] | None:

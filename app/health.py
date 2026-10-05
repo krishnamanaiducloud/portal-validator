@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from typing import Any
 
 from app.network import safe_api_identity
@@ -80,15 +81,26 @@ async def wait_for_render_settle(
     *,
     settle_ms: int,
     maximum_ms: int,
+    network_activity: Callable[[], dict[str, int | float]] | None = None,
+    minimum_observation_ms: int = 500,
+    network_quiet_ms: int = 500,
 ) -> dict[str, Any]:
-    """Wait for bounded DOM/render stability without relying on network-idle."""
+    """Wait for bounded DOM stability and route-scoped network quiet.
+
+    Long-lived sockets/event streams are excluded by the activity tracker. The
+    maximum remains authoritative so polling portals cannot hold a scan open.
+    """
     if settle_ms <= 0:
         return await capture_render_health(page)
     maximum_ms = max(settle_ms, maximum_ms)
-    deadline = time.perf_counter() + (maximum_ms / 1000)
+    started = time.perf_counter()
+    deadline = started + (maximum_ms / 1000)
     stable_since: float | None = None
     previous: tuple[object, ...] | None = None
     latest: dict[str, Any] = {}
+    initial_activity = network_activity() if network_activity is not None else {}
+    last_generation = int(initial_activity.get("generation", 0))
+    network_quiet_since = started
     while True:
         latest = await capture_render_health(page)
         signature = (
@@ -100,14 +112,38 @@ async def wait_for_render_settle(
             latest["title"],
         )
         now = time.perf_counter()
+        activity = network_activity() if network_activity is not None else {}
+        generation = int(activity.get("generation", 0))
+        pending = int(activity.get("pending", 0))
+        if generation != last_generation:
+            last_generation = generation
+            network_quiet_since = now
         if signature == previous:
             stable_since = stable_since or now
-            if (now - stable_since) * 1000 >= settle_ms:
+            dom_stable = (now - stable_since) * 1000 >= settle_ms
+            observed_minimum = (now - started) * 1000 >= minimum_observation_ms
+            network_quiet = (
+                pending == 0
+                and (now - network_quiet_since) * 1000 >= network_quiet_ms
+            )
+            if dom_stable and observed_minimum and network_quiet:
+                latest.update({
+                    "settle_reason": "DOM_AND_NETWORK_QUIET",
+                    "network_pending": pending,
+                    "network_activity_generation": generation,
+                    "settle_elapsed_ms": round((now - started) * 1000),
+                })
                 return latest
         else:
             previous = signature
             stable_since = None
         if now >= deadline:
+            latest.update({
+                "settle_reason": "BOUNDED_TIMEOUT",
+                "network_pending": pending,
+                "network_activity_generation": generation,
+                "settle_elapsed_ms": round((now - started) * 1000),
+            })
             return latest
         await asyncio.sleep(min(0.1, max(0.01, deadline - now)))
 

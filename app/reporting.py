@@ -596,6 +596,7 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 "request_classifications": Counter(),
                 "block_reasons": Counter(),
                 "importance": Counter(),
+                "traffic_categories": Counter(),
             })
             item["calls"] += 1
             phase = str(event.get("phase") or "VALIDATION").upper()
@@ -612,6 +613,9 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 item["first_seen"] = item["first_seen"] or observed_at
                 item["last_seen"] = observed_at
             item["importance"][str(event.get("importance") or "UNKNOWN")] += 1
+            item["traffic_categories"][str(
+                event.get("traffic_category") or "APPLICATION_API"
+            )] += 1
             route_id = event.get("initiating_route") or result_route_id
             if route_id:
                 item["routes"].add(route_id)
@@ -647,6 +651,7 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
         classifications = dict(item.pop("request_classifications"))
         block_reasons = dict(item.pop("block_reasons"))
         importance = dict(item.pop("importance"))
+        traffic_categories = dict(item.pop("traffic_categories"))
         target_failures = item["status_4xx"] + item["status_5xx"] + item["network_failures"]
         status_counts = {
             "2xx": item["status_2xx"],
@@ -676,6 +681,12 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             "classification_counts": classifications,
             "block_reasons": block_reasons,
             "importance_counts": importance,
+            "traffic_categories": traffic_categories,
+            "traffic_category": max(
+                traffic_categories,
+                key=traffic_categories.get,
+                default="APPLICATION_API",
+            ),
             "status_counts": status_counts,
             "target_failure_count": target_failures,
             "observation_outcome": observation_outcome,

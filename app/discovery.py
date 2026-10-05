@@ -524,6 +524,96 @@ SAME_DOCUMENT_TRANSITION_SCRIPT = r"""
 """
 
 
+SEMANTIC_ROUTE_ACTIVATION_SCRIPT = r"""
+({target, expectedLabel, source}) => {
+  const candidate = new URL(target, document.baseURI);
+  const dangerous = new Set([
+    'add','approve','buy','cancel','checkout','confirm','create','delete','deploy','destroy',
+    'disable','edit','enable','execute','export','import','logout','pay','purchase','reboot',
+    'reject','remove','restart','save','send','sign out','signout','start','stop','submit',
+    'terminate','update','upload'
+  ]);
+  const selector = [
+    'a[href]', 'area[href]', '[role="link"][href]', '[role="link"][data-href]',
+    'nav [data-url]', '[role="navigation"] [data-url]', '[role="menuitem"][data-href]',
+    '[role="tab"][data-href]', 'nav button[aria-controls]',
+    '[role="navigation"] button[aria-controls]', '[role="menuitem"][aria-controls]',
+    '[role="tab"][aria-controls]'
+  ].join(',');
+  const elements = [];
+  const visit = (root) => {
+    for (const element of root.querySelectorAll(selector)) elements.push(element);
+    for (const element of root.querySelectorAll('*')) {
+      if (element.shadowRoot) visit(element.shadowRoot);
+    }
+  };
+  visit(document);
+  const expected = (expectedLabel || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const matches = [];
+  for (let index = 0; index < elements.length && index < 500; index += 1) {
+    const element = elements[index];
+    const label = (
+      element.getAttribute('aria-label') || element.textContent || element.getAttribute('title') || ''
+    ).replace(/\s+/g, ' ').trim().toLowerCase();
+    if (Array.from(dangerous).some(word => label.includes(word))) continue;
+    if (element.closest('form') || element.hasAttribute('disabled') ||
+        element.getAttribute('aria-disabled') === 'true') continue;
+    const raw = element.getAttribute('href') || element.getAttribute('data-href') ||
+      element.getAttribute('data-url');
+    let urlMatches = false;
+    if (raw) {
+      try {
+        const resolved = new URL(raw, document.baseURI);
+        urlMatches = resolved.origin === candidate.origin &&
+          resolved.pathname === candidate.pathname && resolved.hash === candidate.hash;
+      } catch (_) {}
+    }
+    const semanticControl = source === 'safe-click' && expected && label === expected &&
+      element.hasAttribute('aria-controls') &&
+      ['tab', 'menuitem', ''].includes((element.getAttribute('role') || '').toLowerCase());
+    if (urlMatches || semanticControl) matches.push(index);
+  }
+  return matches;
+}
+"""
+
+
+async def activate_semantic_route(
+    page,
+    url: str,
+    *,
+    label: str | None,
+    source: str | None,
+    timeout_ms: int,
+) -> bool:
+    """Use the closest safe user-navigation equivalent when it is unambiguous."""
+    indexes = await page.evaluate(
+        SEMANTIC_ROUTE_ACTIVATION_SCRIPT,
+        {"target": url, "expectedLabel": label or "", "source": source or ""},
+    )
+    if not isinstance(indexes, list) or not indexes:
+        return False
+    selector = ",".join((
+        "a[href]", "area[href]", '[role="link"][href]',
+        '[role="link"][data-href]', "nav [data-url]",
+        '[role="navigation"] [data-url]', '[role="menuitem"][data-href]',
+        '[role="tab"][data-href]', "nav button[aria-controls]",
+        '[role="navigation"] button[aria-controls]',
+        '[role="menuitem"][aria-controls]', '[role="tab"][aria-controls]',
+    ))
+    # Playwright CSS locators pierce open shadow roots, matching discovery behavior.
+    candidates = page.locator(selector)
+    for index in indexes:
+        try:
+            candidate = candidates.nth(int(index))
+            if await candidate.is_visible():
+                await candidate.click(timeout=min(timeout_ms, 5000))
+                return True
+        except Exception:
+            continue
+    return False
+
+
 async def expand_safe_navigation(page, maximum: int) -> dict[str, object]:
     result = await page.evaluate(EXPAND_SAFE_NAVIGATION_SCRIPT, maximum)
     return {
@@ -573,7 +663,15 @@ async def discover_page_routes(page, maximum_scrolls: int = 3) -> list[Discovere
     return routes
 
 
-async def perform_route_navigation(page, url: str, mode: str, timeout_ms: int):
+async def perform_route_navigation(
+    page,
+    url: str,
+    mode: str,
+    timeout_ms: int,
+    *,
+    label: str | None = None,
+    source: str | None = None,
+):
     """Navigate a document or transition an existing SPA document.
 
     Playwright correctly returns no Response for same-document transitions; callers use
@@ -583,10 +681,17 @@ async def perform_route_navigation(page, url: str, mode: str, timeout_ms: int):
         response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         if response is None:
             raise RuntimeError("Document navigation completed without an HTTP response")
-        return response, False
+        return response, False, "DOCUMENT"
     if mode not in SAME_DOCUMENT_NAVIGATIONS:
         raise RuntimeError("Unsupported navigation mode")
-    transitioned = await page.evaluate(
+    activated = await activate_semantic_route(
+        page,
+        url,
+        label=label,
+        source=source,
+        timeout_ms=timeout_ms,
+    )
+    transitioned = activated or await page.evaluate(
         SAME_DOCUMENT_TRANSITION_SCRIPT,
         {"target": url, "mode": mode},
     )
@@ -602,4 +707,4 @@ async def perform_route_navigation(page, url: str, mode: str, timeout_ms: int):
         raise RuntimeError("Same-document route transition did not reach the requested route") from exc
     if page.is_closed():
         raise RuntimeError("Browser page closed during same-document route transition")
-    return None, True
+    return None, True, "SEMANTIC_CONTROL" if activated else "SYNTHETIC_FALLBACK"

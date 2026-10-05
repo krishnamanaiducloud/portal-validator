@@ -10,6 +10,7 @@ from app.network import (
     PassiveNetworkObserver,
     load_read_only_policy,
     normalize_api_endpoint,
+    summarize_route_api_coverage,
 )
 from app.main import acknowledge_configured_access_gate
 
@@ -121,11 +122,60 @@ def test_explicit_policy_is_exact_generic_and_supports_session_refresh():
     assert policy.match("DELETE", "https://portal.example.com/api/read-query") is None
 
 
+def test_read_only_policy_supports_only_segment_bounded_patterns():
+    policy = load_read_only_policy(raw=json.dumps({
+        "safe_application_requests": [{
+            "method": "POST",
+            "host": "portal.example.com",
+            "path_pattern": "/api/items/{segment}/query",
+            "classification": "APPROVED_READ_POST",
+        }],
+    }))
+    assert policy.match("POST", "https://portal.example.com/api/items/42/query")
+    assert policy.match("POST", "https://portal.example.com/api/items/42/update") is None
+    assert policy.match("POST", "https://portal.example.com/api/items/42/query/extra") is None
+
+    for unsafe in ("/**", "/api/{segment}", "/{segment}/v1/query"):
+        with pytest.raises(ValueError):
+            load_read_only_policy(raw=json.dumps({
+                "safe_application_requests": [{
+                    "method": "POST",
+                    "host": "portal.example.com",
+                    "path_pattern": unsafe,
+                }],
+            }))
+
+
 def test_api_path_normalization_is_conservative_and_redacts_sensitive_segments():
     assert normalize_api_endpoint("/api/users/123") == "/api/users/{id}"
     assert normalize_api_endpoint("/api/users/456") == "/api/users/{id}"
     assert normalize_api_endpoint("/api/v1/users") == "/api/v1/users"
     assert normalize_api_endpoint("/api/token/super-secret-value") == "/api/token/{redacted}"
+
+
+def test_route_api_coverage_excludes_config_and_reports_blocked_business_api():
+    coverage = summarize_route_api_coverage([
+        {
+            "traffic_category": "MICROFRONTEND_CONFIG",
+            "resource_type": "fetch",
+            "endpoint": "/micro/dashboard/config.json",
+            "blocked_by_validator": False,
+        },
+        {
+            "traffic_category": "VALIDATOR_BLOCKED",
+            "resource_type": "fetch",
+            "endpoint": "/api/dashboard-query",
+            "phase": "ROUTE_VALIDATION",
+            "blocked_by_validator": True,
+        },
+    ])
+    assert coverage == {
+        "api_coverage": "APPLICATION_API_BLOCKED",
+        "apis_observed": 2,
+        "application_apis_observed": 1,
+        "application_apis_executed": 0,
+        "blocked_api_attempts": 1,
+    }
 
 
 @pytest.mark.asyncio

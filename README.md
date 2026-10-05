@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.7.0 is an authenticated, read-only browser health validator for public,
+Portal Validator 1.8.0 is an authenticated, read-only browser health validator for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -52,6 +52,9 @@ storage are never captured. Route totals and unique API totals are independent.
 
 Administrators may approve an exact method + hostname + query-free path for a
 logically read-only application request, session refresh, or access-gate action.
+When an identifier varies, `path_pattern` may replace one or more complete path
+segments with `{segment}`. Patterns must contain at least three segments and two
+literal segments; globbing, `**`, prefix rules, and broad method rules are rejected.
 Set `PORTAL_VALIDATOR_READ_ONLY_POLICY` to JSON, or mount the same JSON and set
 `PORTAL_VALIDATOR_READ_ONLY_POLICY_FILE` (maximum 64 KiB). Configure only one:
 
@@ -63,6 +66,12 @@ Set `PORTAL_VALIDATOR_READ_ONLY_POLICY` to JSON, or mount the same JSON and set
       "host": "portal.example.com",
       "path": "/api/read-query",
       "classification": "APPROVED_READ_POST"
+    },
+    {
+      "method": "POST",
+      "host": "portal.example.com",
+      "path_pattern": "/api/items/{segment}/query",
+      "classification": "APPROVED_READ_POST"
     }
   ],
   "access_gates": [
@@ -71,8 +80,8 @@ Set `PORTAL_VALIDATOR_READ_ONLY_POLICY` to JSON, or mount the same JSON and set
 }
 ```
 
-Rules use exact hosts and paths; URL wording, response status, and request body
-never establish safety. An access-gate selector must resolve to one visible,
+Rules use exact hosts and exact or segment-bounded paths; URL wording, response
+status, and request body never establish safety. An access-gate selector must resolve to one visible,
 explicitly approved control, and any non-safe request caused by it still needs
 its own safe-request rule. Authentication POSTs retain their separate narrow
 main-frame authentication-chain exception. Browser-native session refresh runs
@@ -178,10 +187,10 @@ compatible with an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.7.0 .
+docker build -t mohankrishna999/portal-validator:1.8.0 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.7.0 \
-  -t mohankrishna999/portal-validator:1.7.0-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.8.0 \
+  -t mohankrishna999/portal-validator:1.8.0-debug .
 ```
 
 The debug image adds `debugpy`, hot reload, and port 5678. It inherits the same
@@ -195,7 +204,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.7.0
+  mohankrishna999/portal-validator:1.8.0
 ```
 
 ## OpenShift
@@ -282,7 +291,8 @@ document into a load failure. `tls_status=TRUSTED` means Chromium completed cert
 validation; it does not claim independent inspection of the origin certificate
 when an enterprise TLS proxy is present.
 
-Report schema `2.1` keeps route identity independent from the rendered title.
+Report schema `2.2` keeps route identity independent from the rendered title and
+adds route-level application API coverage plus network-settle evidence.
 It preserves canonical hash/hashbang/history paths and exposes `route_name`,
 `route_name_source`, `route_name_confidence`, `display_path`, `spa_route`, and
 deduplicated discovery provenance. Navigation labels and accessible names rank
@@ -315,6 +325,14 @@ from natural application activity; the validator never probes or replays a
 discovered endpoint. Observed API Inventory is therefore not an active API
 scanner. Document-level security recommendations are evaluated on
 actual document responses and are not repeated for each inherited SPA route.
+
+Same-document routes preferentially reactivate the originally discovered safe
+semantic link/menu/tab control. Direct history/hash transitions are a fallback.
+After activation, a bounded adaptive settle window combines DOM stability with
+route-scoped network quiet so delayed component and microfrontend requests are
+attributed before the route closes. Config traffic is reported separately from
+application API coverage; blocked business requests remain visible without being
+treated as target network failures.
 
 Logs are structured JSON with a per-scan ID. URLs, query secrets, credentials,
 tokens, cookies, storage state, and certificate/private-key material are

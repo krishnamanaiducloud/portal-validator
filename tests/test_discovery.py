@@ -225,11 +225,12 @@ async def test_synthetic_spa_routes_render_without_additional_document_requests(
                 context = await browser.new_context()
                 await context.add_init_script(script=ROUTE_OBSERVER_SCRIPT)
                 page = await context.new_page()
-                response, transitioned = await perform_route_navigation(
+                response, transitioned, activation = await perform_route_navigation(
                     page, f"{origin}/", DOCUMENT_NAVIGATION, 5000,
                 )
                 assert response.status == 200
                 assert transitioned is False
+                assert activation == "DOCUMENT"
                 await page.click("#reports")
                 discovered = await discover_page_routes(page)
                 reports = next(route for route in discovered if route.url.endswith("/reports"))
@@ -240,11 +241,12 @@ async def test_synthetic_spa_routes_render_without_additional_document_requests(
                     (f"{origin}/dashboard#/health", HASH_ROUTE_TRANSITION, "#/health"),
                     (f"{origin}/settings", SAFE_CLICK_NAVIGATION, "/settings"),
                 ):
-                    response, transitioned = await perform_route_navigation(
+                    response, transitioned, activation = await perform_route_navigation(
                         page, target, mode, 5000,
                     )
                     assert response is None
                     assert transitioned is True
+                    assert activation in {"SEMANTIC_CONTROL", "SYNTHETIC_FALLBACK"}
                     assert expected_text in await page.locator("#content").inner_text()
                 assert Handler.document_requests == 1
             finally:
