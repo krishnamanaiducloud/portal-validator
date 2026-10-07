@@ -15,6 +15,12 @@ from app.security import JWT_RE, SENSITIVE_KEYS, normalized_host, sanitize_text,
 
 
 SAFE_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+PUBLIC_POLICY_NAMES = {
+    "APPROVED_READ_POST": "APPROVED_READ_ONLY",
+    "APPROVED_READ_REQUEST": "APPROVED_READ_ONLY",
+    "BLOCKED_MUTATION": "READ_ONLY_BLOCKED",
+    "READ_ONLY_BLOCK": "READ_ONLY_BLOCKED",
+}
 VALID_METHOD_RE = re.compile(r"^[A-Z][A-Z0-9-]{0,31}$")
 UUID_SEGMENT_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
@@ -83,25 +89,40 @@ def classify_traffic(
     return "APPLICATION_API"
 
 
+def request_identity(request: Any) -> Any:
+    """Stable weak-referenceable identity across Playwright API wrappers.
+
+    This identity is used only as a weak mapping key, never serialized or logged.
+    Keeping the underlying implementation weak avoids retaining its raw headers
+    or body after Playwright finishes/disposes the request.
+    """
+    return getattr(request, "_impl_obj", request)
+
+
+def public_policy_classification(classification: str) -> str:
+    """Stable display vocabulary, retaining legacy execution classifications."""
+    return PUBLIC_POLICY_NAMES.get(classification, classification)
+
+
 class RouteNetworkActivity:
     """Track bounded route activity without retaining request secrets."""
 
     def __init__(self) -> None:
-        self._pending: dict[int, str | None] = {}
+        self._pending: weakref.WeakKeyDictionary[Any, str | None] = weakref.WeakKeyDictionary()
         self._last_activity: dict[str | None, float] = {}
         self._generation: dict[str | None, int] = {}
 
-    def request_started(self, request: Any, route_id: str | None) -> None:
-        if str(request.resource_type).lower() in {"websocket", "eventsource"}:
+    def request_started(self, request: Any, route_id: str | None, *, relevant: bool = True) -> None:
+        if not relevant or str(request.resource_type).lower() in {"websocket", "eventsource"}:
             return
-        key = id(request)
+        key = request_identity(request)
         if key in self._pending:
             return
         self._pending[key] = route_id
         self._touch(route_id)
 
     def request_finished(self, request: Any) -> None:
-        key = id(request)
+        key = request_identity(request)
         if key not in self._pending:
             return
         route_id = self._pending.pop(key)
@@ -427,6 +448,7 @@ class PassiveNetworkObserver:
             "main_document": main_document,
             "frame_identity": frame_identity,
             "request_classification": "SAFE_METHOD" if method in SAFE_HTTP_METHODS else "UNKNOWN",
+            "policy_classification": "SAFE_METHOD" if method in SAFE_HTTP_METHODS else "UNKNOWN",
             "allowed_by_policy": method in SAFE_HTTP_METHODS,
             "target_reached": None,
             "lifecycle": "REQUESTED",
@@ -454,6 +476,7 @@ class PassiveNetworkObserver:
         if event is None:
             return None
         event["request_classification"] = classification
+        event["policy_classification"] = public_policy_classification(classification)
         event["allowed_by_policy"] = True
         event["lifecycle"] = "ALLOWED"
         event.update(policy_evaluated=True, policy_decision="ALLOW", policy_reason=classification)
@@ -483,6 +506,7 @@ class PassiveNetworkObserver:
             "blocked_by_validator": True,
             "block_reason": reason,
             "request_classification": classification,
+            "policy_classification": public_policy_classification(classification),
             "allowed_by_policy": False,
             "target_reached": False,
             "lifecycle": "BLOCKED",
@@ -574,7 +598,7 @@ class PassiveNetworkObserver:
         # Async API wrappers can themselves be recreated for one underlying
         # request. The implementation's identity is stable throughout its
         # lifecycle; the weak key does not retain its sensitive raw contents.
-        return getattr(request, "_impl_obj", request)
+        return request_identity(request)
 
     @staticmethod
     def _duration(event: dict[str, Any]) -> int | None:

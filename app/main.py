@@ -8,6 +8,7 @@ import os
 import re
 import time
 import uuid
+import weakref
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -61,6 +62,8 @@ from app.network import (
     ReadOnlyPolicy,
     RouteNetworkActivity,
     load_read_only_policy,
+    request_identity,
+    safe_api_identity,
     summarize_route_api_coverage,
 )
 from app.reporting import (
@@ -72,9 +75,10 @@ from app.reporting import (
     aggregate_security_recommendations,
     classify_page_result,
     finding,
+    refresh_route_api_health,
 )
 from app.session import RuntimeSessionStore, load_refresh_config, refresh_browser_session
-from app.resources import build_resource_report, enrich_resource_timings, large_resource_findings, resource_timing_key
+from app.resources import build_resource_report, enrich_resource_timings, large_resource_findings, resource_timing_key, safe_content_type
 from app.scans import ScanCapacityError, ScanJob, ScanRegistry, TERMINAL_STATES
 from app.security import (
     DestinationError,
@@ -202,6 +206,7 @@ class ApprovedReadPostOperation(BaseModel):
 
 
 class ScanRequest(BaseModel):
+    model_config = {"frozen": True}
     target: str = Field(min_length=1, max_length=4096)
     max_pages: int = Field(50, ge=1, le=250)
     max_depth: int = Field(3, ge=0, le=10)
@@ -226,7 +231,11 @@ class ScanRequest(BaseModel):
     slow_page_threshold_ms: int = Field(5000, ge=500, le=120000)
     large_resource_threshold_bytes: int = Field(1048576, ge=1024, le=104857600)
     large_image_threshold_bytes: int = Field(524288, ge=1024, le=104857600)
+    large_js_threshold_bytes: int = Field(1048576, ge=1024, le=104857600)
+    large_css_font_threshold_bytes: int = Field(524288, ge=1024, le=104857600)
     render_settle_ms: int = Field(750, ge=0, le=5000)
+    min_observation_ms: int = Field(500, ge=0, le=10000)
+    network_quiet_ms: int = Field(300, ge=0, le=5000)
     max_navigation_actions: int = Field(20, ge=0, le=50)
     max_discovery_scrolls: int = Field(3, ge=0, le=20)
     authentication: Authentication = Field(default_factory=Authentication)
@@ -670,6 +679,8 @@ async def execute_scan(
 ):
     scan_id = scan_id or str(uuid.uuid4())
     scan_started = time.perf_counter()
+    deadline = scan_started + req.total_timeout_ms / 1000
+    preflight_timeout_reached = False
 
     async def publish_progress(state: str, **values) -> None:
         if progress_callback is None:
@@ -678,7 +689,35 @@ async def execute_scan(
             0,
             req.total_timeout_ms - round((time.perf_counter() - scan_started) * 1000),
         ))
-        await progress_callback(state, **values)
+        # Observability callbacks cannot extend the configured scan budget.
+        # Final report assembly still runs after expiry to preserve coverage.
+        if time.perf_counter() >= deadline:
+            return
+        budget = asyncio.timeout_at(deadline)
+        try:
+            async with budget:
+                await progress_callback(state, **values)
+        except TimeoutError:
+            if not budget.expired():
+                raise
+            log_event(logging.WARNING, "SCAN_PROGRESS_DEADLINE_REACHED", scan_id=scan_id)
+
+    async def resolve_preflight(host: str) -> None:
+        nonlocal preflight_timeout_reached
+        if preflight_timeout_reached or time.perf_counter() >= deadline:
+            preflight_timeout_reached = True
+            return
+        budget = asyncio.timeout_at(deadline)
+        try:
+            async with budget:
+                await _resolve_with_logging(host, req, scan_id)
+        except TimeoutError:
+            if not budget.expired():
+                raise
+            # No browser is started after this. The normal deadline/report
+            # path below records PARTIAL / SCAN_TIMEOUT, not a target failure.
+            preflight_timeout_reached = True
+            log_event(logging.WARNING, "SCAN_PREFLIGHT_DEADLINE_REACHED", scan_id=scan_id)
 
     await publish_progress("STARTING")
     requested_target = req.target.strip()
@@ -690,7 +729,7 @@ async def execute_scan(
         raise HTTPException(400, exc.public_message) from exc
     log_event(logging.INFO, "URL_VALIDATED", scan_id=scan_id, requested_url=requested_target, hostname=root_host)
     try:
-        await _resolve_with_logging(root_host, req, scan_id)
+        await resolve_preflight(root_host)
     except DestinationError as exc:
         log_event(logging.ERROR, exc.classification, scan_id=scan_id, hostname=root_host, error=exc.public_message)
         raise HTTPException(400, exc.public_message) from exc
@@ -720,7 +759,7 @@ async def execute_scan(
     # and does not generally allow that host's unrelated assets or APIs.
     for policy_host in {rule.host for rule in read_only_policy.safe_application_requests}:
         try:
-            await _resolve_with_logging(policy_host, req, scan_id)
+            await resolve_preflight(policy_host)
         except DestinationError as exc:
             raise HTTPException(400, exc.public_message) from exc
     log_event(
@@ -734,14 +773,14 @@ async def execute_scan(
     approved_resource_hosts = {normalized_host(host) for host in req.resource_hosts}
     for host in approved_resource_hosts:
         try:
-            await _resolve_with_logging(host, req, scan_id)
+            await resolve_preflight(host)
         except DestinationError as exc:
             raise HTTPException(400, exc.public_message) from exc
 
     approved_portal_hosts = {normalized_host(host) for host in req.portal_hosts}
     for host in approved_portal_hosts:
         try:
-            await _resolve_with_logging(host, req, scan_id)
+            await resolve_preflight(host)
         except DestinationError as exc:
             raise HTTPException(400, exc.public_message) from exc
 
@@ -763,7 +802,7 @@ async def execute_scan(
                 "Credential host must be an approved portal or resource/API host",
             )
         try:
-            await _resolve_with_logging(host, req, scan_id)
+            await resolve_preflight(host)
         except DestinationError as exc:
             raise HTTPException(400, exc.public_message) from exc
         credential_hosts.add(host)
@@ -878,14 +917,44 @@ async def execute_scan(
     scan_api_events: list[dict] = []
     scan_resource_events: list[dict] = []
     session_expired = False
-    deadline = time.perf_counter() + (req.total_timeout_ms / 1000)
+    active_route_identity: str | None = None
+    network_observer: PassiveNetworkObserver | None = None
+    popup_tasks: set[asyncio.Task] = set()
+    browser_context_count = 0
+    browser_page_count = 0
+    session_refresh: dict[str, object] = {"attempted": False}
 
     await publish_progress(
         "DISCOVERING",
         discovered=len(discovered_routes),
         queued=len(queue),
     )
-    async with SCAN_SEMAPHORE:
+    @asynccontextmanager
+    async def scan_deadline_scope():
+        nonlocal total_timeout_reached
+        budget = asyncio.timeout_at(deadline)
+        try:
+            async with budget:
+                yield
+        except TimeoutError:
+            if not budget.expired() and time.perf_counter() < deadline:
+                raise
+            total_timeout_reached = True
+            if active_route_identity is not None:
+                seen.discard(active_route_identity)
+            log_event(logging.WARNING, "SCAN_DEADLINE_REACHED", scan_id=scan_id)
+        finally:
+            for task in tuple(popup_tasks):
+                task.cancel()
+            if popup_tasks:
+                await asyncio.gather(*tuple(popup_tasks), return_exceptions=True)
+            if network_observer is not None:
+                network_observer.finalize_pending()
+
+
+    async with scan_deadline_scope(), SCAN_SEMAPHORE:
+        if time.perf_counter() >= deadline:
+            raise TimeoutError("Total scan budget expired before browser startup")
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(
                 headless=True,
@@ -894,6 +963,7 @@ async def execute_scan(
             log_event(logging.INFO, "BROWSER_LAUNCHED", scan_id=scan_id)
             try:
                 context = await browser.new_context(**browser_context_options(state_path))
+                browser_context_count += 1
                 await context.add_init_script(script=ROUTE_OBSERVER_SCRIPT)
                 await configure_cookies(context, req, root_host, approved_portal_hosts)
                 page = None
@@ -911,9 +981,10 @@ async def execute_scan(
                 download_events: list[dict] = []
                 frame_events: list[dict] = []
                 popup_routes: list[DiscoveredRoute] = []
-                request_started: dict[int, float] = {}
-                request_routes: dict[int, str | None] = {}
-                request_observation: dict[int, tuple[str, str]] = {}
+                request_started = weakref.WeakKeyDictionary()
+                request_routes = weakref.WeakKeyDictionary()
+                request_observation = weakref.WeakKeyDictionary()
+                request_owners = weakref.WeakKeyDictionary()
                 active_route_id: str | None = None
                 active_route_activation_id: str | None = None
                 current_tracker: NavigationTracker | None = None
@@ -923,9 +994,10 @@ async def execute_scan(
                 validator_blocks: dict[tuple[str, str, str, bool], deque[str]] = defaultdict(deque)
                 acknowledged_access_gates: set[tuple[str, str]] = set()
                 observation_phase = "AUTHENTICATION"
+                popup_origins = weakref.WeakKeyDictionary()
 
                 def record_console_error(message):
-                    if message.type == "error":
+                    if message.type in {"error", "warning"}:
                         console_errors.append(sanitized_diagnostic(message.text))
 
                 def record_page_error(error):
@@ -937,8 +1009,16 @@ async def execute_scan(
                         or request.method.upper() not in SAFE_READ_ONLY_METHODS
                     )
 
+                def request_origin(request):
+                    try:
+                        owner = popup_origins.get(request_identity(request.frame.page))
+                    except Exception:
+                        owner = None
+                    return owner or (active_route_id, active_route_activation_id, observation_phase)
+
                 def api_importance(request) -> str:
-                    if observation_phase == "AUTHENTICATION" or (
+                    phase = request_origin(request)[2]
+                    if phase == "AUTHENTICATION" or (
                         request.method.upper() not in SAFE_READ_ONLY_METHODS
                         and is_main_navigation(request)
                         and authentication_navigation.active
@@ -951,14 +1031,14 @@ async def execute_scan(
                         return "OPTIONAL"
                     return (
                         "REQUIRED"
-                        if observation_phase in {"APPLICATION_BOOTSTRAP", "ROUTE_VALIDATION", "VALIDATION"}
+                        if phase in {"APPLICATION_BOOTSTRAP", "ROUTE_VALIDATION", "VALIDATION"}
                         else "BACKGROUND"
                     )
 
                 def request_phase(request) -> str:
                     if api_importance(request) == "AUTHENTICATION":
                         return "AUTHENTICATION"
-                    return observation_phase
+                    return request_origin(request)[2]
 
                 def is_main_navigation(request) -> bool:
                     try:
@@ -991,22 +1071,27 @@ async def execute_scan(
                         request,
                         phase=request_phase(request),
                         importance=api_importance(request),
-                        initiating_route=active_route_id,
+                        initiating_route=request_origin(request)[0],
                         main_document=is_main_navigation(request),
-                        route_activation_id=active_route_activation_id,
+                        route_activation_id=request_origin(request)[1],
                     )
                     if "_resource_timing_key" not in event:
                         event["_resource_timing_key"] = resource_timing_key(request.url)
                     return event
 
                 def record_request(request):
-                    if id(request) in request_started:
+                    key = request_identity(request)
+                    if key in request_started:
                         ensure_api_observed(request)
                         return
-                    request_started[id(request)] = time.perf_counter()
-                    request_routes[id(request)] = active_route_id
-                    route_network_activity.request_started(request, active_route_id)
-                    request_observation[id(request)] = (
+                    request_started[key] = time.perf_counter()
+                    request_routes[key] = request_origin(request)[0]
+                    request_owners[key] = request_origin(request)[:2]
+                    route_network_activity.request_started(
+                        request, request_origin(request)[0],
+                        relevant=api_importance(request) == "REQUIRED" and request.resource_type not in {"websocket", "eventsource"},
+                    )
+                    request_observation[key] = (
                         request_phase(request),
                         api_importance(request),
                     )
@@ -1028,10 +1113,11 @@ async def execute_scan(
                 def request_timing(
                     request,
                 ) -> tuple[int | None, str | None, str, str]:
-                    started_at = request_started.pop(id(request), None)
-                    route_id = request_routes.pop(id(request), None)
+                    key = request_identity(request)
+                    started_at = request_started.pop(key, None)
+                    route_id = request_routes.pop(key, None)
                     phase, importance = request_observation.pop(
-                        id(request),
+                        key,
                         (request_phase(request), api_importance(request)),
                     )
                     duration = (
@@ -1084,6 +1170,10 @@ async def execute_scan(
                 def record_failed_request(request):
                     route_network_activity.request_finished(request)
                     duration_ms, initiating_route, phase, importance = request_timing(request)
+                    owner = request_owners.pop(
+                        request_identity(request), request_origin(request)[:2],
+                    )
+                    initiating_route = owner[0]
                     key = request_event_key(request)
                     reasons = validator_blocks.get(key)
                     block_reason = reasons.popleft() if reasons else None
@@ -1099,6 +1189,7 @@ async def execute_scan(
                         "block_reason": block_reason,
                         "duration_ms": duration_ms,
                         "initiating_route": initiating_route,
+                        "route_activation_id": owner[1],
                     })
                     if is_api_observation(request):
                         api_event = network_observer.record_failure(
@@ -1140,15 +1231,22 @@ async def execute_scan(
                 def record_request_finished(request):
                     route_network_activity.request_finished(request)
                     network_observer.record_finished(request)
+                    request_owners.pop(request_identity(request), None)
 
                 def record_response(response):
                     duration_ms, initiating_route, phase, importance = request_timing(response.request)
+                    content_type = safe_content_type(response.headers.get("content-type"))
+                    owner = request_owners.get(
+                        request_identity(response.request), request_origin(response.request)[:2],
+                    )
+                    initiating_route = owner[0]
                     if is_api_observation(response.request):
                         api_event = network_observer.record_response(
                             response.request,
                             response.status,
                         )
                         if api_event is not None:
+                            api_event["content_type"] = content_type
                             log_event(
                                 logging.DEBUG,
                                 "API_RESPONSE_OBSERVED",
@@ -1179,10 +1277,12 @@ async def execute_scan(
                             "_resource_timing_key": resource_timing_key(response.url),
                             "resource_type": response.request.resource_type,
                             "status": response.status,
+                            "content_type": content_type,
                             "error": None,
                             "phase": phase,
                             "duration_ms": duration_ms,
                             "initiating_route": initiating_route,
+                            "route_activation_id": owner[1],
                         })
                         if response.status >= 400:
                             failed_resources.append({
@@ -1195,9 +1295,9 @@ async def execute_scan(
                                 "block_reason": None,
                                 "duration_ms": duration_ms,
                                 "initiating_route": initiating_route,
+                                "route_activation_id": owner[1],
                             })
-                    content_type = response.headers.get("content-type", "").lower()
-                    if response.request.resource_type == "eventsource" or "text/event-stream" in content_type:
+                    if response.request.resource_type == "eventsource" or content_type == "text/event-stream":
                         event_streams.append({
                             "url": sanitized_url(response.url),
                             "status": response.status,
@@ -1240,7 +1340,7 @@ async def execute_scan(
 
                 async def record_popup(popup):
                     try:
-                        await popup.wait_for_load_state("domcontentloaded", timeout=min(req.timeout_ms, 10000))
+                        await popup.wait_for_load_state("domcontentloaded", timeout=max(1, min(req.timeout_ms, round((deadline - time.perf_counter()) * 1000))))
                         if popup.url.startswith(("http://", "https://")):
                             popup_routes.append(DiscoveredRoute(
                                 url=popup.url,
@@ -1255,9 +1355,8 @@ async def execute_scan(
                             scan_id=scan_id,
                             error=sanitized_diagnostic(str(exc)),
                         )
-                    finally:
-                        if not popup.is_closed():
-                            await popup.close()
+                    # Keep the naturally opened page alive until context cleanup:
+                    # closing on DOMContentLoaded cancels lazy APIs and auth work.
 
                 async def route_guard(route: Route):
                     nonlocal navigation_policy_error
@@ -1265,7 +1364,7 @@ async def execute_scan(
                     # Observation is intentionally first and idempotent. Context listeners
                     # normally arrive first; this guarantees policy never makes an attempt
                     # invisible if Playwright schedules interception before the event callback.
-                    if id(request) not in request_started:
+                    if request_identity(request) not in request_started:
                         record_request(request)
                     api_event = ensure_api_observed(request)
                     network_observer.mark_route_handler(request)
@@ -1345,7 +1444,7 @@ async def execute_scan(
                             await abort_by_validator(route, "read_only_mutation_policy")
                             return
                         if auth_navigation_allowed:
-                            request_observation[id(request)] = (
+                            request_observation[request_identity(request)] = (
                                 "AUTHENTICATION",
                                 "AUTHENTICATION",
                             )
@@ -1367,14 +1466,14 @@ async def execute_scan(
                             policy_phase = (
                                 "SESSION_REFRESH"
                                 if classification == "SESSION_REFRESH"
-                                else observation_phase
+                                else request_phase(request)
                             )
                             policy_importance = (
                                 "AUTHENTICATION"
                                 if classification == "SESSION_REFRESH"
                                 else api_importance(request)
                             )
-                            request_observation[id(request)] = (
+                            request_observation[request_identity(request)] = (
                                 policy_phase,
                                 policy_importance,
                             )
@@ -1399,7 +1498,7 @@ async def execute_scan(
                                 method=method,
                                 classification=classification,
                                 request_id=api_event.get("request_id") if api_event else None,
-                                route_activation_id=active_route_activation_id,
+                                route_activation_id=api_event.get("route_activation_id") if api_event else None,
                             )
                     elif api_event is not None:
                         network_observer.mark_allowed(request, "SAFE_METHOD")
@@ -1417,13 +1516,22 @@ async def execute_scan(
                 context.on("response", record_response)
                 await context.route("**/*", route_guard)
                 page = await context.new_page()
+                browser_page_count += 1
                 page.on("console", record_console_error)
                 page.on("pageerror", record_page_error)
                 page.on("websocket", record_websocket)
                 page.on("download", record_download)
                 page.on("framenavigated", record_frame_navigation)
-                page.on("popup", record_popup)
-                session_refresh: dict[str, object] = {"attempted": False}
+                def schedule_popup(popup, owner=None):
+                    nonlocal browser_page_count
+                    browser_page_count += 1
+                    owner = owner or (active_route_id, active_route_activation_id, observation_phase)
+                    popup_origins[request_identity(popup)] = owner
+                    popup.on("popup", lambda child: schedule_popup(child, owner))
+                    task = asyncio.create_task(record_popup(popup))
+                    popup_tasks.add(task)
+                    task.add_done_callback(popup_tasks.discard)
+                page.on("popup", schedule_popup)
                 if refresh_config is not None:
                     current_tracker = NavigationTracker(req.max_redirects)
                     navigation_policy_error = None
@@ -1471,6 +1579,7 @@ async def execute_scan(
                     if route_identity in seen or depth > req.max_depth:
                         continue
                     seen.add(route_identity)
+                    active_route_identity = route_identity
                     active_route_id = sanitized_url(route_identity)
                     active_route_activation_id = f"activation-{len(results) + 1}"
                     await publish_progress(
@@ -1505,8 +1614,6 @@ async def execute_scan(
                     final_raw_url = url
                     console_start = len(console_errors)
                     page_error_start = len(page_errors)
-                    failed_start = len(failed_resources)
-                    api_start = len(api_events)
                     resource_start = len(resource_events)
                     websocket_start = len(websocket_events)
                     event_stream_start = len(event_streams)
@@ -1514,6 +1621,7 @@ async def execute_scan(
                     frame_event_start = len(frame_events)
                     popup_start = len(popup_routes)
                     started = time.perf_counter()
+                    route_deadline = min(deadline, started + req.timeout_ms / 1000)
                     status: int | None = None
                     title: str | None = None
                     error: str | None = None
@@ -1555,243 +1663,198 @@ async def execute_scan(
                             navigation_type=navigation_mode,
                         )
                         try:
-                            response, route_transition_succeeded, activation_method = await perform_route_navigation(
-                                page,
-                                url,
-                                navigation_mode,
-                                min(req.timeout_ms, remaining_ms),
-                                label=route_label,
-                                source=route_source,
-                            )
-                            navigation_ms = round((time.perf_counter() - started) * 1000)
-                            log_event(
-                                logging.INFO,
-                                "ROUTE_ACTIVATION_COMPLETED",
-                                scan_id=scan_id,
-                                current_route=active_route_id,
-                                activation_method=activation_method,
-                            )
-                            final_raw_url = page.url
-                            final_url = sanitized_url(final_raw_url)
-                            if response is not None:
-                                await reconcile_http_redirect_chain(response, current_tracker)
-                            redirects = current_tracker.redirects()
-                            for redirect in redirects:
-                                log_event(logging.INFO, "REDIRECT_DETECTED", scan_id=scan_id, **redirect)
-                                if not redirect["same_origin"]:
-                                    log_event(logging.INFO, "CROSS_ORIGIN_REDIRECT", scan_id=scan_id, **redirect)
-                            if response is not None:
-                                status = response.status
-                                response_headers = {
-                                    name.lower(): value
-                                    for name, value in (await response.all_headers()).items()
-                                }
-                                document_evidence[origin_for_url(final_raw_url)] = {
-                                    "response_headers": response_headers.copy(),
-                                    "strict_tls": urlparse(final_raw_url).scheme == "https",
-                                }
-                            else:
-                                evidence = document_evidence.get(origin_for_url(final_raw_url))
-                                if evidence is None:
-                                    raise RuntimeError(
-                                        "Same-document route has no validated document context"
-                                    )
-                                response_headers = dict(evidence["response_headers"])
-                                inherited_strict_tls = bool(evidence["strict_tls"])
-                                security_headers_inherited = True
-                            if (
-                                url_in_scan_scope(
-                                    final_raw_url,
-                                    root_host,
-                                    req.allow_subdomains,
-                                    approved_portal_hosts,
-                                )
-                                and await acknowledge_configured_access_gate(
+                            async with asyncio.timeout_at(route_deadline):
+                                response, route_transition_succeeded, activation_method = await perform_route_navigation(
                                     page,
-                                    read_only_policy,
-                                    final_raw_url,
-                                    acknowledged_access_gates,
+                                    url,
+                                    navigation_mode,
+                                    min(req.timeout_ms, remaining_ms),
+                                    label=route_label,
+                                    source=route_source,
                                 )
-                            ):
-                                final_raw_url = page.url
-                                final_url = sanitized_url(final_raw_url)
+                                navigation_ms = round((time.perf_counter() - started) * 1000)
                                 log_event(
                                     logging.INFO,
-                                    "ACCESS_GATE_ACKNOWLEDGED",
+                                    "ROUTE_ACTIVATION_COMPLETED",
                                     scan_id=scan_id,
-                                    hostname=normalized_host(
-                                        urlparse(final_raw_url).hostname or ""
-                                    ),
+                                    current_route=active_route_id,
+                                    activation_method=activation_method,
                                 )
-                            title = sanitize_text(await page.title(), limit=512)
-                            name_evidence = await collect_route_name_evidence(page)
-                            final_in_scope = url_in_scan_scope(
-                                final_raw_url,
-                                root_host,
-                                req.allow_subdomains,
-                                approved_portal_hosts,
-                            )
-                            password_form, mfa_form = await detect_auth_signals(page)
-                            authentication_classification = classify_authentication(
-                                authentication_mode=req.authentication.mode,
-                                status=status,
-                                final_url=final_raw_url,
-                                target_in_scope=final_in_scope,
-                                error_classification=None,
-                                password_form=password_form,
-                                mfa_form=mfa_form,
-                            )
-                            log_event(
-                                logging.INFO,
-                                (
-                                    "SPA_ROUTE_TRANSITIONED"
-                                    if route_transition_succeeded
-                                    else "DOCUMENT_NAVIGATION_COMPLETED"
-                                ),
-                                scan_id=scan_id,
-                                final_url=final_raw_url,
-                                hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
-                                http_status=status,
-                                redirect_count=len(redirects),
-                                classification=authentication_classification,
-                                navigation_type=navigation_mode,
-                            )
-                            if authentication_classification != "PASS":
-                                log_event(
-                                    logging.WARNING,
-                                    authentication_classification,
-                                    scan_id=scan_id,
-                                    final_url=final_raw_url,
-                                )
-                            log_event(logging.INFO, "PAGE_VALIDATION_STARTED", scan_id=scan_id, final_url=final_raw_url)
-                            render_start_ms = round((time.perf_counter() - started) * 1000)
-                            render_health = await wait_for_render_settle(
-                                page,
-                                settle_ms=req.render_settle_ms,
-                                maximum_ms=min(
-                                    req.timeout_ms,
-                                    max(1000, req.render_settle_ms * 4),
-                                ),
-                                network_activity=lambda: route_network_activity.snapshot(
-                                    active_route_id
-                                ),
-                                minimum_observation_ms=min(
-                                    req.timeout_ms,
-                                    max(500, min(1000, req.render_settle_ms + 250)),
-                                ),
-                                network_quiet_ms=max(
-                                    500, min(1000, req.render_settle_ms)
-                                ),
-                            )
-                            log_event(
-                                logging.INFO,
-                                "ROUTE_SETTLE_COMPLETED",
-                                scan_id=scan_id,
-                                current_route=active_route_id,
-                                settle_reason=render_health.get("settle_reason"),
-                                settle_elapsed_ms=render_health.get("settle_elapsed_ms"),
-                                network_pending=render_health.get("network_pending"),
-                            )
-                            frame_observations = [
-                                {
-                                    "url": sanitized_url(frame.url),
-                                    "main_frame": frame == page.main_frame,
-                                    "same_origin": origin_for_url(frame.url) == origin_for_url(final_raw_url),
-                                    "observation": (
-                                        "MAIN_DOCUMENT" if frame == page.main_frame else
-                                        "SAME_ORIGIN_FRAME" if origin_for_url(frame.url) == origin_for_url(final_raw_url) else
-                                        "CROSS_ORIGIN_FRAME_OBSERVED"
-                                    ),
-                                    "in_portal_scope": url_in_scan_scope(
-                                        frame.url,
+                                final_raw_url = page.url
+                                final_url = sanitized_url(final_raw_url)
+                                if response is not None:
+                                    await reconcile_http_redirect_chain(response, current_tracker)
+                                redirects = current_tracker.redirects()
+                                for redirect in redirects:
+                                    log_event(logging.INFO, "REDIRECT_DETECTED", scan_id=scan_id, **redirect)
+                                    if not redirect["same_origin"]:
+                                        log_event(logging.INFO, "CROSS_ORIGIN_REDIRECT", scan_id=scan_id, **redirect)
+                                if response is not None:
+                                    status = response.status
+                                    response_headers = {
+                                        name.lower(): value
+                                        for name, value in (await response.all_headers()).items()
+                                    }
+                                    document_evidence[origin_for_url(final_raw_url)] = {
+                                        "response_headers": response_headers.copy(),
+                                        "strict_tls": urlparse(final_raw_url).scheme == "https",
+                                    }
+                                else:
+                                    evidence = document_evidence.get(origin_for_url(final_raw_url))
+                                    if evidence is None:
+                                        raise RuntimeError(
+                                            "Same-document route has no validated document context"
+                                        )
+                                    response_headers = dict(evidence["response_headers"])
+                                    inherited_strict_tls = bool(evidence["strict_tls"])
+                                    security_headers_inherited = True
+                                if (
+                                    url_in_scan_scope(
+                                        final_raw_url,
                                         root_host,
                                         req.allow_subdomains,
                                         approved_portal_hosts,
-                                    ),
-                                }
-                                for frame in page.frames
-                                if frame.url.startswith(("http://", "https://"))
-                            ]
-                            if (
-                                req.check_links
-                                and final_in_scope
-                                and authentication_classification == "PASS"
-                            ):
-                                observation_phase = "DISCOVERY"
-                                discovery_started = time.perf_counter()
-                                await publish_progress(
-                                    "DISCOVERING",
-                                    discovered=len(discovered_routes),
-                                    queued=len(queue),
-                                    validated=len(results),
-                                    current_route=active_route_id,
-                                )
-                                if req.max_navigation_actions:
-                                    navigation_actions = await expand_safe_navigation(
+                                    )
+                                    and await acknowledge_configured_access_gate(
                                         page,
-                                        req.max_navigation_actions,
+                                        read_only_policy,
+                                        final_raw_url,
+                                        acknowledged_access_gates,
                                     )
-                                    safe_routes = list(navigation_actions.pop("routes", []))
-                                    if navigation_actions["activated"]:
-                                        log_event(
-                                            logging.INFO,
-                                            "NAVIGATION_MENU_EXPANDED",
-                                            scan_id=scan_id,
-                                            count=navigation_actions["activated"],
-                                        )
-                                    if navigation_actions["skipped"]:
-                                        log_event(
-                                            logging.INFO,
-                                            "UNSAFE_CONTROL_SKIPPED",
-                                            scan_id=scan_id,
-                                            count=navigation_actions["skipped"],
-                                        )
-                                else:
-                                    safe_routes = []
-                                discovered = safe_routes + await discover_page_routes(
-                                    page,
-                                    req.max_discovery_scrolls,
-                                )
-                                discovered.extend(popup_routes[popup_start:])
-                                unique_discovered: dict[str, DiscoveredRoute] = {}
-                                for route in discovered:
-                                    identity = normalize_route_url(
-                                        route.url,
-                                        query_policy=req.query_parameter_policy,
-                                        allowed_query_parameters=set(req.allowed_query_parameters),
+                                ):
+                                    final_raw_url = page.url
+                                    final_url = sanitized_url(final_raw_url)
+                                    log_event(
+                                        logging.INFO,
+                                        "ACCESS_GATE_ACKNOWLEDGED",
+                                        scan_id=scan_id,
+                                        hostname=normalized_host(
+                                            urlparse(final_raw_url).hostname or ""
+                                        ),
                                     )
-                                    if identity is not None:
-                                        remember_route_discovery(identity, route, final_raw_url)
-                                        existing = unique_discovered.get(identity)
-                                        if existing is None or (not existing.label and route.label):
-                                            unique_discovered[identity] = route
-                                discovered = list(unique_discovered.values())
-                                download_routes = [
-                                    route for route in discovered
-                                    if route.navigation_mode == DOWNLOAD_OBSERVED
-                                ]
-                                navigation_actions["downloads_observed"] = len(download_routes)
-                                links = [
-                                    route.url for route in discovered
-                                    if route.navigation_mode != DOWNLOAD_OBSERVED
-                                ]
-                                crawl_links, external_links = partition_links(
-                                    links,
+                                title = sanitize_text(await page.title(), limit=512)
+                                name_evidence = await collect_route_name_evidence(page)
+                                final_in_scope = url_in_scan_scope(
+                                    final_raw_url,
                                     root_host,
                                     req.allow_subdomains,
                                     approved_portal_hosts,
-                                    req.query_parameter_policy,
-                                    set(req.allowed_query_parameters),
                                 )
-                                if external_links:
+                                password_form, mfa_form = await detect_auth_signals(page)
+                                authentication_classification = classify_authentication(
+                                    authentication_mode=req.authentication.mode,
+                                    status=status,
+                                    final_url=final_raw_url,
+                                    target_in_scope=final_in_scope,
+                                    error_classification=None,
+                                    password_form=password_form,
+                                    mfa_form=mfa_form,
+                                )
+                                log_event(
+                                    logging.INFO,
+                                    (
+                                        "SPA_ROUTE_TRANSITIONED"
+                                        if route_transition_succeeded
+                                        else "DOCUMENT_NAVIGATION_COMPLETED"
+                                    ),
+                                    scan_id=scan_id,
+                                    final_url=final_raw_url,
+                                    hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
+                                    http_status=status,
+                                    redirect_count=len(redirects),
+                                    classification=authentication_classification,
+                                    navigation_type=navigation_mode,
+                                )
+                                if authentication_classification != "PASS":
                                     log_event(
-                                        logging.INFO,
-                                        "EXTERNAL_LINK_SKIPPED",
+                                        logging.WARNING,
+                                        authentication_classification,
                                         scan_id=scan_id,
-                                        count=len(external_links),
+                                        final_url=final_raw_url,
                                     )
-                                if final_in_scope:
-                                    metadata: dict[str, DiscoveredRoute] = {}
+                                log_event(logging.INFO, "PAGE_VALIDATION_STARTED", scan_id=scan_id, final_url=final_raw_url)
+                                render_start_ms = round((time.perf_counter() - started) * 1000)
+                                render_health = await wait_for_render_settle(
+                                    page,
+                                    settle_ms=req.render_settle_ms,
+                                    maximum_ms=max(0, round((route_deadline - time.perf_counter()) * 1000)),
+                                    network_activity=lambda: route_network_activity.snapshot(
+                                        active_route_id
+                                    ),
+                                    minimum_observation_ms=req.min_observation_ms,
+                                    network_quiet_ms=req.network_quiet_ms,
+                                )
+                                log_event(
+                                    logging.INFO,
+                                    "ROUTE_SETTLE_COMPLETED",
+                                    scan_id=scan_id,
+                                    current_route=active_route_id,
+                                    settle_reason=render_health.get("settle_reason"),
+                                    settle_elapsed_ms=render_health.get("settle_elapsed_ms"),
+                                    network_pending=render_health.get("network_pending"),
+                                )
+                                frame_observations = [
+                                    {
+                                        "url": sanitized_url(frame.url),
+                                        "main_frame": frame == page.main_frame,
+                                        "same_origin": origin_for_url(frame.url) == origin_for_url(final_raw_url),
+                                        "observation": (
+                                            "MAIN_DOCUMENT" if frame == page.main_frame else
+                                            "SAME_ORIGIN_FRAME" if origin_for_url(frame.url) == origin_for_url(final_raw_url) else
+                                            "CROSS_ORIGIN_FRAME_OBSERVED"
+                                        ),
+                                        "in_portal_scope": url_in_scan_scope(
+                                            frame.url,
+                                            root_host,
+                                            req.allow_subdomains,
+                                            approved_portal_hosts,
+                                        ),
+                                    }
+                                    for frame in page.frames
+                                    if frame.url.startswith(("http://", "https://"))
+                                ]
+                                if (
+                                    req.check_links
+                                    and final_in_scope
+                                    and authentication_classification == "PASS"
+                                ):
+                                    observation_phase = "DISCOVERY"
+                                    discovery_started = time.perf_counter()
+                                    await publish_progress(
+                                        "DISCOVERING",
+                                        discovered=len(discovered_routes),
+                                        queued=len(queue),
+                                        validated=len(results),
+                                        current_route=active_route_id,
+                                    )
+                                    if req.max_navigation_actions:
+                                        navigation_actions = await expand_safe_navigation(
+                                            page,
+                                            req.max_navigation_actions,
+                                        )
+                                        safe_routes = list(navigation_actions.pop("routes", []))
+                                        if navigation_actions["activated"]:
+                                            log_event(
+                                                logging.INFO,
+                                                "NAVIGATION_MENU_EXPANDED",
+                                                scan_id=scan_id,
+                                                count=navigation_actions["activated"],
+                                            )
+                                        if navigation_actions["skipped"]:
+                                            log_event(
+                                                logging.INFO,
+                                                "UNSAFE_CONTROL_SKIPPED",
+                                                scan_id=scan_id,
+                                                count=navigation_actions["skipped"],
+                                            )
+                                    else:
+                                        safe_routes = []
+                                    discovered = safe_routes + await discover_page_routes(
+                                        page,
+                                        req.max_discovery_scrolls,
+                                    )
+                                    discovered.extend(popup_routes[popup_start:])
+                                    unique_discovered: dict[str, DiscoveredRoute] = {}
                                     for route in discovered:
                                         identity = normalize_route_url(
                                             route.url,
@@ -1799,72 +1862,113 @@ async def execute_scan(
                                             allowed_query_parameters=set(req.allowed_query_parameters),
                                         )
                                         if identity is not None:
-                                            metadata.setdefault(identity, route)
-                                    for link in crawl_links:
-                                        path = urlparse(link).path.lower()
-                                        if (
-                                            not any(word in path for word in DANGEROUS_PATH_WORDS)
-                                            and link not in discovered_routes
-                                        ):
-                                            discovered_route = metadata.get(link) or DiscoveredRoute(
-                                                url=link,
-                                                label="Discovered route",
-                                                source="semantic",
-                                                navigation_mode=DOCUMENT_NAVIGATION,
+                                            remember_route_discovery(identity, route, final_raw_url)
+                                            existing = unique_discovered.get(identity)
+                                            if existing is None or (not existing.label and route.label):
+                                                unique_discovered[identity] = route
+                                    discovered = list(unique_discovered.values())
+                                    download_routes = [
+                                        route for route in discovered
+                                        if route.navigation_mode == DOWNLOAD_OBSERVED
+                                    ]
+                                    navigation_actions["downloads_observed"] = len(download_routes)
+                                    links = [
+                                        route.url for route in discovered
+                                        if route.navigation_mode != DOWNLOAD_OBSERVED
+                                    ]
+                                    crawl_links, external_links = partition_links(
+                                        links,
+                                        root_host,
+                                        req.allow_subdomains,
+                                        approved_portal_hosts,
+                                        req.query_parameter_policy,
+                                        set(req.allowed_query_parameters),
+                                    )
+                                    if external_links:
+                                        log_event(
+                                            logging.INFO,
+                                            "EXTERNAL_LINK_SKIPPED",
+                                            scan_id=scan_id,
+                                            count=len(external_links),
+                                        )
+                                    if final_in_scope:
+                                        metadata: dict[str, DiscoveredRoute] = {}
+                                        for route in discovered:
+                                            identity = normalize_route_url(
+                                                route.url,
+                                                query_policy=req.query_parameter_policy,
+                                                allowed_query_parameters=set(req.allowed_query_parameters),
                                             )
-                                            label = (
-                                                sanitize_text(discovered_route.label, limit=160)
-                                                if discovered_route.label else "Discovered route"
-                                            )
-                                            source = discovered_route.source
-                                            mode = discovered_route.navigation_mode
-                                            discovered_routes.add(link)
-                                            if depth >= req.max_depth:
-                                                depth_limited_routes.add(link)
+                                            if identity is not None:
+                                                metadata.setdefault(identity, route)
+                                        for link in crawl_links:
+                                            path = urlparse(link).path.lower()
+                                            if (
+                                                not any(word in path for word in DANGEROUS_PATH_WORDS)
+                                                and link not in discovered_routes
+                                            ):
+                                                discovered_route = metadata.get(link) or DiscoveredRoute(
+                                                    url=link,
+                                                    label="Discovered route",
+                                                    source="semantic",
+                                                    navigation_mode=DOCUMENT_NAVIGATION,
+                                                )
+                                                label = (
+                                                    sanitize_text(discovered_route.label, limit=160)
+                                                    if discovered_route.label else "Discovered route"
+                                                )
+                                                source = discovered_route.source
+                                                mode = discovered_route.navigation_mode
+                                                discovered_routes.add(link)
+                                                if depth >= req.max_depth:
+                                                    depth_limited_routes.add(link)
+                                                    log_event(
+                                                        logging.INFO,
+                                                        "ROUTE_SKIPPED",
+                                                        scan_id=scan_id,
+                                                        current_url=link,
+                                                        reason="MAX_DEPTH_REACHED",
+                                                    )
+                                                    continue
+                                                route_item = (
+                                                    link,
+                                                    depth + 1,
+                                                    label,
+                                                    source,
+                                                    mode,
+                                                    final_raw_url,
+                                                    discovered_route.discovery_type,
+                                                    discovered_route.label_source,
+                                                    (
+                                                        sanitize_text(discovered_route.accessible_name, limit=160)
+                                                        if discovered_route.accessible_name else None
+                                                    ),
+                                                )
+                                                if mode in SAME_DOCUMENT_NAVIGATIONS:
+                                                    # Queue all branches breadth-first so one menu does not
+                                                    # consume the validation budget before its peers.
+                                                    queue.append(route_item)
+                                                else:
+                                                    queue.append(route_item)
+                                                queued_routes.add(link)
                                                 log_event(
-                                                    logging.INFO,
-                                                    "ROUTE_SKIPPED",
+                                                    logging.DEBUG,
+                                                    "LINK_DISCOVERED",
                                                     scan_id=scan_id,
                                                     current_url=link,
-                                                    reason="MAX_DEPTH_REACHED",
+                                                    crawl_depth=depth + 1,
+                                                    navigation_type=mode,
                                                 )
-                                                continue
-                                            route_item = (
-                                                link,
-                                                depth + 1,
-                                                label,
-                                                source,
-                                                mode,
-                                                final_raw_url,
-                                                discovered_route.discovery_type,
-                                                discovered_route.label_source,
-                                                (
-                                                    sanitize_text(discovered_route.accessible_name, limit=160)
-                                                    if discovered_route.accessible_name else None
-                                                ),
-                                            )
-                                            if mode in SAME_DOCUMENT_NAVIGATIONS:
-                                                # Queue all branches breadth-first so one menu does not
-                                                # consume the validation budget before its peers.
-                                                queue.append(route_item)
-                                            else:
-                                                queue.append(route_item)
-                                            queued_routes.add(link)
-                                            log_event(
-                                                logging.DEBUG,
-                                                "LINK_DISCOVERED",
-                                                scan_id=scan_id,
-                                                current_url=link,
-                                                crawl_depth=depth + 1,
-                                                navigation_type=mode,
-                                            )
-                                route_discovery_ms = round(
-                                    (time.perf_counter() - discovery_started) * 1000
-                                )
-                                discovery_duration_ms += route_discovery_ms
-                                observation_phase = "ROUTE_VALIDATION"
+                                    route_discovery_ms = round(
+                                        (time.perf_counter() - discovery_started) * 1000
+                                    )
+                                    discovery_duration_ms += route_discovery_ms
+                                    observation_phase = "ROUTE_VALIDATION"
                         except Exception as exc:
-                            if navigation_policy_error is not None:
+                            if isinstance(exc, TimeoutError):
+                                error = "Configured maximum time per route exceeded"
+                                error_classification = "TIMEOUT"
+                            elif navigation_policy_error is not None:
                                 error = navigation_policy_error.public_message
                                 error_classification = navigation_policy_error.classification
                             else:
@@ -1909,6 +2013,7 @@ async def execute_scan(
                             hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
                         )
 
+                    health_validation_started = time.perf_counter()
                     elapsed = round((time.perf_counter() - started) * 1000)
                     route_validation_ms = max(0, elapsed - route_discovery_ms)
                     performance_timing = route_performance_timing(
@@ -1917,22 +2022,38 @@ async def execute_scan(
                         total_validation_ms=route_validation_ms,
                         render_start_ms=render_start_ms,
                     )
-                    validation_duration_ms += route_validation_ms
                     page_console = list(dict.fromkeys(
                         console_errors[console_start:]
                     )) if req.check_console else []
                     page_script_errors = list(dict.fromkeys(
                         page_errors[page_error_start:]
                     )) if req.check_console else []
-                    page_failures = failed_resources[failed_start:] if req.check_resources else []
-                    page_api_events = api_events[api_start:] if req.check_resources else []
+                    page_failures = [
+                        failure for failure in failed_resources
+                        if failure.get("route_activation_id") == active_route_activation_id
+                    ] if req.check_resources else []
+                    page_api_events = [
+                        event for event in api_events
+                        if event.get("route_activation_id") == active_route_activation_id
+                    ]
                     page_resource_events = resource_events[resource_start:] if req.check_resources else []
-                    if render_health is not None and req.check_resources:
-                        await enrich_resource_timings(page, page_resource_events + page_api_events)
+                    if render_health is not None and req.check_resources and time.perf_counter() < route_deadline:
+                        timing_budget = asyncio.timeout_at(route_deadline)
+                        try:
+                            async with timing_budget:
+                                await enrich_resource_timings(page, page_resource_events + page_api_events)
+                        except TimeoutError:
+                            if not timing_budget.expired():
+                                raise
+                            # Optional size diagnostics cannot extend a route's
+                            # work budget or invent a main-document failure.
+                            log_event(logging.INFO, "RESOURCE_TIMING_BUDGET_EXHAUSTED", scan_id=scan_id)
                     page_resource_details, _ = build_resource_report(
                         page_resource_events + page_api_events,
                         large_resource_threshold_bytes=req.large_resource_threshold_bytes,
                         large_image_threshold_bytes=req.large_image_threshold_bytes,
+                        large_js_threshold_bytes=req.large_js_threshold_bytes,
+                        large_css_font_threshold_bytes=req.large_css_font_threshold_bytes,
                     )
                     page_websockets = websocket_events[websocket_start:] if req.check_resources else []
                     page_event_streams = event_streams[event_stream_start:] if req.check_resources else []
@@ -2090,7 +2211,20 @@ async def execute_scan(
                         display_path=identity["display_path"],
                     )
                     provenance = route_provenance.get(route_identity, {"observations": 1, "sources": []})
+                    health_validation_ms = round((time.perf_counter() - health_validation_started) * 1000)
+                    route_validation_ms = max(0, round((time.perf_counter() - started) * 1000) - route_discovery_ms)
+                    performance_timing = route_performance_timing(
+                        navigation_ms=navigation_ms,
+                        render_health=render_health,
+                        total_validation_ms=route_validation_ms,
+                        render_start_ms=render_start_ms,
+                    )
+                    performance_timing["route_transition_ms"] = navigation_ms if navigation_mode in SAME_DOCUMENT_NAVIGATIONS else 0
+                    performance_timing["health_validation_ms"] = health_validation_ms
+                    performance_timing["discovery_ms"] = route_discovery_ms
+                    validation_duration_ms += route_validation_ms
                     result = {
+                        "route_activation_id": active_route_activation_id,
                         "url": display_url,
                         "requested_url": requested_url,
                         "discovered_url": sanitized_url(route_identity),
@@ -2133,6 +2267,7 @@ async def execute_scan(
                         "title": title,
                         "load_ms": performance_timing["application_load_ms"] if req.check_performance else None,
                         **performance_timing,
+                        "timings": dict(performance_timing),
                         "error": error,
                         "redirect_count": len(redirects),
                         "redirects": redirects,
@@ -2173,6 +2308,7 @@ async def execute_scan(
                         **classification,
                     }
                     results.append(result)
+                    active_route_identity = None
                     await publish_progress(
                         "VALIDATING",
                         discovered=len(discovered_routes),
@@ -2233,6 +2369,11 @@ async def execute_scan(
     )
     finalization_started = time.perf_counter()
     for result in results:
+        # Continuous observation can complete a request after its initiating
+        # route snapshot. Reconcile that route, never the currently active one.
+        route_events = [event for event in scan_api_events
+                        if event.get("route_activation_id") == result.get("route_activation_id")]
+        result.update(refresh_route_api_health(result, route_events))
         canonical = str(result.get("canonical_route") or "")
         provenance = route_provenance.get(canonical)
         if provenance:
@@ -2283,6 +2424,8 @@ async def execute_scan(
         scan_resource_events + scan_api_events,
         large_resource_threshold_bytes=req.large_resource_threshold_bytes,
         large_image_threshold_bytes=req.large_image_threshold_bytes,
+        large_js_threshold_bytes=req.large_js_threshold_bytes,
+        large_css_font_threshold_bytes=req.large_css_font_threshold_bytes,
     )
     for event in scan_resource_events + scan_api_events:
         event.pop("_resource_timing_key", None)
@@ -2345,6 +2488,36 @@ async def execute_scan(
     summary["total_scan_duration_ms"] = round(
         (time.perf_counter() - scan_started) * 1000
     )
+    scan_timing = {
+        "authentication_ms": authentication_duration_ms,
+        "initial_bootstrap_ms": int(results[0].get("total_validation_ms") or 0) if results else 0,
+        "discovery_ms": discovery_duration_ms,
+        "route_validation_ms": validation_duration_ms,
+        "finalization_ms": summary["finalization_duration_ms"],
+        "total_scan_ms": summary["total_scan_duration_ms"],
+        "application_settle_ms": sum(int(item.get("application_settle_ms") or 0) for item in results),
+        "validator_overhead_ms": sum(int(item.get("validator_overhead_ms") or 0) for item in results),
+        "browser_contexts": browser_context_count,
+        "pages": browser_page_count,
+        "full_navigations": sum(item["navigation_type"] not in SAME_DOCUMENT_NAVIGATIONS for item in results),
+        "spa_transitions": sum(item["navigation_type"] in SAME_DOCUMENT_NAVIGATIONS for item in results),
+    }
+    # Explicit whitelist: never serialize authentication secrets, profile state,
+    # credential headers, cookie values, or free-form approval descriptions.
+    scan_configuration = req.model_dump(include={
+        "max_pages", "max_depth", "max_redirects", "timeout_ms", "total_timeout_ms",
+        "slow_page_threshold_ms", "render_settle_ms", "min_observation_ms", "network_quiet_ms",
+        "large_resource_threshold_bytes", "large_image_threshold_bytes",
+        "large_js_threshold_bytes", "large_css_font_threshold_bytes",
+        "check_links", "check_console", "check_resources", "check_performance", "check_security_headers",
+        "allow_subdomains", "allow_private_networks", "max_navigation_actions", "max_discovery_scrolls",
+    })
+    scan_configuration["authentication_mode"] = req.authentication.mode
+    scan_configuration["approved_read_post_operations"] = [
+        {"method": rule.method, "host": rule.host,
+         "path_pattern" if rule.path_pattern else "path": safe_api_identity("https://" + rule.host + rule.path)[2]}
+        for rule in read_only_policy.safe_application_requests
+    ]
     trust_status: TrustStatus = getattr(app.state, "trust_status", TrustStatus(enabled=False))
     log_event(
         logging.INFO,
@@ -2374,6 +2547,9 @@ async def execute_scan(
         "results": results,
         "api_inventory": api_inventory,
         "network_observation": network_observation,
+        "scan_configuration": scan_configuration,
+        "scan_timing": scan_timing,
+        "timings": scan_timing,
         "resource_inventory": resource_inventory,
         "resource_details": resource_details,
         "resource_summary": resource_summary,
@@ -2502,7 +2678,7 @@ async def create_scan(req: ScanRequest):
         job = SCAN_REGISTRY.create(scan_id)
     except ScanCapacityError as exc:
         raise HTTPException(503, "Scan capacity is currently exhausted; retry later") from exc
-    job.task = asyncio.create_task(_run_scan_job(job, req), name=f"portal-scan-{scan_id}")
+    job.task = asyncio.create_task(_run_scan_job(job, req.model_copy(deep=True)), name=f"portal-scan-{scan_id}")
     log_event(logging.INFO, "SCAN_CREATED", scan_id=scan_id)
     return {
         "scan_id": scan_id,

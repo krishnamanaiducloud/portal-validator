@@ -173,12 +173,14 @@ def test_observation_delay_does_not_create_slow_page_finding():
         },
         total_validation_ms=7500,
     )
-    assert timing["application_load_ms"] == 480
+    assert timing["application_load_ms"] == 450
+    assert timing["application_navigation_ms"] == 150
+    assert timing["validator_overhead_ms"] == 7050
     assert timing["validator_observation_ms"] == 6000
     assert timing["total_validation_ms"] == 7500
     snapshot = {"text_length": 100, "visible_elements": 10, "busy_indicators": 0}
     _, findings = assess_page_health(snapshot, load_ms=timing["application_load_ms"], slow_page_threshold_ms=5000)
-    assert "SLOW_PAGE" not in {item["type"] for item in findings}
+    assert "SLOW_ROUTE" not in {item["type"] for item in findings}
 
 
 def test_genuine_application_delay_remains_slow():
@@ -192,7 +194,149 @@ def test_genuine_application_delay_remains_slow():
         {"text_length": 100, "visible_elements": 10, "busy_indicators": 0},
         load_ms=timing["application_load_ms"], slow_page_threshold_ms=5000,
     )
-    assert {item["type"] for item in findings} == {"SLOW_PAGE"}
+    assert {item["type"] for item in findings} == {"SLOW_ROUTE"}
+
+
+def test_pre_render_validator_work_is_not_application_navigation_or_settle():
+    timing = route_performance_timing(
+        navigation_ms=100, render_start_ms=6000,
+        render_health={"settle_application_ms": 50, "settle_validator_observation_ms": 800},
+        total_validation_ms=7100,
+    )
+    assert timing["application_navigation_ms"] == 100
+    assert timing["application_settle_ms"] == 50
+    assert timing["application_load_ms"] == 150
+    assert timing["validator_overhead_ms"] == 6950
+    assert timing["total_validation_ms"] == 7100
+    _, findings = assess_page_health(
+        {"text_length": 100, "visible_elements": 10, "busy_indicators": 0},
+        load_ms=timing["application_load_ms"], slow_page_threshold_ms=5000,
+    )
+    assert findings == []
+
+
+def test_resource_thresholds_are_independent_and_runtime_configurable():
+    events = [
+        {"url": "https://portal.example.net/app.js", "resource_type": "script", "status": 200,
+         "transfer_size_bytes": 1500, "content_type": "application/javascript; charset=utf-8"},
+        {"url": "https://portal.example.net/app.css", "resource_type": "stylesheet", "status": 200,
+         "transfer_size_bytes": 700, "content_type": "text/css; arbitrary-secret=never-include"},
+        {"url": "https://portal.example.net/font.woff2", "resource_type": "font", "status": 200,
+         "transfer_size_bytes": 700, "content_type": "font/woff2"},
+    ]
+    details, summary = build_resource_report(
+        events, large_resource_threshold_bytes=3000,
+        large_js_threshold_bytes=1000, large_css_font_threshold_bytes=600,
+    )
+    assert details[0]["size_categories"] == ["LARGE_JS_BUNDLE"]
+    assert details[1]["size_categories"] == details[2]["size_categories"] == ["LARGE_CSS_FONT"]
+    assert summary["large_js_bundles"] == 1
+    assert summary["large_css_fonts"] == 2
+    assert summary["large_js_threshold_bytes"] == 1000
+    assert summary["large_css_font_threshold_bytes"] == 600
+    assert details[0]["content_type"] == "application/javascript"
+    assert details[1]["content_type"] == "text/css"
+    assert "never-include" not in json.dumps(details)
+    warnings = large_resource_findings(details)
+    assert warnings[0]["observed_bytes"] == 1500
+    assert warnings[0]["threshold_bytes"] == 1000
+    raised, raised_summary = build_resource_report(
+        events, large_js_threshold_bytes=2000, large_css_font_threshold_bytes=1000,
+    )
+    assert all(item["size_categories"] == [] for item in raised)
+    assert raised_summary["large_resources"] == 0
+
+
+@pytest.mark.asyncio
+async def test_maximum_settle_budget_is_not_extended_to_stability_requirement(monkeypatch):
+    import app.health as health
+    clock = [0.0]
+
+    async def sleep(seconds):
+        clock[0] += seconds
+
+    async def capture(_):
+        return {
+            "ready_state": "complete", "title": "Generic portal", "text_length": 100,
+            "visible_elements": 10, "busy_indicators": 0, "challenge_indicators": 0,
+        }
+
+    monkeypatch.setattr(health.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(health.asyncio, "sleep", sleep)
+    monkeypatch.setattr(health, "capture_render_health", capture)
+    snapshot = await wait_for_render_settle(
+        object(), settle_ms=5000, maximum_ms=35,
+        minimum_observation_ms=2000, network_quiet_ms=3000,
+    )
+    assert snapshot["settle_reason"] == "BOUNDED_TIMEOUT"
+    assert snapshot["settle_elapsed_ms"] == 35
+    assert snapshot["settle_application_ms"] == 0
+
+
+@pytest.mark.asyncio
+async def test_zero_remaining_budget_does_not_attempt_browser_capture(monkeypatch):
+    import app.health as health
+
+    async def capture(_):
+        pytest.fail("expired route must not perform a browser operation")
+
+    monkeypatch.setattr(health, "capture_render_health", capture)
+    snapshot = await wait_for_render_settle(object(), settle_ms=750, maximum_ms=0)
+    assert snapshot["settle_reason"] == "BOUNDED_TIMEOUT"
+    assert snapshot["settle_elapsed_ms"] == 0
+
+
+@pytest.mark.asyncio
+async def test_slow_dom_diagnostic_is_bounded_and_not_application_slow_time(monkeypatch):
+    import app.health as health
+
+    async def capture(_):
+        await health.asyncio.sleep(1)
+
+    monkeypatch.setattr(health, "capture_render_health", capture)
+    started = health.time.perf_counter()
+    snapshot = await wait_for_render_settle(object(), settle_ms=750, maximum_ms=20)
+    elapsed = health.time.perf_counter() - started
+    assert elapsed < 0.2
+    assert snapshot["settle_reason"] == "BOUNDED_TIMEOUT"
+    assert snapshot["settle_application_ms"] == 0
+    assert snapshot["settle_capture_ms"] >= 10
+
+
+@pytest.mark.asyncio
+async def test_visible_loader_and_network_activity_are_not_confused_with_quiet_confirmation(monkeypatch):
+    import app.health as health
+    clock = [0.0]
+
+    async def sleep(seconds):
+        clock[0] += seconds
+
+    async def capture(_):
+        busy = clock[0] < 0.3
+        return {
+            "ready_state": "complete", "title": "Generic portal",
+            "text_length": 10 if busy else 100, "visible_elements": 10,
+            "busy_indicators": int(busy), "challenge_indicators": 0,
+        }
+
+    def activity():
+        return {
+            "pending": int(clock[0] < 0.35),
+            "generation": 1 if clock[0] < 0.35 else 2,
+            "last_activity": 0.0 if clock[0] < 0.35 else 0.35,
+        }
+
+    monkeypatch.setattr(health.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(health.asyncio, "sleep", sleep)
+    monkeypatch.setattr(health, "capture_render_health", capture)
+    snapshot = await wait_for_render_settle(
+        object(), settle_ms=200, maximum_ms=5000, network_activity=activity,
+        minimum_observation_ms=1000, network_quiet_ms=300,
+    )
+    assert snapshot["settle_reason"] == "DOM_AND_NETWORK_QUIET"
+    assert 350 <= snapshot["settle_application_ms"] <= 400
+    assert snapshot["settle_elapsed_ms"] < 1200
+    assert snapshot["settle_validator_observation_ms"] >= 600
 
 
 def test_disabled_performance_check_does_not_emit_slow_warning():

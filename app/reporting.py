@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter
+import math
 from typing import Any
 from urllib.parse import urlparse
 
 from app.navigation import classify_navigation_error
-from app.network import safe_api_identity
+from app.network import public_policy_classification, safe_api_identity, summarize_route_api_coverage
+from app.security import sanitize_text, sanitize_url
 
 
 PASS_OUTCOMES = frozenset({"PASS", "PASS_WITH_WARNINGS"})
@@ -28,6 +30,21 @@ FAILURE_OUTCOMES = frozenset({
     "PAGE_RENDER_ERROR",
     "FAIL",
 })
+API_WARNING_TYPES = frozenset({
+    "API_AUTHENTICATION_FAILURE", "API_AUTHORIZATION_FAILURE", "API_BAD_REQUEST",
+    "API_CLIENT_ERROR", "API_CONFLICT", "API_CORS_FAILURE", "API_DNS_FAILURE",
+    "API_NETWORK_FAILURE", "API_NOT_FOUND", "API_RATE_LIMITED", "API_REQUEST_FAILED",
+    "API_RESPONSE_BODY_FAILURE", "API_SERVER_ERROR_OPTIONAL", "API_TIMEOUT", "API_TLS_FAILURE",
+})
+
+
+def _api_validation_status(items: list[dict[str, Any]], *, loaded: bool) -> str:
+    types = {str(item.get("type")) for item in items}
+    return (
+        "FAIL" if "API_SERVER_ERROR" in types else
+        "WARNING" if types & API_WARNING_TYPES else
+        "PASS" if loaded else "NOT_TESTED"
+    )
 
 
 def finding(
@@ -173,7 +190,7 @@ def determine_page_outcome(
         return base_classification
     if any(item.get("blocking") for item in findings):
         return "VALIDATION_FAILED"
-    if any(item.get("severity") == "WARNING" for item in findings):
+    if any(item.get("severity") in {"WARNING", "ERROR"} for item in findings):
         return "PASS_WITH_WARNINGS"
     return "PASS"
 
@@ -190,6 +207,78 @@ FAILURE_DIMENSIONS = {
     "RESOURCE_FAILED": "RESOURCES",
     "READ_ONLY_MUTATION_BLOCKED": "READ_ONLY_SAFETY",
 }
+
+
+def structured_warning_reasons(
+    classification: str, findings: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Explain non-blocking warnings without copying arbitrary finding payloads."""
+    if classification == "PASS":
+        return []
+    reasons: list[dict[str, Any]] = []
+    for item in findings:
+        if item.get("blocking") or item.get("severity") not in {"WARNING", "ERROR"}:
+            continue
+        original_code = str(item.get("type") or "UNKNOWN")
+        component = "VALIDATION"
+        if original_code in {"SLOW_PAGE", "SLOW_ROUTE"}:
+            code, component = "SLOW_ROUTE", "PERFORMANCE"
+        elif original_code in {"CONSOLE_ERROR", "CONSOLE_WARNING", "PAGE_SCRIPT_ERROR"}:
+            code, component = "CONSOLE_WARNING", "CONSOLE"
+        elif original_code == "MISSING_SECURITY_HEADER":
+            code, component = "SECURITY_RECOMMENDATION", "SECURITY"
+        elif original_code == "READ_ONLY_MUTATION_BLOCKED":
+            code, component = "READ_ONLY_BLOCK", "READ_ONLY_SAFETY"
+        elif original_code == "RESOURCE_FAILED":
+            code, component = "NON_CRITICAL_RESOURCE_FAILURE", "RESOURCES"
+        elif original_code.startswith("LARGE_"):
+            code, component = original_code, "RESOURCES"
+        elif original_code.startswith("API_"):
+            code = (
+                "BACKGROUND_API_WARNING" if item.get("importance") == "BACKGROUND" else
+                "OPTIONAL_API_FAILURE" if item.get("importance") == "OPTIONAL" or original_code.endswith("_OPTIONAL") else
+                "API_WARNING"
+            )
+            component = "API"
+        elif original_code == "RENDER_STILL_BUSY":
+            code, component = "APPLICATION_STILL_BUSY", "RENDER"
+        else:
+            code = "OTHER_NON_BLOCKING_WARNING"
+        evidence: dict[str, Any] = {"original_code": sanitize_text(original_code, limit=100)}
+        resource = item.get("resource")
+        if isinstance(resource, str):
+            evidence["resource"] = (
+                sanitize_url(resource) if resource.startswith(("http://", "https://"))
+                else sanitize_text(resource, limit=1000)
+            )
+        for key in (
+            "http_status", "count", "observed_ms", "duration_ms", "threshold_ms",
+            "threshold_bytes", "transfer_size_bytes", "encoded_body_size_bytes", "decoded_body_size_bytes",
+        ):
+            value = item.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+                evidence[key] = value
+        reason: dict[str, Any] = {
+            "code": code,
+            "description": sanitize_text(item.get("message") or code.replace("_", " ").title(), limit=1000),
+            "severity": "WARNING",
+            "evidence": evidence,
+            "affected_component": component,
+        }
+        for key, unit in (("threshold_ms", "ms"), ("threshold_bytes", "bytes")):
+            if key in evidence:
+                reason["threshold"] = {"value": evidence[key], "unit": unit}
+                break
+        reasons.append(reason)
+    if classification == "PASS_WITH_WARNINGS" and not reasons:
+        reasons.append({
+            "code": "OTHER_NON_BLOCKING_WARNING",
+            "description": "The route validated with a non-blocking warning; detailed warning evidence was unavailable.",
+            "severity": "WARNING",
+            "evidence": {"basis": "LEGACY_NON_BLOCKING_OUTCOME"},
+            "affected_component": "VALIDATION",
+        })
+    return reasons
 
 
 def failure_metadata(
@@ -260,6 +349,7 @@ def classify_page_result(
     if base_classification == "PASS" and render_classification:
         base_classification = render_classification
     classification = determine_page_outcome(base_classification, structured_findings)
+    warning_reasons = structured_warning_reasons(classification, structured_findings)
     page_load_status = (
         "LOADED" if loaded else
         "NOT_TESTED" if classification in LIMITED_OUTCOMES else
@@ -303,7 +393,7 @@ def classify_page_result(
         validation_status = "NOT_TESTED"
     elif classification in FAILURE_OUTCOMES:
         validation_status = "FAIL"
-    elif severity_counts["WARNING"]:
+    elif classification == "PASS_WITH_WARNINGS" or severity_counts["WARNING"]:
         validation_status = "WARNING"
     else:
         validation_status = "PASS"
@@ -314,17 +404,7 @@ def classify_page_result(
         )
     )
     finding_types = {item["type"] for item in structured_findings}
-    api_warning_types = {
-        "API_AUTHENTICATION_FAILURE", "API_AUTHORIZATION_FAILURE", "API_BAD_REQUEST",
-        "API_CLIENT_ERROR", "API_CONFLICT", "API_CORS_FAILURE", "API_DNS_FAILURE",
-        "API_NETWORK_FAILURE", "API_NOT_FOUND", "API_RATE_LIMITED", "API_REQUEST_FAILED",
-        "API_SERVER_ERROR_OPTIONAL", "API_TIMEOUT", "API_TLS_FAILURE",
-    }
-    api_status = (
-        "FAIL" if "API_SERVER_ERROR" in finding_types else
-        "WARNING" if finding_types & api_warning_types else
-        "PASS" if loaded else "NOT_TESTED"
-    )
+    api_status = _api_validation_status(structured_findings, loaded=loaded)
     resource_status = (
         "WARNING" if finding_types & {"RESOURCE_FAILED", "RESOURCE_SKIPPED"} else
         "PASS" if loaded else "NOT_TESTED"
@@ -386,7 +466,7 @@ def classify_page_result(
         "api_status": api_status,
         "resource_status": resource_status,
         "console_status": console_status,
-        "performance_status": "WARNING" if "SLOW_PAGE" in finding_types else (
+        "performance_status": "WARNING" if finding_types & {"SLOW_PAGE", "SLOW_ROUTE"} else (
             "PASS" if loaded else "NOT_TESTED"
         ),
         "read_only_status": (
@@ -396,6 +476,9 @@ def classify_page_result(
         "failure_dimension": failure_dimension,
         "failure_details": failure_details,
         "finding_details": structured_findings,
+        "warning_reasons": warning_reasons,
+        "warning_count": len(warning_reasons),
+        "warning_codes": sorted({reason["code"] for reason in warning_reasons}),
         "findings": len(structured_findings),
         "finding_occurrences": occurrence_count,
         "info_findings": severity_counts["INFO"],
@@ -403,6 +486,97 @@ def classify_page_result(
         "error_findings": severity_counts["ERROR"],
         "passed": loaded and classification in PASS_OUTCOMES,
     }
+
+
+def refresh_route_api_health(
+    result: dict[str, Any], events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Reconcile late responses onto their original route without re-navigation.
+
+    Context-wide observation continues after one route's snapshot. Rebuild only
+    its API findings from the final event stream; preserve document, auth, TLS,
+    render, resource and performance evidence exactly as originally evaluated.
+    The caller supplies events attributed to this route activation, not a slice
+    of requests that happened to finish while another route was being scanned.
+    """
+    # health uses finding() above; a local import avoids a module import cycle.
+    from app.health import api_health_findings
+
+    target_events = [event for event in events if not event.get("blocked_by_validator")]
+    items = deduplicate_findings([
+        *[
+            item for item in result.get("finding_details", [])
+            if not str(item.get("type") or "").startswith("API_")
+        ],
+        *api_health_findings(target_events),
+    ])
+    loaded = result.get("page_load_status") == "LOADED"
+    previous_classification = str(result.get("classification") or "PASS")
+    # VALIDATION_FAILED can be caused by an API snapshot alone. Re-evaluate its
+    # retained non-API blocking findings, without changing genuine nav/auth/
+    # render failures or asserting that an unloaded document became healthy.
+    base_classification = (
+        "PASS" if loaded and previous_classification in (PASS_OUTCOMES | {"VALIDATION_FAILED"})
+        else previous_classification
+    )
+    classification = determine_page_outcome(base_classification, items)
+    reasons = structured_warning_reasons(classification, items)
+    severities = Counter(item.get("severity") for item in items)
+    failure_reason, failure_dimension, failure_details = failure_metadata(
+        classification, items, result.get("error"),
+    )
+    failed_events = [
+        event for event in target_events
+        if event.get("error") or (
+            isinstance(event.get("status"), int) and event["status"] >= 400
+        )
+    ]
+    required_failures = sum(event.get("importance") == "REQUIRED" for event in failed_events)
+    updated = dict(result)
+    updated.update({
+        "classification": classification,
+        "category": (
+            "TLS_CERTIFICATE_ERROR" if classification == "TLS_ERROR" else
+            "VALIDATION_FINDINGS" if classification == "PASS_WITH_WARNINGS" else
+            None if classification == "PASS" else classification
+        ),
+        "validation_status": (
+            "NOT_TESTED" if not loaded or classification in AUTH_OUTCOMES or classification in LIMITED_OUTCOMES else
+            "FAIL" if classification in FAILURE_OUTCOMES else
+            "WARNING" if classification == "PASS_WITH_WARNINGS" else "PASS"
+        ),
+        "passed": loaded and classification in PASS_OUTCOMES,
+        "finding_details": items,
+        "findings": len(items),
+        "finding_occurrences": sum(int(item.get("count", 1)) for item in items),
+        "info_findings": severities["INFO"],
+        "warning_findings": severities["WARNING"],
+        "error_findings": severities["ERROR"],
+        "warning_reasons": reasons,
+        "warning_count": len(reasons),
+        "warning_codes": sorted({reason["code"] for reason in reasons}),
+        "failure_reason": failure_reason,
+        "failure_dimension": failure_dimension,
+        "failure_details": failure_details,
+        "api_requests": list(events),
+        "api_status": _api_validation_status(items, loaded=loaded),
+        "api_failures": len(failed_events),
+        "failed_api_count": len(failed_events),
+        "failed_required_api_count": required_failures,
+        "failed_optional_api_count": len(failed_events) - required_failures,
+        "api_network_failure_count": sum(
+            bool(event.get("error")) and not isinstance(event.get("status"), int)
+            for event in failed_events
+        ),
+        "read_only_blocks": sum(
+            bool(event.get("blocked_by_validator")) and event.get("block_reason") in {
+                "READ_ONLY_MUTATION_BLOCKED", "read_only_mutation_policy",
+            }
+            for event in events
+        ),
+        **summarize_route_api_coverage(events),
+    })
+    return updated
 
 
 def aggregate_report(
@@ -496,6 +670,7 @@ def aggregate_report(
         "termination_reason": termination_reason,
         "scan_completeness": (
             "CANCELLED" if termination_reason == "USER_CANCELLED"
+            else "PARTIAL" if termination_reason == "SCAN_TIMEOUT"
             else "COMPLETE" if termination_reason == "DISCOVERY_EXHAUSTED" and not_tested_count == 0
             else "FAILED" if not results
             else "PARTIAL"
@@ -693,6 +868,9 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             "policies": sorted({
                 "READ_ONLY_BLOCK" if name == "BLOCKED_MUTATION" else name
                 for name in classifications
+            }),
+            "policy_classifications": sorted({
+                public_policy_classification(name) for name in classifications
             }),
             "classification_counts": classifications,
             "block_reasons": block_reasons,

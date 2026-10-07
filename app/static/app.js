@@ -12,6 +12,7 @@ let refreshProfiles = new Set();
 let profileMessage = '';
 let routeSort = {key:'route_name', direction:1};
 let apiSort = {key:'host', direction:1};
+let resourceSort = {key:'transfer_size_bytes', direction:-1};
 let progressTimer = null;
 let activeDrilldown = 'all';
 let apiFailureOnly = false;
@@ -26,6 +27,7 @@ const passOutcomes = new Set(['PASS','PASS_WITH_WARNINGS']);
 const terminalStates = new Set(['COMPLETED','PARTIAL','FAILED','CANCELLED']);
 const numericRouteKeys = new Set(['status','load_ms','api_failures','resource_failure_count','console_count','warning_findings']);
 const numericApiKeys = new Set(['calls','status_2xx','status_3xx','status_4xx','status_5xx','network_failures','route_count','allowed_calls','blocked_count','application_bootstrap_phase_count','authentication_phase_count','route_validation_phase_count','session_refresh_phase_count','average_duration_ms','worst_duration_ms']);
+const numericResourceKeys = new Set(['transfer_size_bytes','encoded_body_size_bytes','decoded_body_size_bytes','duration_ms','status']);
 
 // Preferences contain column names only, never scan data or credentials. Unknown
 // keys default to visible, so a newly introduced column is not silently hidden.
@@ -46,9 +48,9 @@ const tableColumns = {
     ['application_bootstrap_phase_count','Bootstrap Calls','Calls attributed to initial application or microfrontend bootstrap.'],
     ['authentication_phase_count','Auth Calls','Calls attributed to authentication/session establishment.'],
     ['route_validation_phase_count','Route Calls','Calls attributed to normal route activation.'],
-    ['session_refresh_phase_count','Refresh Calls','Calls attributed to browser/session refresh activity.'],
-    ['average_duration_ms','Avg Time','Mean actual completed API response duration in milliseconds; excludes blocked and no-response calls.'],
-    ['worst_duration_ms','Worst Time','Maximum actual completed API response duration in milliseconds.'],
+    ['session_refresh_phase_count','Refresh Calls','Recognized authentication/session/token-refresh calls; ordinary route calls are not refresh traffic.'],
+    ['average_duration_ms','Average Time (ms)','Mean actual completed API response duration in milliseconds; excludes blocked and no-response calls.'],
+    ['worst_duration_ms','Worst Time (ms)','Maximum actual completed API response duration in milliseconds.'],
     ['observation_outcome','Health','Aggregated API health; policy-blocked-only calls are NOT_EXECUTED.'],
     ['policies','Policy','Observed read-only approval/block decisions. No request bodies are inspected.'],
   ],
@@ -66,6 +68,19 @@ const tableColumns = {
     ['tls_status','TLS','Verified browser TLS trust; not an origin-certificate inspection claim.'],
     ['warning_findings','Warnings','Count and drill-down of sanitized non-fatal findings.'],
     ['details','Details','Route evidence and timing breakdown.'],
+  ],
+  resource: [
+    ['type','Type','Naturally observed browser resource type.'],
+    ['host','Host','Sanitized destination hostname.'],
+    ['path','Resource','Sanitized resource path; no additional download is made.',true],
+    ['transfer_size_bytes','Transfer','Browser transfer bytes, including headers where available. N/A means unknown.'],
+    ['encoded_body_size_bytes','Encoded','Compressed response body bytes where available.'],
+    ['decoded_body_size_bytes','Decoded','Decompressed response body bytes where available.'],
+    ['duration_ms','Duration','Browser-observed resource duration in milliseconds.'],
+    ['route','Routes','Logical route on which the resource was observed.'],
+    ['status','Status','Observed HTTP status; N/A means no response status was available.'],
+    ['size_categories','Size warning','Warnings evaluated against the effective UI-configured byte thresholds.'],
+    ['health','Health','Failed resource observations do not automatically fail main-document navigation.'],
   ],
 };
 const columnPreferences = {};
@@ -93,7 +108,7 @@ function saveColumnPreferences(kind) {
 
 function setupTableControls(kind) {
   columnPreferences[kind] = loadColumnPreferences(kind);
-  const tools = document.querySelector(kind === 'api' ? '.api-tools' : '.report-tools');
+  const tools = document.querySelector(kind === 'api' ? '.api-tools' : kind === 'resource' ? '.resource-tools' : '.report-tools');
   const headers = document.querySelectorAll(`#${kind}-table-wrap th`);
   tableColumns[kind].forEach(([key,label,description], index) => {
     const header = headers[index];
@@ -105,7 +120,7 @@ function setupTableControls(kind) {
   });
   const controls = document.createElement('div');
   controls.className = 'table-controls';
-  controls.innerHTML = `<details class="columns-control" id="${kind}-columns"><summary>Columns</summary><div class="columns-panel"><div class="column-actions"><button type="button" data-column-action="all">Select all</button><button type="button" data-column-action="clear">Clear all</button><button type="button" data-column-action="reset">Reset default</button></div><p>Identifying columns remain visible.</p>${tableColumns[kind].map(([key,label,description,required]) => `<label title="${escapeHtml(description)}"><input type="checkbox" data-column-kind="${kind}" data-column-key="${key}" ${required ? 'disabled' : ''}> ${escapeHtml(label)}</label>`).join('')}</div></details><label class="field density-control"><span>Density</span><select id="${kind}-density" aria-label="${kind === 'api' ? 'API' : 'Route'} table density"><option value="compact">Compact</option><option value="comfortable">Comfortable</option></select></label>`;
+  controls.innerHTML = `<details class="columns-control" id="${kind}-columns"><summary>Columns</summary><div class="columns-panel"><div class="column-actions"><button type="button" data-column-action="all">Select all</button><button type="button" data-column-action="clear">Clear all</button><button type="button" data-column-action="reset">Reset default</button></div><p>Identifying columns remain visible.</p>${tableColumns[kind].map(([key,label,description,required]) => `<label title="${escapeHtml(description)}"><input type="checkbox" data-column-kind="${kind}" data-column-key="${key}" ${required ? 'disabled' : ''}> ${escapeHtml(label)}</label>`).join('')}</div></details><label class="field density-control"><span>Density</span><select id="${kind}-density" aria-label="${kind === 'api' ? 'API' : kind === 'resource' ? 'Resource' : 'Route'} table density"><option value="compact">Compact</option><option value="comfortable">Comfortable</option></select></label>`;
   tools.append(controls);
   controls.querySelectorAll('[data-column-kind]').forEach((input) => input.addEventListener('change', () => {
     columnPreferences[kind][input.dataset.columnKey] = input.checked;
@@ -285,14 +300,26 @@ function detailSection(title, value) {
   return `<details class="technical-detail"><summary>${escapeHtml(title)}</summary><pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre></details>`;
 }
 
+function routeWarnings(item) {
+  if (item.classification === 'PASS') return [];
+  if (Array.isArray(item.warning_reasons)) return item.warning_reasons;
+  // Compatibility for saved reports generated before structured warning reasons.
+  return (item.finding_details || [])
+    .filter((finding) => !['ERROR','CRITICAL','FAIL'].includes(String(finding.severity || '').toUpperCase()))
+    .map((finding) => ({code:finding.type,description:finding.message,severity:finding.severity,affected_component:finding.resource || 'ROUTE',evidence:undefined}));
+}
+
+function warningReasonsMarkup(item) {
+  const warnings = routeWarnings(item);
+  if (!warnings.length) return '<p class="empty-detail">No non-blocking warning reasons were recorded.</p>';
+  return `<ul class="finding-list warning-reasons">${warnings.map((warning) => `<li><strong>${escapeHtml(warning.code || 'OTHER_NON_BLOCKING_WARNING')}</strong><span>${escapeHtml(warning.description || warning.message || 'Non-blocking warning')}</span><small>${escapeHtml(warning.severity || 'WARNING')} · ${escapeHtml(warning.affected_component || 'ROUTE')}</small>${warning.threshold != null ? `<small>Configured threshold: ${escapeHtml(typeof warning.threshold === 'object' ? `${warning.threshold.value ?? 'N/A'} ${warning.threshold.unit || ''}` : warning.threshold)}</small>` : ''}${warning.evidence != null ? detailSection('Safe evidence', warning.evidence) : ''}</li>`).join('')}</ul>`;
+}
+
 function showRouteWarnings(item) {
-  const warnings = (item.finding_details || []).filter((finding) => !['ERROR','CRITICAL','FAIL'].includes(String(finding.severity || '').toUpperCase()));
-  const categories = [...new Set(warnings.map((finding) => finding.type).filter(Boolean))];
-  showEvidence(`Warnings: ${item.display_path || routeDisplay(item).path}`, {
-    warning_count:item.warning_findings || warnings.length,
-    warning_categories:categories,
-    warnings:warnings.map(({type,severity,message,resource,count}) => ({type,severity,message,resource,count})),
-  });
+  byId('evidence-title').textContent = `Warnings (${routeWarnings(item).length}): ${item.display_path || routeDisplay(item).path}`;
+  byId('evidence-content').innerHTML = `<p class="warning-health-note">Non-blocking warnings: this route remains healthy.</p>${warningReasonsMarkup(item)}`;
+  byId('evidence-panel').hidden = false;
+  scrollAndFocus(byId('evidence-panel'));
 }
 
 function renderRows() {
@@ -300,7 +327,7 @@ function renderRows() {
   const query = byId('result-search').value.trim().toLowerCase();
   const filter = byId('result-filter').value;
   const navigationFilter = byId('navigation-filter').value;
-  const rows = [...lastReport.results].map((item) => ({...item, console_count:(item.console_errors?.length || 0) + (item.page_errors?.length || 0)})).filter((item) => {
+  const rows = [...lastReport.results].map((item) => ({...item, warning_findings:routeWarnings(item).length, console_count:(item.console_errors?.length || 0) + (item.page_errors?.length || 0)})).filter((item) => {
     const haystack = `${item.url} ${item.route_name || ''} ${item.display_path || ''} ${item.document_title || item.title || ''} ${item.navigation_label || item.route_label || ''} ${item.classification} ${item.failure_reason || ''}`.toLowerCase();
     return (!query || haystack.includes(query)) && matchesOutcome(item, filter) && matchesDrilldown(item) && (navigationFilter === 'all' || item.navigation_type === navigationFilter);
   });
@@ -314,24 +341,34 @@ function renderRows() {
   byId('result-list').innerHTML = rows.map((item) => {
     const route = routeDisplay(item);
     const routeIdentity = {requested_url:item.requested_url,discovered_url:item.discovered_url,final_url:item.final_url,origin:item.origin,host:item.host,pathname:item.pathname,query_sanitized:item.query_sanitized,fragment:item.fragment,spa_route:item.spa_route,canonical_route:item.canonical_route,display_path:item.display_path,route_name:item.route_name,route_name_source:item.route_name_source,route_name_confidence:item.route_name_confidence,discovery_sources:item.discovery_sources,duplicate_discovery_count:item.duplicate_discovery_count};
-    const detail = {route_identity:routeIdentity,redirects:item.redirects,navigation_type:item.navigation_type,tls_basis:item.tls_basis,render_health:item.render_health,timings:{navigation_ms:item.navigation_ms,render_ready_ms:item.render_ready_ms,application_settle_ms:item.application_settle_ms,validator_observation_ms:item.validator_observation_ms,total_validation_ms:item.total_validation_ms,application_load_ms:item.application_load_ms},api_coverage:item.api_coverage,apis_observed:item.apis_observed,application_apis_observed:item.application_apis_observed,blocked_api_attempts:item.blocked_api_attempts,api_failures:item.api_failures,resource_failures:item.resource_failure_count,api_requests:item.api_requests,resources:item.resources,failed_resources:item.failed_resources,frames:item.frames,security_headers:item.security_headers,external_links:item.external_links};
+    const detail = {route_identity:routeIdentity,redirects:item.redirects,navigation_type:item.navigation_type,tls_basis:item.tls_basis,render_health:item.render_health,timings:{application_navigation_ms:item.application_navigation_ms ?? item.navigation_ms,application_settle_ms:item.application_settle_ms,validator_overhead_ms:item.validator_overhead_ms,validator_observation_ms:item.validator_observation_ms,total_validation_ms:item.total_validation_ms,application_load_ms:item.application_load_ms,...(item.timings || {})},warning_reasons:item.warning_reasons,api_coverage:item.api_coverage,apis_observed:item.apis_observed,application_apis_observed:item.application_apis_observed,blocked_api_attempts:item.blocked_api_attempts,api_failures:item.api_failures,resource_failures:item.resource_failure_count,api_requests:item.api_requests,resources:item.resources,failed_resources:item.failed_resources,frames:item.frames,security_headers:item.security_headers,external_links:item.external_links};
     const failure = item.failure_reason ? `<small class="failure-reason"><b>${escapeHtml(item.failure_dimension || 'VALIDATION')}</b>${escapeHtml(item.failure_reason)}</small>` : '';
     return `<tr class="route-row outcome-${statusClass(item.classification)}"><td><span class="outcome-badge ${statusClass(item.classification)}">${escapeHtml(item.classification)}</span>${failure}</td><td class="route-name-cell"><strong>${escapeHtml(item.route_name || item.route_label || 'Unnamed route')}</strong><small>${escapeHtml(item.route_name_source || 'FALLBACK')}</small></td><td class="route-cell"><span>${escapeHtml(route.host)}</span><code>${escapeHtml(route.path)}</code></td><td><span class="dimension-state ${statusClass(item.navigation_status)}">${escapeHtml(item.navigation_type || 'DOCUMENT_NAVIGATION')}</span></td><td><strong class="http-status">${escapeHtml(item.http_status_display ?? item.status ?? 'N/A')}</strong></td><td><span class="time-value ${item.slow ? 'slow' : ''}">${escapeHtml(item.load_ms ?? '—')} ms</span></td><td><span class="dimension-state ${statusClass(item.api_status)}">${escapeHtml(item.api_status)}</span></td><td><span class="dimension-state ${statusClass(item.resource_status)}">${escapeHtml(item.resource_status)}</span></td><td><span class="dimension-state ${statusClass(item.console_status)}">${escapeHtml(item.console_status)}</span></td><td><span class="dimension-state ${statusClass(item.authentication_status)}">${escapeHtml(item.authentication_status)}</span></td><td><span class="dimension-state ${statusClass(item.tls_status)}">${escapeHtml(item.tls_status)}</span></td><td><strong>${escapeHtml(item.warning_findings || 0)}</strong></td><td><details class="route-detail"><summary>Inspect</summary><div class="detail-drawer"><div class="result-overview"><div><span>Page load</span><strong class="state ${statusClass(item.page_load_status)}">${escapeHtml(item.page_load_status)}</strong></div><div><span>Validation</span><strong class="state ${statusClass(item.validation_status)}">${escapeHtml(item.validation_status)}</strong></div><div><span>Render</span><strong class="state ${statusClass(item.render_status)}">${escapeHtml(item.render_status)}</strong></div><div><span>TLS</span><strong class="state ${statusClass(item.tls_status)}">${escapeHtml(item.tls_status)}</strong></div><div><span>Security headers</span><strong class="state ${statusClass(item.security_headers_status)}">${escapeHtml(item.security_headers_status)}</strong></div><div><span>Read-only</span><strong class="state ${statusClass(item.read_only_status)}">${escapeHtml(item.read_only_status)}</strong></div><div><span>Navigation</span><strong>${escapeHtml(item.navigation_type || 'DOCUMENT_NAVIGATION')}</strong></div><div><span>Discovery</span><strong>${escapeHtml(item.discovery_type || item.route_source || 'route')}</strong></div><div><span>Depth</span><strong>${escapeHtml(item.depth)}</strong></div></div>${item.failure_reason ? `<h3>Failure explanation</h3><p class="failure-explanation"><b>${escapeHtml(item.failure_dimension || 'VALIDATION')}</b>${escapeHtml(item.failure_reason)}</p>` : ''}<h3>Route identity</h3>${detailSection('Identity and provenance', routeIdentity)}<h3>Findings</h3>${findingsMarkup(item)}${detailSection('Navigation and redirects', {requested_url:item.requested_url,final_url:item.final_url,redirects:item.redirects})}${detailSection('API / XHR', item.api_requests)}${detailSection('Resources', item.resources)}${detailSection('Console', {console:item.console_errors,page_errors:item.page_errors})}${detailSection('Security headers', item.security_headers)}${detailSection('Performance', item.render_health)}${detailSection('Read-only safety', {status:item.read_only_status,blocks:item.read_only_blocks})}<details class="technical-detail"><summary>Technical route data</summary><pre>${escapeHtml(JSON.stringify(detail, null, 2))}</pre></details></div></details></td></tr>`;
   }).join('') || '<tr><td colspan="13" class="empty-table">No routes match this filter.</td></tr>';
   byId('result-list').querySelectorAll('.route-row').forEach((row, index) => {
     const item = rows[index];
+    const warnings = routeWarnings(item);
+    if (warnings.length) row.querySelector('.result-overview').insertAdjacentHTML('afterend', `<h3>Why this route has warnings</h3>${warningReasonsMarkup(item)}`);
     if (!Number(item.warning_findings || 0)) return;
     const cell = row.children[11];
     const button = document.createElement('button');
     button.type = 'button'; button.className = 'warning-count';
     button.textContent = item.warning_findings;
     button.setAttribute('aria-label', `Show ${item.warning_findings} warnings for ${item.route_name || item.display_path || 'route'}`);
+    const warningDescription = warnings.map((warning) => warning.description || warning.message || warning.code).join('\n');
+    button.title = warningDescription;
     button.addEventListener('click', () => showRouteWarnings(item));
     cell.replaceChildren(button);
+    const summary = document.createElement('small');
+    summary.className = 'warning-summary';
+    summary.textContent = [...new Set(warnings.map((warning) => String(warning.code || 'WARNING').toLowerCase().replaceAll('_', ' ')))].join(', ');
+    summary.title = warningDescription;
+    cell.append(summary);
     if (item.classification === 'PASS_WITH_WARNINGS') {
       const badge = row.querySelector('.outcome-badge');
       badge.tabIndex = 0; badge.setAttribute('role', 'button');
-      badge.title = 'Show warning count, categories, and descriptions';
+      badge.textContent = `PASS WITH WARNINGS (${warnings.length})`;
+      badge.title = warningDescription;
       badge.addEventListener('click', () => showRouteWarnings(item));
       badge.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showRouteWarnings(item); } });
     }
@@ -351,9 +388,17 @@ function updateApiRouteFilter(inventory) {
 function updateApiMethodFilter(inventory) {
   const select = byId('api-method-filter');
   const current = select.value;
-  const methods = [...new Set(inventory.map((item) => item.method).filter(Boolean))].sort();
+  const methods = [...new Set(['GET','POST',...inventory.map((item) => item.method).filter(Boolean)])].sort();
   select.innerHTML = `<option value="all">All methods</option>${methods.map((method) => `<option value="${escapeHtml(method)}">${escapeHtml(method)}</option>`).join('')}`;
   if (methods.includes(current)) select.value = current;
+}
+
+function apiDisplayPolicies(item) {
+  // Reports retain legacy internal names for compatibility. Normalize only the
+  // presentation/filter boundary; this does not grant any request approval.
+  const aliases = {APPROVED_READ_POST:'APPROVED_READ_ONLY',APPROVED_READ_REQUEST:'APPROVED_READ_ONLY',BLOCKED_MUTATION:'READ_ONLY_BLOCKED',READ_ONLY_BLOCK:'READ_ONLY_BLOCKED'};
+  const names = [...(Array.isArray(item.policy_classifications) ? item.policy_classifications : []),...(Array.isArray(item.policies) ? item.policies : []),...Object.keys(item.classification_counts || {})];
+  return [...new Set(names.filter((name) => typeof name === 'string').map((name) => aliases[name] || name))].sort();
 }
 
 function renderApiInventory() {
@@ -366,10 +411,12 @@ function renderApiInventory() {
   const failedOnly = apiFailureOnly || byId('api-failed-only').checked;
   const visible = inventory.filter((item) => {
     const outcome = item.observation_outcome || (item.health === 'DEGRADED' ? 'WARNING' : item.health);
+    const policies = apiDisplayPolicies(item);
+    const targetFailure = Number(item.status_4xx || 0) + Number(item.status_5xx || 0) + Number(item.network_failures || 0) + Number(item.response_body_failures || 0) > 0;
     return (!search || `${item.host} ${item.endpoint}`.toLowerCase().includes(search))
       && (method === 'all' || item.method === method)
       && (health === 'all' || outcome === health)
-      && (policy === 'all' || (policy === 'blocked' ? Number(item.blocked_count || 0) > 0 : Number(item.allowed_calls ?? item.calls ?? 0) > 0))
+      && (policy === 'all' || (policy === 'blocked' ? Number(item.blocked_count || 0) > 0 : policy === 'approved-post' ? item.method === 'POST' && policies.includes('APPROVED_READ_ONLY') : policy === 'target-failures' ? targetFailure : Number(item.allowed_calls ?? item.calls ?? 0) > 0))
       && (route === 'all' || (item.routes_using_endpoint || []).includes(route))
       && (!failedOnly || ['FAILED','WARNING'].includes(outcome));
   });
@@ -380,9 +427,9 @@ function renderApiInventory() {
     const outcome = item.observation_outcome || (item.health === 'DEGRADED' ? 'WARNING' : item.health);
     const healthLabel = item.health === 'NOT_EXECUTED' ? 'NOT_EXECUTED' : outcome;
     const numbers = [item.calls,item.status_2xx,item.status_3xx,item.status_4xx,item.status_5xx,item.network_failures,item.route_count,item.allowed_calls ?? Math.max(0, Number(item.calls || 0) - Number(item.blocked_count || 0)),item.blocked_count || 0,item.application_bootstrap_phase_count || 0,item.authentication_phase_count || 0,item.route_validation_phase_count ?? item.validation_phase_count ?? 0,item.session_refresh_phase_count || 0,item.average_duration_ms ?? 'N/A',item.worst_duration_ms ?? 'N/A'];
-    const policies = item.policies || Object.keys(item.classification_counts || {});
+    const policies = apiDisplayPolicies(item);
     return `<tr><td><strong>${escapeHtml(item.method)}</strong></td><td>${escapeHtml(item.host)}</td><td><button class="api-endpoint" type="button" data-api-index="${index}" title="${escapeHtml(item.endpoint)}">${escapeHtml(item.endpoint)}</button></td>${numbers.map((value) => `<td>${escapeHtml(value)}</td>`).join('')}<td><span class="dimension-state ${statusClass(healthLabel)}">${escapeHtml(healthLabel)}</span></td><td class="api-policy-cell">${escapeHtml(policies.join(', ') || 'N/A')}</td></tr>`;
-  }).join('') || `<tr><td colspan="20" class="empty-table">${failedOnly ? 'No target API failures were observed during this scan.' : 'No API requests match these filters.'}</td></tr>`;
+  }).join('') || `<tr><td colspan="20" class="empty-table">${method === 'POST' && !inventory.some((item) => item.method === 'POST') ? 'No POST requests were observed for this scan.' : failedOnly || policy === 'target-failures' ? 'No target API failures match these filters.' : 'No API requests match these filters.'}</td></tr>`;
   byId('api-list').querySelectorAll('[data-api-index]').forEach((button) => button.addEventListener('click', () => {
     const item = visible[Number(button.dataset.apiIndex)];
     showEvidence(`${item.method} ${item.host}${item.endpoint}`, item);
@@ -405,19 +452,34 @@ function renderResourceDetails() {
   const details = lastReport?.resource_details || [];
   const filter = byId('resource-type-filter').value;
   const largeOnly = byId('resource-large-only').checked;
+  const search = byId('resource-search').value.trim().toLowerCase();
+  const route = byId('resource-route-filter').value;
+  const status = byId('resource-status-filter').value;
+  const failedOnly = byId('resource-failed-only').checked;
   const knownTypes = new Set(['image','script','stylesheet','font','xhr','fetch']);
   const visible = details.filter((item) => {
     const type = String(item.type || item.resource_type || '').toLowerCase();
     return (filter === 'all' || (filter === 'failed' ? resourceIsFailed(item) : filter === 'api' ? ['xhr','fetch'].includes(type) : filter === 'other' ? !knownTypes.has(type) : type === filter))
+      && (!search || `${item.host} ${item.path || item.endpoint || ''} ${item.content_type || ''}`.toLowerCase().includes(search))
+      && (route === 'all' || item.route === route)
+      && (status === 'all' || (status === 'unknown' ? item.status == null : Math.floor(Number(item.status) / 100) === Number(status)))
+      && (!failedOnly || resourceIsFailed(item))
       && (!largeOnly || Boolean(item.size_categories?.length));
-  }).sort((left, right) => Number(right.transfer_size_bytes ?? -1) - Number(left.transfer_size_bytes ?? -1));
+  }).sort((left, right) => compareValues(left[resourceSort.key], right[resourceSort.key], numericResourceKeys.has(resourceSort.key)) * resourceSort.direction);
+  updateAriaSort('[data-resource-sort]', resourceSort, 'resourceSort');
   byId('resource-count').textContent = `${visible.length} of ${details.length} resource observations`;
-  byId('resource-list').innerHTML = visible.map((item) => `<tr><td>${escapeHtml(item.type || item.resource_type || 'OTHER')}</td><td class="resource-path"><span>${escapeHtml(item.host || '')}</span><code>${escapeHtml(item.path || item.endpoint || item.url || '')}</code></td><td>${escapeHtml(formatBytes(item.transfer_size_bytes))}</td><td>${escapeHtml(formatBytes(item.encoded_body_size_bytes))}</td><td>${escapeHtml(formatBytes(item.decoded_body_size_bytes))}</td><td class="resource-path">${escapeHtml(item.route || '')}</td><td>${escapeHtml(item.status ?? (resourceIsFailed(item) ? 'FAILED' : 'N/A'))}</td><td>${escapeHtml(item.duration_ms == null ? 'N/A' : `${item.duration_ms} ms`)}</td><td>${escapeHtml((item.size_categories || []).join(', ') || '—')}</td></tr>`).join('') || '<tr><td colspan="9" class="empty-table">No observed resources match these filters.</td></tr>';
+  byId('resource-list').innerHTML = visible.map((item) => `<tr><td>${escapeHtml(item.type || item.resource_type || 'OTHER')}</td><td>${escapeHtml(item.host || '')}</td><td class="resource-path" title="${escapeHtml(item.content_type || 'Content type unavailable')}"><code>${escapeHtml(item.path || item.endpoint || item.url || '')}</code></td><td>${escapeHtml(formatBytes(item.transfer_size_bytes))}</td><td>${escapeHtml(formatBytes(item.encoded_body_size_bytes))}</td><td>${escapeHtml(formatBytes(item.decoded_body_size_bytes))}</td><td>${escapeHtml(item.duration_ms == null ? 'N/A' : `${item.duration_ms} ms`)}</td><td class="resource-path">${escapeHtml(item.route || '')}</td><td>${escapeHtml(item.status ?? 'N/A')}</td><td title="${escapeHtml(item.warning_threshold_bytes == null ? 'No size warning' : `Configured threshold: ${formatBytes(item.warning_threshold_bytes)}`)}">${escapeHtml((item.size_categories || []).join(', ') || '—')}</td><td><span class="dimension-state ${resourceIsFailed(item) ? 'warning' : 'pass'}">${resourceIsFailed(item) ? 'WARNING' : 'OBSERVED'}</span></td></tr>`).join('') || '<tr><td colspan="11" class="empty-table">No observed resources match these filters.</td></tr>';
+  refreshScrollSync();
 }
 
 function renderResourceSummary() {
   const details = lastReport?.resource_details || [];
   const summary = lastReport?.resource_summary || {};
+  const routeSelect = byId('resource-route-filter');
+  const currentRoute = routeSelect.value;
+  const routes = [...new Set(details.map((item) => item.route).filter(Boolean))].sort();
+  routeSelect.innerHTML = `<option value="all">All routes</option>${routes.map((route) => `<option value="${escapeHtml(route)}">${escapeHtml(route)}</option>`).join('')}`;
+  if (routes.includes(currentRoute)) routeSelect.value = currentRoute;
   const measurable = details.filter((item) => item.transfer_size_bytes != null);
   const total = summary.total_transfer_size_bytes ?? (measurable.length ? measurable.reduce((sum,item) => sum + Number(item.transfer_size_bytes),0) : null);
   const cards = [
@@ -425,8 +487,8 @@ function renderResourceSummary() {
     ['Total Transfer',formatBytes(total)],
     ['Large Resources',summary.large_resources ?? details.filter((item) => item.size_categories?.length).length],
     ['Large Images',summary.large_images ?? details.filter((item) => item.size_categories?.includes('LARGE_IMAGE')).length],
-    ['Large JS Bundles',details.filter((item) => item.size_categories?.includes('LARGE_JS_BUNDLE')).length],
-    ['Large CSS / Fonts',`${details.filter((item) => String(item.type).toUpperCase() === 'STYLESHEET' && item.size_categories?.length).length} / ${details.filter((item) => String(item.type).toUpperCase() === 'FONT').length}`],
+    ['Large JS Bundles',summary.large_js_bundles ?? details.filter((item) => item.size_categories?.includes('LARGE_JS_BUNDLE')).length],
+    ['Large CSS / Fonts',summary.large_css_fonts ?? details.filter((item) => item.size_categories?.includes('LARGE_CSS_FONT') || ['STYLESHEET','FONT'].includes(String(item.type || '').toUpperCase()) && item.size_categories?.length).length],
     ['Resource Failures',summary.resource_failures ?? details.filter(resourceIsFailed).length],
   ];
   byId('resource-summary').innerHTML = cards.map(([label,value]) => `<div class="resource-card"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`).join('');
@@ -489,6 +551,7 @@ function renderReport(report) {
   byId('summary').querySelectorAll('[data-summary-action]').forEach((button) => button.addEventListener('click', () => activateSummary(button.dataset.summaryAction, button.querySelector('strong').textContent, button)));
   const coverage = report.coverage || {};
   byId('coverage').innerHTML = `<strong>${escapeHtml(coverage.scan_completeness || 'UNKNOWN')} SCAN</strong><span>${escapeHtml(terminationMessage(coverage))}</span>`;
+  byId('scan-diagnostics-content').innerHTML = `${detailSection('Effective scan configuration', report.scan_configuration || report.scan_config || {})}${detailSection('Scan timing breakdown', report.scan_timing || report.scan_timings || {})}`;
   byId('raw-report').textContent = JSON.stringify(report, null, 2);
   activeDrilldown = 'all';
   apiFailureOnly = false;
@@ -585,11 +648,14 @@ if (!byId('api-route-filter')) {
 const apiPolicyHeader = document.createElement('th');
 apiPolicyHeader.textContent = 'Policy';
 document.querySelector('#api-table-wrap thead tr').append(apiPolicyHeader);
+byId('api-policy-filter').insertAdjacentHTML('beforeend', '<option value="approved-post">Approved read-only POST</option><option value="target-failures">Target failures</option>');
 setupTableControls('route');
 setupTableControls('api');
+setupTableControls('resource');
 byId('add-read-post').addEventListener('click', addReadPostOperation);
 byId('resource-type-filter').addEventListener('change', renderResourceDetails);
 byId('resource-large-only').addEventListener('change', renderResourceDetails);
+['resource-search','resource-route-filter','resource-status-filter','resource-failed-only'].forEach((id) => byId(id).addEventListener(id === 'resource-search' ? 'input' : 'change', renderResourceDetails));
 
 authMode.addEventListener('change', renderAuthFields);
 byId('result-search').addEventListener('input', renderRows);
@@ -599,6 +665,7 @@ byId('navigation-filter').addEventListener('change', renderRows);
 byId('evidence-close').addEventListener('click', () => { byId('evidence-panel').hidden = true; });
 document.querySelectorAll('[data-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.sort; routeSort = {key, direction:routeSort.key === key ? -routeSort.direction : 1}; renderRows(); }));
 document.querySelectorAll('[data-api-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.apiSort; apiSort = {key, direction:apiSort.key === key ? -apiSort.direction : 1}; renderApiInventory(); }));
+document.querySelectorAll('[data-resource-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.resourceSort; resourceSort = {key, direction:resourceSort.key === key ? -resourceSort.direction : 1}; renderResourceDetails(); }));
 byId('cancel-button').addEventListener('click', async () => {
   if (!activeScanId) return;
   byId('cancel-button').disabled = true;
@@ -617,6 +684,10 @@ form.addEventListener('submit', async (event) => {
     payload.approved_read_post_operations = approvedReadPostOperations();
     payload.large_resource_threshold_bytes = Number(byId('large-resource-threshold').value) * 1024;
     payload.large_image_threshold_bytes = Number(byId('large-image-threshold').value) * 1024;
+    payload.large_js_threshold_bytes = Number(byId('large-js-threshold').value) * 1024;
+    payload.large_css_font_threshold_bytes = Number(byId('large-css-font-threshold').value) * 1024;
+    payload.min_observation_ms = Number(byId('min-observation').value);
+    payload.network_quiet_ms = Number(byId('network-quiet').value);
   } catch (error) { notify(error.message, true); return; }
   clearTransientCredentials();
   runButton.disabled = true;

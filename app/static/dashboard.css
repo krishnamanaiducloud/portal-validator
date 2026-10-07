@@ -133,6 +133,11 @@
 .resource-path { max-width: 340px; min-width: 180px; overflow-wrap: anywhere; }
 .resource-path span,.resource-path code { display: block; }
 .resource-path span { color: var(--muted); font-size: 10px; }
+.warning-summary { display: block; max-width: 155px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--warning); font-size: 10px; line-height: 1.4; margin-top: 3px; }
+.warning-health-note { color: var(--lime); font-size: 12px; }
+.warning-reasons small { display: block; color: var(--muted); font-size: 11px; }
+.resource-tools .field { min-width: 0; flex: 1 1 145px; }
+.resource-tools .table-controls { margin-left: auto; }
 @media (max-width: 1050px) {
   .scope-grid,.report-tools { grid-template-columns: 1fr 1fr; }
   .api-tools { grid-template-columns: 1fr 1fr 1fr; }

@@ -32,6 +32,10 @@ async def main():
         assert await page.locator("#auth-mode option").count() == 6
         assert await page.locator("#redirects").input_value() == "10"
         assert await page.locator("#pages").input_value() == "50"
+        assert "Maximum time / route" in await page.locator("#timeout").evaluate("element => element.closest('label').textContent")
+        assert await page.locator("#min-observation").input_value() == "500"
+        assert await page.locator("#network-quiet").input_value() == "300"
+        assert await page.locator("#slow-threshold").input_value() == "5000"
         await page.locator("#auth-mode").select_option("storage_state")
         assert await page.get_by_text("Mounted SSO profile", exact=True).is_visible()
         await page.locator("#read-post-settings > summary").click()
@@ -72,7 +76,7 @@ async def main():
               {method:'POST',host:'api.example.net',endpoint:'/query',calls:10,status_2xx:8,
               status_3xx:0,status_4xx:1,status_5xx:0,network_failures:0,route_count:1,
               allowed_calls:9,blocked_count:1,application_bootstrap_phase_count:2,authentication_phase_count:0,route_validation_phase_count:8,session_refresh_phase_count:0,
-              average_duration_ms:25,worst_duration_ms:40,health:'DEGRADED',observation_outcome:'WARNING',routes_using_endpoint:['/health']},
+              average_duration_ms:25,worst_duration_ms:40,health:'DEGRADED',observation_outcome:'WARNING',policies:['APPROVED_READ_POST'],policy_classifications:['APPROVED_READ_ONLY'],classification_counts:{APPROVED_READ_POST:9,BLOCKED_MUTATION:1},routes_using_endpoint:['/health']},
               ...['POST','PUT','PATCH','DELETE'].map((method, index) => ({method,host:'api.example.net',endpoint:`/blocked/${index}`,calls:1,status_2xx:0,
               status_3xx:0,status_4xx:0,status_5xx:0,network_failures:0,route_count:1,allowed_calls:0,
               blocked_count:1,application_bootstrap_phase_count:0,authentication_phase_count:0,route_validation_phase_count:1,session_refresh_phase_count:0,
@@ -85,6 +89,8 @@ async def main():
             security_recommendations:[{type:'MISSING_SECURITY_HEADER',header:'content-security-policy',
               severity:'RECOMMENDATION',impact:'NON_BLOCKING',affected_document_count:1,
               affected_documents:['https://portal.example.com/health']}],
+            scan_configuration:{timeout_ms:15000,slow_page_threshold_ms:5000,min_observation_ms:500,network_quiet_ms:300},
+            scan_timing:{authentication_ms:20,discovery_ms:30,route_validation_ms:125,total_scan_ms:175},
             results:[{url:'https://portal.example.com/health',requested_url:'https://portal.example.com/health',
               discovered_url:'https://portal.example.com/health',final_url:'https://portal.example.com/health',
               route_label:'Health',navigation_label:'Health',route_name:'Health',route_name_source:'NAVIGATION_LABEL',
@@ -95,6 +101,7 @@ async def main():
               resource_status:'PASS',console_status:'PASS',authentication_status:'PASS',read_only_status:'ENFORCED',
               navigation_type:'DOCUMENT_NAVIGATION',warning_findings:1,status:200,load_ms:125,navigation_ms:20,render_ready_ms:105,application_settle_ms:105,validator_observation_ms:6000,total_validation_ms:6125,application_load_ms:125,depth:1,slow:false,api_failures:0,
               resource_failure_count:0,read_only_blocks:0,console_errors:[],finding_details:[{type:'CONSOLE_WARNING',severity:'WARNING',message:'Optional component emitted a warning.'}],redirects:[],
+              warning_reasons:[{code:'CONSOLE_WARNING',description:'Optional component emitted a warning.',severity:'WARNING',affected_component:'CONSOLE',evidence:{count:1},threshold:null}],
               render_health:{text_length:120},api_requests:[],failed_resources:[],frames:[],security_headers:{},
               external_links:[]}]
           })
@@ -117,6 +124,43 @@ async def main():
         await page.locator("#api-policy-filter").select_option("blocked")
         assert await page.locator("#api-list tr").count() == 5
         await page.locator("#api-policy-filter").select_option("all")
+        await page.locator("#api-policy-filter").select_option("approved-post")
+        assert await page.locator("#api-list tr").count() == 1
+        assert "APPROVED_READ_ONLY" in await page.locator("#api-list").text_content()
+        assert "APPROVED_READ_POST" not in await page.locator("#api-list .api-policy-cell").text_content()
+        assert await page.evaluate("apiDisplayPolicies({policies:['APPROVED_READ_POST','READ_ONLY_BLOCK'],policy_classifications:['APPROVED_READ_ONLY','READ_ONLY_BLOCKED'],classification_counts:{BLOCKED_MUTATION:1}})") == ["APPROVED_READ_ONLY", "READ_ONLY_BLOCKED"]
+        # Saved older reports have only internal policy names, not the new
+        # canonical policy_classifications field. They must filter identically.
+        await page.evaluate("""() => {
+          const post = lastReport.api_inventory.find(item => item.endpoint === '/query');
+          delete post.policy_classifications; delete post.classification_counts;
+          renderApiInventory();
+        }""")
+        assert await page.locator("#api-list tr").count() == 1
+        assert "/query" in await page.locator("#api-list").text_content()
+        assert await page.locator("#api-list .api-policy-cell").text_content() == "APPROVED_READ_ONLY"
+        await page.evaluate("""() => {
+          const post = lastReport.api_inventory.find(item => item.endpoint === '/query');
+          delete post.policies; post.classification_counts = {APPROVED_READ_POST:9};
+          renderApiInventory();
+        }""")
+        assert await page.locator("#api-list tr").count() == 1
+        assert await page.locator("#api-list .api-policy-cell").text_content() == "APPROVED_READ_ONLY"
+        await page.evaluate("""() => {
+          const post = lastReport.api_inventory.find(item => item.endpoint === '/query');
+          post.policies = ['APPROVED_READ_POST']; post.policy_classifications = ['APPROVED_READ_ONLY'];
+          post.classification_counts = {APPROVED_READ_POST:9,BLOCKED_MUTATION:1};
+          renderApiInventory();
+        }""")
+        await page.locator("#api-policy-filter").select_option("target-failures")
+        assert await page.locator("#api-list tr").count() == 1
+        assert "/query" in await page.locator("#api-list").text_content()
+        await page.locator("#api-policy-filter").select_option("all")
+        await page.evaluate("window.savedInventory = lastReport.api_inventory; lastReport.api_inventory = lastReport.api_inventory.filter(item => item.method !== 'POST'); updateApiMethodFilter(lastReport.api_inventory)")
+        await page.locator("#api-method-filter").select_option("POST")
+        assert await page.locator("#api-list .empty-table").text_content() == "No POST requests were observed for this scan."
+        await page.evaluate("lastReport.api_inventory = window.savedInventory; delete window.savedInventory; updateApiMethodFilter(lastReport.api_inventory)")
+        await page.locator("#api-method-filter").select_option("all")
         assert await page.locator("#api-list .not-executed").count() == 4
         assert await page.locator("#api-table-wrap table").get_attribute("data-density") == "compact"
         await page.locator("#api-density").select_option("comfortable")
@@ -124,6 +168,8 @@ async def main():
         await page.locator("#api-density").select_option("compact")
         assert "excludes blocked" in await page.locator('[data-api-sort="average_duration_ms"]').evaluate("element => element.closest('th').title")
         assert await page.locator('[data-api-sort="application_bootstrap_phase_count"]').text_content() == "Bootstrap Calls"
+        assert await page.locator('[data-api-sort="average_duration_ms"]').text_content() == "Average Time (ms)"
+        assert await page.locator('[data-api-sort="worst_duration_ms"]').text_content() == "Worst Time (ms)"
         await page.locator("#api-columns > summary").click()
         assert await page.locator("#api-columns input[type=checkbox]").count() == 20
         screenshot_base, screenshot_extension = os.path.splitext(screenshot)
@@ -163,9 +209,36 @@ async def main():
         await page.locator(".warning-count").click()
         assert "CONSOLE_WARNING" in await page.locator("#evidence-content").text_content()
         assert "Optional component emitted a warning" in await page.locator("#evidence-content").text_content()
+        assert await page.locator("#evidence-content > pre").count() == 0
+        assert "route remains healthy" in await page.locator("#evidence-content").text_content()
+        assert "console warning" in await page.locator(".warning-summary").text_content()
+        assert await page.locator("#result-list .outcome-badge").text_content() == "PASS WITH WARNINGS (1)"
         await page.locator("#evidence-close").click()
+        await page.evaluate("""() => {
+          lastReport.results[0].load_ms = 5820;
+          lastReport.results[0].warning_reasons = [{code:'SLOW_ROUTE',description:'Slow route: 5.82s > configured 5.0s threshold',severity:'WARNING',affected_component:'ROUTE_PERFORMANCE',threshold:{value:5000,unit:'ms'},evidence:{application_load_ms:5820,validator_overhead_ms:6000}}];
+          renderRows();
+        }""")
+        assert "5.82s > configured 5.0s threshold" in await page.locator(".warning-count").get_attribute("title")
+        await page.locator(".warning-count").click()
+        assert "Slow route: 5.82s > configured 5.0s threshold" in await page.locator("#evidence-content").text_content()
+        assert "Configured threshold" in await page.locator("#evidence-content").text_content()
+        await page.locator("#evidence-panel").screenshot(path=f"{screenshot_base}-warnings{screenshot_extension or '.png'}")
+        await page.locator("#evidence-close").click()
+        await page.evaluate("lastReport.results[0].load_ms = 125; lastReport.results[0].warning_reasons = [{code:'CONSOLE_WARNING',description:'Optional component emitted a warning.',severity:'WARNING',affected_component:'CONSOLE'}]; renderRows()")
+        await page.locator("#scan-diagnostics > summary").click()
+        assert "5000" in await page.locator("#scan-diagnostics-content").text_content()
+        assert "authentication_ms" in await page.locator("#scan-diagnostics-content").text_content()
+        await page.locator("#scan-diagnostics > summary").click()
         assert not await page.locator("#resource-details").get_attribute("open")
         assert await page.locator("#resource-summary .resource-card").count() == 7
+        assert await page.evaluate("""() => {
+          lastReport.resource_details.push({type:'FONT',host:'cdn.example.net',path:'/small.woff',size_categories:[]});
+          renderResourceSummary();
+          const count = document.querySelectorAll('#resource-summary .resource-card strong')[5].textContent;
+          lastReport.resource_details.pop(); renderResourceSummary();
+          return count;
+        }""") == "0"
         await page.locator("#resource-details > summary").click()
         assert await page.locator("#resource-list tr").count() == 3
         await page.locator("#resource-type-filter").select_option("image")
@@ -178,6 +251,27 @@ async def main():
         assert await page.locator("#resource-list tr").count() == 1
         assert "503" in await page.locator("#resource-list").text_content()
         await page.locator("#resource-type-filter").select_option("all")
+        await page.locator("#resource-search").fill("hero")
+        assert await page.locator("#resource-list tr").count() == 1
+        await page.locator("#resource-search").fill("")
+        await page.locator("#resource-route-filter").select_option("/health")
+        assert await page.locator("#resource-list tr").count() == 3
+        await page.locator("#resource-status-filter").select_option("5")
+        assert await page.locator("#resource-list tr").count() == 1
+        assert "503" in await page.locator("#resource-list").text_content()
+        await page.locator("#resource-status-filter").select_option("all")
+        await page.locator("#resource-failed-only").check()
+        assert await page.locator("#resource-list tr").count() == 1
+        await page.locator("#resource-failed-only").uncheck()
+        await page.locator('[data-resource-sort="duration_ms"]').click()
+        assert "/app.js" in await page.locator("#resource-list tr").first.text_content()
+        await page.locator("#resource-columns > summary").click()
+        assert await page.locator("#resource-columns input[type=checkbox]").count() == 11
+        await page.locator('[data-column-kind="resource"][data-column-key="host"]').uncheck()
+        assert not await page.locator('[data-resource-sort="host"]').is_visible()
+        await page.locator('#resource-columns [data-column-action="reset"]').click()
+        assert await page.locator('[data-resource-sort="host"]').is_visible()
+        await page.locator("#resource-columns > summary").click()
         await page.locator("#resource-details > summary").click()
         assert await page.locator("#security-list .recommendation").count() == 1
         calls_sort = page.get_by_role("button", name="Calls", exact=True)
@@ -254,6 +348,13 @@ async def main():
         await page.locator("#add-read-post").click()
         await page.locator(".operation-host").fill("api.example.net")
         await page.locator(".operation-path").fill("/v1/query")
+        await page.locator("#min-observation").evaluate("element => { element.closest('details').open = true; }")
+        await page.locator("#large-js-threshold").evaluate("element => { element.closest('details').open = true; }")
+        await page.locator("#min-observation").fill("100")
+        await page.locator("#network-quiet").fill("150")
+        await page.locator("#large-js-threshold").fill("1536")
+        await page.locator("#large-css-font-threshold").fill("768")
+        await page.locator("#slow-threshold").fill("7250")
         await page.locator("#run-button").click()
         await page.wait_for_function("() => !document.getElementById('run-button').disabled && document.getElementById('progress').hidden")
         assert len(submitted) == 1
@@ -263,6 +364,11 @@ async def main():
         assert submitted[0]["allow_mutations"] is False
         assert submitted[0]["large_resource_threshold_bytes"] == 1048576
         assert submitted[0]["large_image_threshold_bytes"] == 524288
+        assert submitted[0]["large_js_threshold_bytes"] == 1572864
+        assert submitted[0]["large_css_font_threshold_bytes"] == 786432
+        assert submitted[0]["min_observation_ms"] == 100
+        assert submitted[0]["network_quiet_ms"] == 150
+        assert submitted[0]["slow_page_threshold_ms"] == 7250
         await page.unroute("**/api/scans", capture_scan)
         await page.unroute("**/api/scans/ui-policy", completed_status)
         await page.unroute("**/api/scans/ui-policy/report", fixture_report)
@@ -293,7 +399,8 @@ async def main():
           lastReport.results = Array.from({length:44}, (_, index) => ({...first,
             route_name:`Route ${index}`,display_path:`/route/${index}`,
             classification:index === 43 ? 'FAIL' : index < 33 ? 'PASS_WITH_WARNINGS' : 'PASS',
-            warning_findings:index < 33 ? 1 : 0
+            warning_findings:index < 33 ? 1 : 0,
+            warning_reasons:index < 33 ? first.warning_reasons : []
           }));
           renderRows();
           return {rows:document.querySelectorAll('#result-list .route-row').length,
@@ -308,6 +415,7 @@ async def main():
         ):
             await page.set_viewport_size(viewport)
             assert await page.get_by_role("button", name="Run validation →").is_visible()
+            await page.locator("#resource-details").evaluate("element => { element.open = true; }")
             await page.locator("#read-post-settings > summary").click()
             await page.locator("#add-read-post").click()
             await page.locator(".operation-host").fill("api.example.net")

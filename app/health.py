@@ -62,6 +62,10 @@ ERROR_SURFACE_MARKERS = (
     "unexpected error",
 )
 
+# Sampling is a bounded internal observation cadence, not an application wait
+# or a user-facing route timeout. A remaining deadline always takes precedence.
+RENDER_SAMPLE_INTERVAL_SECONDS = 0.1
+
 
 async def capture_render_health(page) -> dict[str, Any]:
     result = await page.evaluate(RENDER_HEALTH_SCRIPT)
@@ -83,41 +87,50 @@ async def wait_for_render_settle(
     maximum_ms: int,
     network_activity: Callable[[], dict[str, int | float]] | None = None,
     minimum_observation_ms: int = 500,
-    network_quiet_ms: int = 500,
+    network_quiet_ms: int = 300,
 ) -> dict[str, Any]:
     """Wait for bounded DOM stability and route-scoped network quiet.
 
     Long-lived sockets/event streams are excluded by the activity tracker. The
     maximum remains authoritative so polling portals cannot hold a scan open.
     """
-    if settle_ms <= 0:
-        snapshot = await capture_render_health(page)
-        snapshot.update({
-            "settle_reason": "SETTLE_DISABLED",
-            "settle_elapsed_ms": 0,
-            "settle_render_ready_ms": 0,
-            "settle_application_ms": 0,
-            "settle_validator_observation_ms": 0,
-        })
-        return snapshot
-    maximum_ms = max(settle_ms, maximum_ms)
+    maximum_ms = max(0, int(maximum_ms))
+    settle_ms = max(0, int(settle_ms))
+    minimum_observation_ms = max(0, int(minimum_observation_ms))
+    network_quiet_ms = max(0, int(network_quiet_ms))
     started = time.perf_counter()
     deadline = started + (maximum_ms / 1000)
     stable_since: float | None = None
     previous: tuple[object, ...] | None = None
-    latest: dict[str, Any] = {}
+    latest: dict[str, Any] = {
+        "ready_state": "unknown", "title": "", "text_length": 0,
+        "visible_elements": 0, "busy_indicators": 0,
+        "challenge_indicators": 0, "alert_text": "",
+    }
     initial_activity = network_activity() if network_activity is not None else {}
     last_generation = int(initial_activity.get("generation", 0))
     network_quiet_since = started
     application_active_until = started
     first_render_ready: float | None = None
+    capture_intervals: list[tuple[float, float]] = []
+    dom_active_until = started
+    api_active_until = started
 
     def finish(reason: str, now: float, pending: int, generation: int) -> dict[str, Any]:
         elapsed_ms = max(0, round((now - started) * 1000))
         # The trailing stability/quiet confirmation is a validator observation,
         # not application work. Only observed render changes, visible loading,
         # and request activity contribute to application readiness.
-        application_ms = min(elapsed_ms, max(0, round((application_active_until - started) * 1000)))
+        # Evaluating our DOM diagnostic is validator work. Subtract only the
+        # portion before the last observed readiness activity; never subtract a
+        # trailing capture twice or include a late polling confirmation.
+        active_capture_seconds = sum(
+            max(0.0, min(end, application_active_until) - begin)
+            for begin, end in capture_intervals if begin < application_active_until
+        )
+        application_ms = min(elapsed_ms, max(0, round(
+            (application_active_until - started - active_capture_seconds) * 1000
+        )))
         latest.update({
             "settle_reason": reason,
             "network_pending": pending,
@@ -129,11 +142,34 @@ async def wait_for_render_settle(
             ),
             "settle_application_ms": application_ms,
             "settle_validator_observation_ms": elapsed_ms - application_ms,
+            "settle_capture_ms": max(0, round(sum(
+                end - begin for begin, end in capture_intervals
+            ) * 1000)),
+            "settle_dom_activity_ms": max(0, round((dom_active_until - started) * 1000)),
+            "settle_api_activity_ms": max(0, round((api_active_until - started) * 1000)),
         })
         return latest
 
     while True:
-        latest = await capture_render_health(page)
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            activity = network_activity() if network_activity is not None else {}
+            return finish(
+                "BOUNDED_TIMEOUT", time.perf_counter(),
+                int(activity.get("pending", 0)), int(activity.get("generation", 0)),
+            )
+        capture_started = time.perf_counter()
+        try:
+            latest = await asyncio.wait_for(capture_render_health(page), timeout=remaining)
+        except TimeoutError:
+            capture_intervals.append((capture_started, time.perf_counter()))
+            activity = network_activity() if network_activity is not None else {}
+            return finish(
+                "BOUNDED_TIMEOUT", time.perf_counter(),
+                int(activity.get("pending", 0)), int(activity.get("generation", 0)),
+            )
+        now = time.perf_counter()
+        capture_intervals.append((capture_started, now))
         signature = (
             latest["ready_state"],
             latest["text_length"],
@@ -142,7 +178,6 @@ async def wait_for_render_settle(
             latest["challenge_indicators"],
             latest["title"],
         )
-        now = time.perf_counter()
         activity = network_activity() if network_activity is not None else {}
         generation = int(activity.get("generation", 0))
         pending = int(activity.get("pending", 0))
@@ -151,34 +186,48 @@ async def wait_for_render_settle(
             and not latest["busy_indicators"]
             and (latest["text_length"] >= 20 or latest["visible_elements"] >= 3)
         ):
-            first_render_ready = now
-        if pending or latest["busy_indicators"] or latest["ready_state"] == "loading":
-            application_active_until = now
+            first_render_ready = capture_started
+        if pending:
+            api_active_until = capture_started
+            application_active_until = max(application_active_until, capture_started)
+        if latest["busy_indicators"] or latest["ready_state"] == "loading":
+            dom_active_until = capture_started
+            application_active_until = max(application_active_until, capture_started)
         if generation != last_generation:
             last_generation = generation
             network_quiet_since = now
             last_activity = float(activity.get("last_activity", now))
+            api_active_until = max(api_active_until, min(now, max(started, last_activity)))
             application_active_until = max(
                 application_active_until, min(now, max(started, last_activity))
             )
+        if settle_ms == 0:
+            return finish("SETTLE_DISABLED", now, pending, generation)
         if signature == previous:
-            stable_since = stable_since or now
+            if stable_since is None:
+                stable_since = capture_started
             dom_stable = (now - stable_since) * 1000 >= settle_ms
             observed_minimum = (now - started) * 1000 >= minimum_observation_ms
             network_quiet = (
                 pending == 0
                 and (now - network_quiet_since) * 1000 >= network_quiet_ms
             )
-            if dom_stable and observed_minimum and network_quiet:
+            content_ready = (
+                latest["ready_state"] in {"interactive", "complete"}
+                and not latest["busy_indicators"]
+                and (latest["text_length"] >= 20 or latest["visible_elements"] >= 3)
+            )
+            if dom_stable and observed_minimum and network_quiet and content_ready:
                 return finish("DOM_AND_NETWORK_QUIET", now, pending, generation)
         else:
             if previous is not None:
-                application_active_until = now
+                dom_active_until = capture_started
+                application_active_until = max(application_active_until, capture_started)
             previous = signature
-            stable_since = None
+            stable_since = capture_started
         if now >= deadline:
             return finish("BOUNDED_TIMEOUT", now, pending, generation)
-        await asyncio.sleep(min(0.1, max(0.01, deadline - now)))
+        await asyncio.sleep(min(RENDER_SAMPLE_INTERVAL_SECONDS, max(0.0, deadline - now)))
 
 
 def route_performance_timing(
@@ -200,16 +249,26 @@ def route_performance_timing(
     total_validation_ms = max(navigation_ms, int(total_validation_ms))
     snapshot = render_health or {}
     render_offset = max(navigation_ms, int(render_start_ms or navigation_ms))
-    application_settle_ms = max(0, int(snapshot.get("settle_application_ms") or 0))
+    application_settle_ms = min(
+        max(0, total_validation_ms - navigation_ms),
+        max(0, int(snapshot.get("settle_application_ms") or 0)),
+    )
     observation_ms = max(0, int(snapshot.get("settle_validator_observation_ms") or 0))
     ready_ms = snapshot.get("settle_render_ready_ms")
+    application_load_ms = navigation_ms + application_settle_ms
     return {
+        "application_navigation_ms": navigation_ms,
         "navigation_ms": navigation_ms,
         "render_ready_ms": render_offset + max(0, int(ready_ms)) if ready_ms is not None else None,
+        "dom_ready_ms": render_offset + max(0, int(ready_ms)) if ready_ms is not None else None,
         "application_settle_ms": application_settle_ms,
+        "dom_settle_ms": max(0, int(snapshot.get("settle_dom_activity_ms") or 0)),
+        "api_settle_ms": max(0, int(snapshot.get("settle_api_activity_ms") or 0)),
+        "render_validation_ms": max(0, int(snapshot.get("settle_capture_ms") or 0)),
         "validator_observation_ms": observation_ms,
+        "validator_overhead_ms": total_validation_ms - application_load_ms,
         "total_validation_ms": total_validation_ms,
-        "application_load_ms": min(total_validation_ms, render_offset + application_settle_ms),
+        "application_load_ms": application_load_ms,
         "performance_basis": "OBSERVED_APPLICATION_READINESS",
     }
 
@@ -256,9 +315,14 @@ def assess_page_health(
         ))
     if performance_enabled and load_ms > slow_page_threshold_ms:
         findings.append(finding(
-            "SLOW_PAGE",
+            "SLOW_ROUTE",
             "WARNING",
-            f"Observed application readiness exceeded the configured {slow_page_threshold_ms} ms threshold; deliberate validator observation waits are excluded.",
+            f"Slow route: {load_ms / 1000:.2f}s > configured {slow_page_threshold_ms / 1000}s threshold",
+            code="SLOW_ROUTE",
+            component="ROUTE_PERFORMANCE",
+            observed_ms=load_ms,
+            threshold_ms=slow_page_threshold_ms,
+            evidence={"application_load_ms": load_ms, "slow_route_threshold_ms": slow_page_threshold_ms},
         ))
     return classification, findings
 
@@ -266,12 +330,18 @@ def assess_page_health(
 def api_health_findings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for event in events:
+        # A denied request never reached the target. It is separately reported
+        # as validator-policy evidence, never a target API failure.
+        if event.get("blocked_by_validator"):
+            continue
         status = event.get("status")
         _, fallback_host, fallback_endpoint = safe_api_identity(str(event.get("url") or ""))
         method = str(event.get("method") or "GET").upper()
         host = str(event.get("host") or fallback_host)
         endpoint = str(event.get("endpoint") or fallback_endpoint)
-        required = event.get("importance", "REQUIRED") == "REQUIRED"
+        importance = str(event.get("importance") or "REQUIRED").upper()
+        importance = importance if importance in {"REQUIRED", "OPTIONAL", "BACKGROUND"} else "REQUIRED"
+        required = importance == "REQUIRED"
         resource = f"{method} {host} {endpoint}"
         detail = {
             "resource": resource,
@@ -279,7 +349,7 @@ def api_health_findings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "host": host,
             "endpoint": endpoint,
             "http_status": status,
-            "importance": "REQUIRED" if required else "OPTIONAL",
+            "importance": importance,
             "target_failure": True,
             "validator_block": False,
         }

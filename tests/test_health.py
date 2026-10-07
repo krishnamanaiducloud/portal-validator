@@ -42,7 +42,34 @@ def test_slow_busy_route_is_warning_not_failed_load():
     )
     assert result["classification"] == "PASS_WITH_WARNINGS"
     assert result["page_load_status"] == "LOADED"
-    assert {item["type"] for item in result["finding_details"]} == {"SLOW_PAGE", "RENDER_STILL_BUSY"}
+    assert {item["type"] for item in result["finding_details"]} == {"SLOW_ROUTE", "RENDER_STILL_BUSY"}
+
+
+def test_slow_route_warning_explains_effective_dynamic_threshold():
+    snapshot = {"text_length": 500, "visible_elements": 25, "busy_indicators": 0}
+    _, findings = assess_page_health(snapshot, load_ms=5820, slow_page_threshold_ms=5000)
+    warning = findings[0]
+    assert warning["type"] == "SLOW_ROUTE"
+    assert warning["code"] == "SLOW_ROUTE"
+    assert warning["message"] == "Slow route: 5.82s > configured 5.0s threshold"
+    assert warning["threshold_ms"] == 5000
+    assert warning["observed_ms"] == 5820
+    assert warning["component"] == "ROUTE_PERFORMANCE"
+    assert warning["evidence"] == {"application_load_ms": 5820, "slow_route_threshold_ms": 5000}
+    _, fractional = assess_page_health(snapshot, load_ms=8000, slow_page_threshold_ms=7250)
+    assert fractional[0]["message"] == "Slow route: 8.00s > configured 7.25s threshold"
+    assert fractional[0]["threshold_ms"] == 7250
+    _, raised = assess_page_health(snapshot, load_ms=5820, slow_page_threshold_ms=6000)
+    _, equal = assess_page_health(snapshot, load_ms=5820, slow_page_threshold_ms=5820)
+    assert raised == equal == []
+
+
+def test_denied_read_only_post_is_never_reported_as_target_api_failure():
+    assert api_health_findings([{
+        "url": "https://portal.example.net/api/query", "method": "POST",
+        "error": "net::ERR_BLOCKED_BY_CLIENT", "status": None,
+        "blocked_by_validator": True,
+    }]) == []
 
 
 def test_api_failures_are_observed_without_calling_apis():
@@ -157,6 +184,15 @@ def test_optional_background_api_failure_is_explained_without_failing_route():
     assert result["classification"] == "PASS_WITH_WARNINGS"
     assert result["api_status"] == "WARNING"
     assert result["failure_reason"] is None
+
+
+def test_background_api_importance_is_preserved_for_warning_explanation():
+    findings = api_health_findings([{
+        "url": "https://telemetry.example.net/collect", "status": 503,
+        "error": None, "importance": "BACKGROUND",
+    }])
+    assert findings[0]["importance"] == "BACKGROUND"
+    assert findings[0]["blocking"] is False
 
 
 def test_failed_spa_transition_is_a_navigation_failure():

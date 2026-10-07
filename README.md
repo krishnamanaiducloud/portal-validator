@@ -367,25 +367,61 @@ Route **Time** and slow warnings now use `application_load_ms`, a passive
 application-readiness estimate: navigation/SPA activation plus observed render
 and network work, excluding trailing stability confirmation, minimum observation
 waits, and discovery/reporting overhead. The report separately exposes
-`navigation_ms`, `render_ready_ms`, `application_settle_ms`,
-`validator_observation_ms`, and `total_validation_ms`. This is not a Core Web
-Vitals measurement. API **Avg Time**/**Worst Time** use completed responses only;
+`application_navigation_ms`, `application_settle_ms`, `validator_overhead_ms`,
+and `total_validation_ms`, with detailed DOM/API/observation timings retained.
+`application_load_ms = application_navigation_ms + application_settle_ms`;
+validator overhead is the remaining route validation time. This is not a Core
+Web Vitals measurement. Slow warnings compare this estimate against the exact
+UI-configured `slow_page_threshold_ms`, for example
+`Slow route: 5.82s > configured 5.0s threshold`.
+API **Average Time (ms)**/**Worst Time (ms)** use completed responses only;
 blocked, pending, and failed requests cannot inflate response-time averages.
+**Refresh Calls** counts recognized authentication/session-refresh traffic,
+not ordinary repeated application calls. Bootstrap, authentication, and route
+calls retain separate phase counts.
+
+**Maximum time / route** (`timeout_ms`) bounds navigation, readiness, and route
+discovery rather than forcing each route to wait that long. The total scan
+budget starts at scan entry and includes browser queue/startup time; expiry
+preserves completed routes and reports remaining coverage as partial/not tested.
+Advanced settings independently configure DOM stability (`render_settle_ms`),
+minimum observation (`min_observation_ms`), and network quiet (`network_quiet_ms`).
+Observation listeners remain active throughout the browser context lifetime;
+shortening readiness waits does not uninstall API listeners. Requests that
+finish after a route closes are reconciled with their initiating route.
+The report includes a secret-free `scan_configuration` snapshot and
+`scan_timing` diagnostics for authentication, discovery, validation, finalization,
+browser/page counts, and full versus SPA navigations.
+
+Approved, naturally issued read-only POSTs are observed and evaluated even when
+asset/resource checking is disabled. Approval still requires an explicit
+method/host/path rule and does not bypass SSRF policy. A completed required API
+500 is a target failure; a denied POST is a validator-policy block, not a target
+failure. Popup-origin requests retain their initiating route and shared session.
+No endpoint is probed, replayed, or given blanket POST permission.
 
 API and route **Columns** controls independently persist only column visibility
 in `portal-validator.api-columns` and `portal-validator.route-columns`. All new
 columns default to visible, identifying columns remain available, and density
-defaults to Compact. Header tooltips describe each metric; route details expose
-sanitized warning categories and descriptions. Healthy still includes both PASS
-and PASS_WITH_WARNINGS.
+defaults to Compact. Header tooltips describe each metric. Every
+`PASS_WITH_WARNINGS` route exposes `warning_count` and structured
+`warning_reasons` with a code, description, affected component, safe evidence,
+and threshold where applicable. The table shows warning counts and summaries;
+route details show readable reasons without requiring raw JSON. Healthy still
+includes both PASS and PASS_WITH_WARNINGS; warnings never count as failed routes.
 
 The collapsible **Resource Details** view reads the browser's natural
 ResourceTiming entries without additional downloads. Transfer size, encoded body
 size, and decoded body size are separate byte measurements; inaccessible timing
 data is unavailable, not a fabricated zero. Total transfer covers measurable
-resources only. Large images/resources remain warnings. Defaults are 512 KiB per
-image and 1 MiB per resource; scan fields `large_image_threshold_bytes` and
-`large_resource_threshold_bytes` (also exposed under Advanced) adjust them.
+resources only. Large resources remain non-blocking warnings. Independent
+Advanced thresholds default to 512 KiB for images and CSS/fonts, and 1 MiB for
+JavaScript and other resources (`large_image_threshold_bytes`,
+`large_css_font_threshold_bytes`, `large_js_threshold_bytes`, and
+`large_resource_threshold_bytes`). Resource Details supports search, route,
+status, type, failed/large filters, numeric sorting, and independent column
+visibility; API method filtering explicitly distinguishes no observed POSTs
+from POSTs hidden by filters.
 
 Logs are structured JSON with a per-scan ID. URLs, query secrets, credentials,
 tokens, cookies, storage state, and certificate/private-key material are

@@ -2,17 +2,20 @@
 
 import gc
 import json
+import logging
+import socket
 import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 
 import pytest
 from playwright.async_api import async_playwright
 from pydantic import ValidationError
 
 from app.main import ScanRequest, execute_scan
-from app.network import PassiveNetworkObserver, load_read_only_policy
+from app.logging_config import LOGGER
+from app.network import PassiveNetworkObserver, RouteNetworkActivity, load_read_only_policy, request_identity
 from app.reporting import aggregate_api_events
 
 
@@ -20,6 +23,18 @@ class RequestFixture:
     method = "GET"
     url = "https://portal.example/api/config"
     resource_type = "fetch"
+
+
+@pytest.fixture
+def scanner_logs(caplog):
+    # Production intentionally does not propagate this redacted logger. Attach
+    # pytest's handler explicitly so leakage assertions inspect actual events.
+    caplog.set_level(logging.DEBUG, logger=LOGGER.name)
+    LOGGER.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        LOGGER.removeHandler(caplog.handler)
 
 
 def test_completed_request_identity_does_not_alias_a_new_post_after_gc():
@@ -65,6 +80,44 @@ def test_request_api_wrapper_recreation_keeps_underlying_lifecycle_identity():
     assert len(events) == 1
     assert event["status"] == 201
     assert event["response_completed"] is True
+
+
+def test_route_readiness_uses_underlying_request_identity_without_retaining_requests():
+    activity = RouteNetworkActivity()
+    implementation = RequestFixture()
+    first_wrapper = RequestFixture()
+    first_wrapper._impl_obj = implementation
+    activity.request_started(first_wrapper, "route-1")
+    del first_wrapper
+    gc.collect()
+    assert activity.snapshot("route-1")["pending"] == 1
+    final_wrapper = RequestFixture()
+    final_wrapper._impl_obj = implementation
+    assert request_identity(final_wrapper) is implementation
+    activity.request_finished(final_wrapper)
+    assert activity.snapshot("route-1")["pending"] == 0
+    assert activity.snapshot("route-1")["generation"] == 2
+    reference = weakref.ref(implementation)
+    del final_wrapper, implementation
+    gc.collect()
+    assert reference() is None
+
+
+def test_background_activity_is_observed_but_does_not_extend_route_readiness():
+    request = RequestFixture()
+    request.method = "POST"
+    activity = RouteNetworkActivity()
+    observer = PassiveNetworkObserver([])
+    observer.observe_request(
+        request, phase="SESSION_REFRESH", importance="AUTHENTICATION",
+        initiating_route="route-1", main_document=False,
+    )
+    activity.request_started(request, "route-1", relevant=False)
+    activity.request_finished(request)
+    assert len(observer.events) == 1
+    assert observer.events[0]["method"] == "POST"
+    assert activity.snapshot("route-1")["generation"] == 0
+    assert activity.snapshot("route-1")["pending"] == 0
 
 
 @pytest.mark.parametrize("rule", [
@@ -162,6 +215,17 @@ def test_explicit_policy_source_does_not_inherit_deployment_environment(tmp_path
 def production_spa(monkeypatch):
     class Handler(BaseHTTPRequestHandler):
         routes = 1
+        post_status = 201
+        query_secrets = False
+        authentication_flow = False
+        authentication_posts = 0
+        popup_mode = False
+        popup_nested_mode = False
+        popup_post_ready = Event()
+        late_post_mode = False
+        late_failure_mode = None
+        missing_resource_mode = False
+        release_late_post = Event()
         post_paths = []
         mutation_calls = 0
         session_cookie_seen = False
@@ -169,11 +233,77 @@ def production_spa(monkeypatch):
         script_calls = 0
 
         def do_GET(self):
-            if self.path == "/":
+            if self.path == "/optional-missing.svg":
+                body = b"Optional resource unavailable"
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; private-metadata=fixture-private-mime")
+            elif self.path == "/release-late-response":
+                type(self).release_late_post.set()
+                body = b'{"released":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+            elif self.path == "/popup":
+                body = b'''<!doctype html><html><body><h1>Child application</h1><script>
+                fetch('/popup-bootstrap').then(()=>fetch('/api/query',{
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({password:'fixture-private-popup-body'})
+                })).then(()=>document.body.dataset.done='true');
+                </script></body></html>'''
+                if self.popup_nested_mode:
+                    body = b'''<!doctype html><html><body><h1>First child application</h1><script>
+                    fetch('/popup-bootstrap').then(()=>window.open('/nested-popup','nested-child'));
+                    </script></body></html>'''
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+            elif self.path == "/nested-popup":
+                body = b'''<!doctype html><html><body><h1>Nested application</h1><script>
+                fetch('/api/query',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+                </script></body></html>'''
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+            elif self.path == "/popup-bootstrap":
+                # Real application work completes after DOMContentLoaded. The
+                # parent gate makes readiness deterministic rather than having
+                # the test race the scanner with an arbitrary test sleep.
+                if self.popup_nested_mode:
+                    self.release_late_post.wait(3)
+                else:
+                    Event().wait(0.25)
+                body = b'{"ready":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+            elif self.path == "/popup-gate":
+                self.popup_post_ready.wait(2)
+                body = b'{"ready":true}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+            elif self.path.startswith("/oauth2/authorize"):
+                body = b'''<!doctype html><html><body><h1>Authentication handoff</h1>
+                <form id="sso" method="POST" action="/idp/SSO.saml2">
+                <input name="SAMLRequest" value="fixture-private-saml">
+                <input name="RelayState" value="fixture-private-relay"></form>
+                <script>document.querySelector('#sso').submit()</script></body></html>'''
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+            elif self.path.startswith("/callback"):
+                self.send_response(303)
+                self.send_header("Set-Cookie", "session=fixture-private-cookie; HttpOnly; SameSite=Lax")
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            elif self.path == "/":
+                if self.authentication_flow and "session=fixture-private-cookie" not in self.headers.get("Cookie", ""):
+                    self.send_response(302)
+                    self.send_header("Location", "/oauth2/authorize?client_id=fixture&state=fixture-private-state")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 links = "".join(
                     f'<a href="#/route-{index}">Route {index}</a>'
                     for index in range(1, self.routes + 1)
                 )
+                api_query = "/api/query?access_token=fixture-private-query" if self.query_secrets else "/api/query"
                 body = ("""<!doctype html><html><body><img src="/fixture.svg" alt="fixture"><script src="/fixture.js"></script><nav>""" + links + """</nav>
                 <main><h1>Home</h1></main><script>
                 document.querySelectorAll('nav a').forEach(link => link.addEventListener('click',event=>{
@@ -188,7 +318,39 @@ def production_spa(monkeypatch):
                     for(const method of ['PUT','PATCH','DELETE']) calls.push(fetch('/api/write',{method}));
                     Promise.allSettled(calls).then(()=>document.body.dataset.done='true');
                   },180));
-                }));</script></body></html>""").encode()
+                }));</script></body></html>""").replace("'/api/query'", repr(api_query))
+                if self.popup_mode:
+                    body = body.replace(
+                        "fetch('/micro/config.json')",
+                        """document.querySelector('main').innerHTML='<h1>Opening child application</h1><span aria-busy="true">Loading</span>';
+                        window.open('/popup','child-application');
+                        fetch('/popup-gate').then(()=>document.querySelector('main').innerHTML='<h1>Child application ready</h1>');
+                        return; fetch('/micro/config.json')""",
+                    )
+                if self.popup_nested_mode:
+                    body = body.replace(
+                        "fetch('/micro/config.json')",
+                        """if(link.getAttribute('href')==='#/route-1') {
+                          window.open('/popup','first-child');
+                        } else { fetch('/release-late-response'); }
+                        return; fetch('/micro/config.json')""",
+                    )
+                if self.late_post_mode:
+                    body = body.replace(
+                        "fetch('/micro/config.json')",
+                        """if(link.getAttribute('href')==='#/route-1') {
+                          fetch('/analytics/read',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+                        } else { fetch('/release-late-response'); }
+                        return; fetch('/micro/config.json')""",
+                    )
+                if self.missing_resource_mode:
+                    body = body.replace(
+                        "fetch('/micro/config.json')",
+                        """const optionalImage=new Image(); optionalImage.src='/optional-missing.svg';
+                        document.querySelector('main').append(optionalImage);
+                        return; fetch('/micro/config.json')""",
+                    )
+                body = body.encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
                 self.send_header("Set-Cookie", "session=fixture-private-cookie; HttpOnly; SameSite=Lax")
@@ -211,17 +373,41 @@ def production_spa(monkeypatch):
             self.wfile.write(body)
 
         def do_POST(self):
-            type(self).post_paths.append(self.path)
-            type(self).session_cookie_seen = "session=fixture-private-cookie" in self.headers.get("Cookie", "")
             length = int(self.headers.get("Content-Length", "0"))
             if length:
                 self.rfile.read(length)
+            if self.path == "/idp/SSO.saml2":
+                type(self).authentication_posts += 1
+                self.send_response(303)
+                self.send_header("Location", "/callback?code=fixture-private-code&state=fixture-private-state")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            type(self).post_paths.append(self.path)
+            type(self).session_cookie_seen = "session=fixture-private-cookie" in self.headers.get("Cookie", "")
             body = b'{"ok":true}'
-            self.send_response(201)
+            if self.path == "/analytics/read":
+                self.release_late_post.wait(3)
+                if self.late_failure_mode:
+                    if self.late_failure_mode == "AFTER_HEADERS":
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", "100")
+                        self.end_headers()
+                        self.wfile.write(b"{")
+                        self.wfile.flush()
+                    self.close_connection = True
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    self.connection.close()
+                    return
+                self.send_response(500)
+            else:
+                self.send_response(self.post_status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            type(self).popup_post_ready.set()
 
         def do_PUT(self):
             type(self).mutation_calls += 1
@@ -286,6 +472,7 @@ async def test_full_scan_natural_spa_post_observer_policy_network_and_report(pro
         check_security_headers=False,
         large_resource_threshold_bytes=1024,
         large_image_threshold_bytes=1024,
+        large_js_threshold_bytes=1024,
         approved_read_post_operations=([{
             "method": "POST", "host": "127.0.0.1", "path": "/api/query",
             "description": "Application owner approved fixture read query",
@@ -353,5 +540,218 @@ async def test_disabled_resource_checks_do_not_hide_scan_wide_read_only_blocks(p
     post = next(item for item in report["api_inventory"] if item["method"] == "POST")
     assert post["calls"] == 7 and post["blocked_calls"] == 7 and post["allowed_calls"] == 0
     assert report["summary"]["read_only_blocks"] == 10  # seven POST + PUT/PATCH/DELETE
-    assert all(not result["api_requests"] for result in report["results"])
+    route = next(result for result in report["results"] if result["url"].endswith("#/route-1"))
+    assert sum(event["method"] == "POST" for event in route["api_requests"]) == 7
     assert handler.post_paths == [] and handler.mutation_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_status,approved", [(200, True), (500, True), (200, False)])
+async def test_actual_scan_read_post_health_matches_real_target_response(production_spa, scanner_logs, post_status, approved):
+    origin, handler = production_spa
+    handler.post_status = post_status
+    handler.query_secrets = True
+    async with async_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).is_file():
+            pytest.skip("matching Playwright Chromium is not installed on this host")
+    report = await execute_scan(ScanRequest(
+        target=origin, allow_private_networks=True, max_pages=2, max_depth=2,
+        timeout_ms=5000, render_settle_ms=500, max_navigation_actions=0,
+        max_discovery_scrolls=0, check_security_headers=False,
+        approved_read_post_operations=([{
+            "method": "POST", "host": "127.0.0.1", "path": "/api/query",
+        }] if approved else []),
+    ))
+    post = next(item for item in report["api_inventory"] if item["method"] == "POST")
+    route = next(item for item in report["results"] if item["url"].endswith("#/route-1"))
+    assert post["endpoint"] == "/api/query"
+    assert post["calls"] == 7
+    assert handler.mutation_calls == 0
+    assert "fixture-private" not in json.dumps(report)
+    assert "API_REQUEST_OBSERVED" in scanner_logs.text
+    assert "fixture-private" not in scanner_logs.text
+    if approved:
+        assert len(handler.post_paths) == 7
+        assert post["allowed_calls"] == 7 and post["blocked_calls"] == 0
+        assert post["policy_classifications"] == ["APPROVED_READ_ONLY"]
+        assert post["status_2xx" if post_status == 200 else "status_5xx"] == 7
+        assert post["target_failure_count"] == (0 if post_status == 200 else 7)
+        assert post["health"] == ("HEALTHY" if post_status == 200 else "FAILED")
+        assert route["api_status"] == ("PASS" if post_status == 200 else "FAIL")
+        assert route["api_failures"] == (0 if post_status == 200 else 7)
+        assert route["passed"] is (post_status == 200)
+    else:
+        assert handler.post_paths == []
+        assert post["policy_classifications"] == ["READ_ONLY_BLOCKED"]
+        assert post["allowed_calls"] == 0 and post["blocked_calls"] == 7
+        assert post["target_failure_count"] == 0 and post["health"] == "NOT_EXECUTED"
+        assert route["api_failures"] == 0 and route["passed"] is True
+
+
+@pytest.mark.asyncio
+async def test_actual_scan_authentication_document_post_remains_allowed_and_redacted(production_spa, scanner_logs):
+    origin, handler = production_spa
+    handler.authentication_flow = True
+    async with async_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).is_file():
+            pytest.skip("matching Playwright Chromium is not installed on this host")
+    report = await execute_scan(ScanRequest(
+        target=origin, allow_private_networks=True, max_pages=1, max_depth=0,
+        timeout_ms=8000, render_settle_ms=500, max_navigation_actions=0,
+        max_discovery_scrolls=0, check_security_headers=False,
+    ))
+    auth_post = next(item for item in report["api_inventory"] if item["endpoint"] == "/idp/SSO.saml2")
+    assert handler.authentication_posts == 1
+    assert auth_post["method"] == "POST"
+    assert auth_post["allowed_calls"] == 1 and auth_post["blocked_calls"] == 0
+    assert auth_post["status_3xx"] == 1 and auth_post["target_failure_count"] == 0
+    assert auth_post["policies"] == ["AUTH_FLOW"]
+    assert auth_post["authentication_phase_count"] == 1
+    assert report["results"][0]["authentication_status"] == "PASS"
+    assert "fixture-private" not in json.dumps(report)
+    assert "AUTH_FLOW_POST_ALLOWED" in scanner_logs.text
+    assert "fixture-private" not in scanner_logs.text
+
+
+@pytest.mark.asyncio
+async def test_actual_scan_keeps_popup_alive_for_natural_read_post_after_domcontentloaded(production_spa, scanner_logs):
+    origin, handler = production_spa
+    handler.popup_mode = True
+    handler.post_status = 200
+    async with async_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).is_file():
+            pytest.skip("matching Playwright Chromium is not installed on this host")
+    report = await execute_scan(ScanRequest(
+        target=origin, allow_private_networks=True, max_pages=2, max_depth=1,
+        timeout_ms=5000, render_settle_ms=500, max_navigation_actions=0,
+        max_discovery_scrolls=0, check_security_headers=False,
+        approved_read_post_operations=[{
+            "method": "POST", "host": "127.0.0.1", "path": "/api/query",
+        }],
+    ))
+    post = next(item for item in report["api_inventory"] if item["method"] == "POST")
+    assert handler.post_paths == ["/api/query"]
+    assert handler.session_cookie_seen is True
+    assert post["calls"] == 1 and post["allowed_calls"] == 1
+    assert post["blocked_calls"] == 0 and post["status_2xx"] == 1
+    assert post["target_failure_count"] == 0 and post["health"] == "HEALTHY"
+    assert post["policy_classifications"] == ["APPROVED_READ_ONLY"]
+    assert post["routes_using_endpoint"] == [origin + "/#/route-1"]
+    assert report["network_observation"]["observed_requests"] == report["network_observation"]["aggregated_requests"]
+    assert "fixture-private" not in json.dumps(report) and "fixture-private" not in scanner_logs.text
+
+
+@pytest.mark.asyncio
+async def test_late_approved_post_response_updates_its_own_route_health(production_spa):
+    origin, handler = production_spa
+    handler.routes = 2
+    handler.late_post_mode = True
+    async with async_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).is_file():
+            pytest.skip("matching Playwright Chromium is not installed on this host")
+    report = await execute_scan(ScanRequest(
+        target=origin, allow_private_networks=True, max_pages=3, max_depth=1,
+        timeout_ms=5000, render_settle_ms=500, max_navigation_actions=0,
+        max_discovery_scrolls=0, check_security_headers=False, check_resources=False,
+        approved_read_post_operations=[{
+            "method": "POST", "host": "127.0.0.1", "path": "/analytics/read",
+        }],
+    ))
+    assert handler.release_late_post.is_set()
+    post = next(item for item in report["api_inventory"] if item["method"] == "POST")
+    assert post["endpoint"] == "/analytics/read" and post["status_5xx"] == 1
+    assert post["allowed_calls"] == 1 and post["target_failure_count"] == 1
+    assert post["routes_using_endpoint"] == [origin + "/#/route-1"]
+    route1 = next(result for result in report["results"] if result["url"].endswith("#/route-1"))
+    route2 = next(result for result in report["results"] if result["url"].endswith("#/route-2"))
+    assert route1["api_failures"] == 1 and route1["api_status"] == "WARNING"
+    assert route1["classification"] == "PASS_WITH_WARNINGS" and route1["passed"] is True
+    assert "OPTIONAL_API_FAILURE" in route1["warning_codes"]
+    assert route2["api_failures"] == 0 and route2["api_status"] == "PASS"
+    assert all(event["endpoint"] != "/analytics/read" for event in route2["api_requests"])
+    assert all(event["route_activation_id"] == route1["route_activation_id"] for event in route1["api_requests"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["BEFORE_HEADERS", "AFTER_HEADERS"])
+async def test_late_post_network_failure_does_not_warn_an_unrelated_route(production_spa, failure_mode):
+    origin, handler = production_spa
+    handler.routes = 2
+    handler.late_post_mode = True
+    handler.late_failure_mode = failure_mode
+    async with async_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).is_file():
+            pytest.skip("matching Playwright Chromium is not installed on this host")
+    report = await execute_scan(ScanRequest(
+        target=origin, allow_private_networks=True, max_pages=3, max_depth=1,
+        timeout_ms=5000, render_settle_ms=500, max_navigation_actions=0,
+        # Isolate request-owned API/resource findings. Browser console messages
+        # without request identity remain reported against the active route.
+        max_discovery_scrolls=0, check_security_headers=False, check_resources=True, check_console=False,
+        approved_read_post_operations=[{
+            "method": "POST", "host": "127.0.0.1", "path": "/analytics/read",
+        }],
+    ))
+    route1 = next(result for result in report["results"] if result["url"].endswith("#/route-1"))
+    route2 = next(result for result in report["results"] if result["url"].endswith("#/route-2"))
+    post = next(item for item in report["api_inventory"] if item["method"] == "POST")
+    assert post["target_failure_count"] == 1 and post["blocked_calls"] == 0
+    assert route1["api_failures"] == 1 and route1["classification"] == "PASS_WITH_WARNINGS"
+    assert route2["api_failures"] == 0 and route2["resource_failure_count"] == 0
+    assert route2["classification"] == "PASS" and route2["warning_reasons"] == [], route2["warning_reasons"]
+    assert all(failure.get("route_activation_id") == route2["route_activation_id"] for failure in route2["failed_resources"])
+
+
+@pytest.mark.asyncio
+async def test_nested_popup_inherits_original_route_after_parent_scan_advances(production_spa):
+    origin, handler = production_spa
+    handler.routes = 2
+    handler.popup_nested_mode = True
+    handler.post_status = 200
+    async with async_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).is_file():
+            pytest.skip("matching Playwright Chromium is not installed on this host")
+    report = await execute_scan(ScanRequest(
+        target=origin, allow_private_networks=True, max_pages=3, max_depth=1,
+        timeout_ms=5000, render_settle_ms=500, max_navigation_actions=0,
+        max_discovery_scrolls=0, check_security_headers=False,
+        approved_read_post_operations=[{
+            "method": "POST", "host": "127.0.0.1", "path": "/api/query",
+        }],
+    ))
+    assert handler.post_paths == ["/api/query"] and handler.session_cookie_seen is True
+    post = next(item for item in report["api_inventory"] if item["method"] == "POST")
+    assert post["health"] == "HEALTHY" and post["routes_using_endpoint"] == [origin + "/#/route-1"]
+    assert post["route_validation_phase_count"] == 1 and post["discovery_phase_count"] == 0
+    assert report["scan_timing"]["pages"] == 3
+    route1 = next(result for result in report["results"] if result["url"].endswith("#/route-1"))
+    assert any(event["method"] == "POST" for event in route1["api_requests"])
+    assert all(event["phase"] == "ROUTE_VALIDATION" for event in route1["api_requests"] if event["method"] == "POST")
+
+
+@pytest.mark.asyncio
+async def test_http_404_subresource_is_preserved_as_nonblocking_owned_warning(production_spa):
+    origin, handler = production_spa
+    handler.missing_resource_mode = True
+    async with async_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).is_file():
+            pytest.skip("matching Playwright Chromium is not installed on this host")
+    report = await execute_scan(ScanRequest(
+        target=origin, allow_private_networks=True, max_pages=2, max_depth=1,
+        timeout_ms=5000, render_settle_ms=500, max_navigation_actions=0,
+        max_discovery_scrolls=0, check_security_headers=False, check_resources=True, check_console=False,
+    ))
+    route = next(result for result in report["results"] if result["url"].endswith("#/route-1"))
+    assert route["page_load_status"] == "LOADED" and route["passed"] is True
+    assert route["classification"] == "PASS_WITH_WARNINGS" and route["resource_status"] == "WARNING"
+    assert route["resource_failure_count"] == 1
+    assert route["warning_codes"] == ["NON_CRITICAL_RESOURCE_FAILURE"]
+    failure = next(item for item in route["failed_resources"] if item["url"].endswith("/optional-missing.svg"))
+    assert failure["route_activation_id"] == route["route_activation_id"]
+    assert failure["initiating_route"] == route["url"] and failure["error"] == "Resource returned HTTP 404"
+    inventory = next(item for item in report["resource_inventory"] if item["path"] == "/optional-missing.svg")
+    assert inventory["failures"] == 1
+    detail = next(item for item in report["resource_details"] if item["path"] == "/optional-missing.svg")
+    assert detail["content_type"] == "text/plain"
+    assert "fixture-private-mime" not in json.dumps(report)
+    assert report["summary"]["healthy_routes"] == 2 and report["summary"]["failed_pages"] == 0

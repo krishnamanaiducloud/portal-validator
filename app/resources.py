@@ -10,6 +10,7 @@ import math
 import hashlib
 import hmac
 import secrets
+import re
 from collections import defaultdict, deque
 from typing import Any
 from urllib.parse import urlparse
@@ -146,11 +147,19 @@ def _resource_type(event: dict[str, Any], path: str) -> str:
     return "OTHER"
 
 
+def safe_content_type(value: Any) -> str | None:
+    """Keep only a MIME type, never arbitrary response-header parameters."""
+    candidate = str(value or "").split(";", 1)[0].strip().lower()
+    return candidate if re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", candidate) else None
+
+
 def build_resource_report(
     events: list[dict[str, Any]],
     *,
     large_resource_threshold_bytes: int = 1024 * 1024,
     large_image_threshold_bytes: int = 512 * 1024,
+    large_js_threshold_bytes: int = 1024 * 1024,
+    large_css_font_threshold_bytes: int = 512 * 1024,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Serialize safe per-call resource details and measurable-transfer totals."""
     details: list[dict[str, Any]] = []
@@ -178,11 +187,22 @@ def build_resource_report(
             measured_size = sizes["encoded_body_size_bytes"]
             measurement = "ENCODED_BODY_SIZE"
         categories: list[str] = []
+        thresholds: dict[str, int] = {}
         if measured_size is not None:
             if resource_type == "IMAGE" and measured_size > large_image_threshold_bytes:
                 categories.append("LARGE_IMAGE")
-            if measured_size > large_resource_threshold_bytes:
-                categories.append("LARGE_JS_BUNDLE" if resource_type == "SCRIPT" else "LARGE_RESOURCE")
+                thresholds["LARGE_IMAGE"] = large_image_threshold_bytes
+            if resource_type == "SCRIPT":
+                if measured_size > large_js_threshold_bytes:
+                    categories.append("LARGE_JS_BUNDLE")
+                    thresholds["LARGE_JS_BUNDLE"] = large_js_threshold_bytes
+            elif resource_type in {"STYLESHEET", "FONT"}:
+                if measured_size > large_css_font_threshold_bytes:
+                    categories.append("LARGE_CSS_FONT")
+                    thresholds["LARGE_CSS_FONT"] = large_css_font_threshold_bytes
+            elif measured_size > large_resource_threshold_bytes:
+                categories.append("LARGE_RESOURCE")
+                thresholds["LARGE_RESOURCE"] = large_resource_threshold_bytes
         route = str(event.get("initiating_route") or "")
         # Preserve logical SPA route fragments, but never serialize query values
         # or opaque identifiers from resource correlation metadata.
@@ -199,12 +219,14 @@ def build_resource_report(
             "host": host,
             "path": path,
             "type": resource_type,
+            "content_type": safe_content_type(event.get("content_type")),
             "route": route or None,
             "status": status if isinstance(status, int) else None,
             "duration_ms": _nonnegative_number(event.get("resource_duration_ms", event.get("duration_ms"))),
             **sizes,
             "size_source": event.get("size_source", "UNAVAILABLE"),
             "size_categories": categories,
+            "size_thresholds_bytes": thresholds,
             "warning_size_basis": measurement if categories else None,
             "failed": failed,
             "blocked_by_validator": blocked,
@@ -216,6 +238,8 @@ def build_resource_report(
         "resources_with_transfer_size": len(transfers),
         "large_resources": sum(bool(item["size_categories"]) for item in details),
         "large_images": sum("LARGE_IMAGE" in item["size_categories"] for item in details),
+        "large_js_bundles": sum("LARGE_JS_BUNDLE" in item["size_categories"] for item in details),
+        "large_css_fonts": sum("LARGE_CSS_FONT" in item["size_categories"] for item in details),
         "resource_failures": sum(item["failed"] for item in details),
         "largest_resources": sorted(
             (item for item in details if item["transfer_size_bytes"] is not None),
@@ -223,6 +247,8 @@ def build_resource_report(
         )[:5],
         "large_resource_threshold_bytes": large_resource_threshold_bytes,
         "large_image_threshold_bytes": large_image_threshold_bytes,
+        "large_js_threshold_bytes": large_js_threshold_bytes,
+        "large_css_font_threshold_bytes": large_css_font_threshold_bytes,
     }
     return details, summary
 
@@ -231,11 +257,20 @@ def large_resource_findings(details: list[dict[str, Any]]) -> list[dict[str, Any
     findings: list[dict[str, Any]] = []
     for item in details:
         for category in item["size_categories"]:
+            threshold = item.get("size_thresholds_bytes", {}).get(category)
+            observed = (
+                item["encoded_body_size_bytes"]
+                if item["warning_size_basis"] == "ENCODED_BODY_SIZE"
+                else item["transfer_size_bytes"]
+            )
             findings.append(finding(
                 category,
                 "WARNING",
-                "A naturally loaded resource exceeds the configured size warning threshold.",
+                f"A naturally loaded resource measured {observed} bytes > configured {threshold} byte threshold.",
                 resource=f"{item['host']} {item['path']}",
+                component="RESOURCE",
+                observed_bytes=observed,
+                threshold_bytes=threshold,
                 size_basis=item["warning_size_basis"],
                 transfer_size_bytes=item["transfer_size_bytes"],
                 encoded_body_size_bytes=item["encoded_body_size_bytes"],
