@@ -52,6 +52,9 @@ async def main():
             {"method": "POST", "host": "api.example.net", "path": "/v1/query"},
             {"method": "POST", "host": "api.example.net", "path_pattern": "/v1/items/{segment}/query"},
         ]
+        await operations.nth(0).locator(".operation-graphql").check()
+        assert (await page.evaluate("approvedReadPostOperations()"))[0]["graphql_queries_only"] is True
+        await operations.nth(0).locator(".operation-graphql").uncheck()
         await operations.nth(1).locator(".operation-path").fill("/**")
         rejection = await page.evaluate("""() => {
             try { approvedReadPostOperations(); return null; }
@@ -391,8 +394,15 @@ async def main():
             return {milliseconds:performance.now() - started, rows:document.querySelectorAll('#api-list tr').length};
           }
         """, inventory_size)
-            assert large_inventory["rows"] == inventory_size
+            assert large_inventory["rows"] == 50
             assert large_inventory["milliseconds"] < 3000
+            assert f"of {inventory_size}" in await page.locator("#api-page-status").inner_text()
+            first_endpoint = await page.locator("#api-list .api-endpoint").first.inner_text()
+            await page.locator("#api-page-next").click()
+            assert "Page 2" in await page.locator("#api-page-status").inner_text()
+            assert first_endpoint != await page.locator("#api-list .api-endpoint").first.inner_text()
+            await page.locator("#api-page-prev").click()
+            assert first_endpoint == await page.locator("#api-list .api-endpoint").first.inner_text()
             print(f"UI_TABLE_PERFORMANCE rows={inventory_size} render_ms={large_inventory['milliseconds']:.2f}")
         route_coverage = await page.evaluate("""() => {
           const first = lastReport.results[0];
@@ -407,6 +417,35 @@ async def main():
             warnings:document.querySelectorAll('#result-list .warning-count').length};
         }""")
         assert route_coverage == {"rows": 44, "warnings": 33}
+        await page.locator("#api-method-filter").select_option("GET")
+        await page.locator("#api-status-filter").select_option("FAILED")
+        await page.locator("#api-search").fill("previous-scan-filter")
+        await page.locator("#result-search").fill("previous-route-filter")
+        await page.locator("#resource-details").evaluate("element => { element.open = true; }")
+        await page.locator("#resource-search").fill("previous-resource-filter")
+        await page.locator("#resource-failed-only").check()
+        await page.locator("#resource-large-only").check()
+        await page.evaluate("renderReport(lastReport)")
+        assert await page.locator("#api-method-filter").input_value() == "all"
+        assert await page.locator("#api-status-filter").input_value() == "all"
+        assert await page.locator("#api-search").input_value() == ""
+        assert await page.locator("#result-search").input_value() == ""
+        assert await page.locator("#resource-search").input_value() == ""
+        assert not await page.locator("#resource-failed-only").is_checked()
+        assert not await page.locator("#resource-large-only").is_checked()
+        assert await page.locator("#api-list .api-endpoint").count() == 50
+        await page.evaluate("""() => {
+          window.originalResourceDetails = lastReport.resource_details;
+          lastReport.resource_details = ['route-a','route-b'].flatMap(route =>
+            Array.from({length:100}, (_, index) => ({route,url:`https://assets.example.net/${index}`,path:`/${index}`,type:'image',status:200})));
+          renderResourceSummary();
+        }""")
+        await page.locator("#resource-route-filter").select_option("route-a")
+        await page.locator("#resource-page-next").click()
+        assert "Page 2" in await page.locator("#resource-page-status").inner_text()
+        await page.locator("#resource-route-filter").select_option("route-b")
+        assert "Page 1" in await page.locator("#resource-page-status").inner_text()
+        await page.evaluate("lastReport.resource_details = window.originalResourceDetails; renderReport(lastReport)")
         for viewport in (
             {"width": 1920, "height": 1080},
             {"width": 1366, "height": 768},
@@ -449,7 +488,7 @@ async def main():
             if "Cross-Origin-Opener-Policy header has been ignored" not in error
         ]
         assert not actionable_errors, actionable_errors
-        print("UI_SMOKE_PASSED: POST form contract, blocked methods, columns/persistence, density, warnings, resource filters, synchronized scrolling, 44 routes, 1000 API rows, mobile layouts, strict CSP")
+        print("UI_SMOKE_PASSED: POST form contract, blocked methods, columns/persistence, density, warnings, resource filters, synchronized scrolling, 44 routes, 1000 paginated API records, mobile layouts, strict CSP")
         await browser.close()
 
 

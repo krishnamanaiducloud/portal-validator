@@ -52,7 +52,7 @@ const tableColumns = {
     ['average_duration_ms','Average Time (ms)','Mean actual completed API response duration in milliseconds; excludes blocked and no-response calls.'],
     ['worst_duration_ms','Worst Time (ms)','Maximum actual completed API response duration in milliseconds.'],
     ['observation_outcome','Health','Aggregated API health; policy-blocked-only calls are NOT_EXECUTED.'],
-    ['policies','Policy','Observed read-only approval/block decisions. No request bodies are inspected.'],
+    ['policies','Policy','Observed read-only approval/block decisions. No bodies are retained; explicit GraphQL query rules inspect operation types in memory.'],
   ],
   route: [
     ['classification','Status','PASS and PASS_WITH_WARNINGS both count as healthy routes.'],
@@ -84,6 +84,23 @@ const tableColumns = {
   ],
 };
 const columnPreferences = {};
+const tablePagination = Object.fromEntries(['route','api','resource'].map((kind) => [kind, {page:0,size:50,key:''}]));
+
+function paginateTable(kind, items) {
+  const state = tablePagination[kind];
+  const controls = kind === 'route' ? ['result-search','result-filter','navigation-filter'] : kind === 'api' ? ['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-failed-only'] : ['resource-search','resource-type-filter','resource-route-filter','resource-status-filter','resource-failed-only','resource-large-only'];
+  const filters = controls.map((id) => { const input = byId(id); return input.type === 'checkbox' ? input.checked : input.value; });
+  const sort = kind === 'route' ? routeSort : kind === 'api' ? apiSort : resourceSort;
+  const key = JSON.stringify([filters,sort,activeDrilldown,apiFailureOnly,items.map((item) => item.canonical_route || item.url || [item.method,item.host,item.endpoint,item.path])]);
+  if (key !== state.key) { state.page = 0; state.key = key; }
+  const pages = Math.max(1, Math.ceil(items.length / state.size));
+  state.page = Math.min(state.page, pages - 1);
+  const start = state.page * state.size;
+  byId(`${kind}-page-status`).textContent = items.length ? `${start + 1}–${Math.min(start + state.size, items.length)} of ${items.length} · Page ${state.page + 1} of ${pages}` : '0 records';
+  byId(`${kind}-page-prev`).disabled = state.page === 0;
+  byId(`${kind}-page-next`).disabled = state.page + 1 >= pages;
+  return items.slice(start, start + state.size);
+}
 
 function loadColumnPreferences(kind) {
   try {
@@ -133,6 +150,14 @@ function setupTableControls(kind) {
   }));
   const table = byId(`${kind}-table-wrap`).querySelector('table');
   table.dataset.density = 'compact';
+  const pager = document.createElement('div');
+  pager.className = 'table-pagination';
+  pager.innerHTML = `<label class="field"><span>Rows per page</span><select id="${kind}-page-size" aria-label="${kind} rows per page"><option>25</option><option selected>50</option><option>100</option><option>250</option></select></label><button type="button" class="secondary" id="${kind}-page-prev">Previous</button><span id="${kind}-page-status" role="status" aria-live="polite"></span><button type="button" class="secondary" id="${kind}-page-next">Next</button>`;
+  byId(`${kind}-table-wrap`).after(pager);
+  const render = kind === 'route' ? renderRows : kind === 'api' ? renderApiInventory : renderResourceDetails;
+  byId(`${kind}-page-size`).addEventListener('change', (event) => { tablePagination[kind].size = Number(event.target.value); tablePagination[kind].page = 0; render(); });
+  byId(`${kind}-page-prev`).addEventListener('click', () => { tablePagination[kind].page -= 1; render(); });
+  byId(`${kind}-page-next`).addEventListener('click', () => { tablePagination[kind].page += 1; render(); });
   byId(`${kind}-density`).addEventListener('change', (event) => { table.dataset.density = event.target.value; refreshScrollSync(); });
   applyColumnVisibility(kind);
 }
@@ -142,6 +167,11 @@ function addReadPostOperation() {
   row.className = 'read-post-operation';
   row.innerHTML = '<label class="field"><span>Method</span><select class="operation-method" aria-label="Approved method"><option>POST</option></select></label><label class="field"><span>Host</span><input class="operation-host" placeholder="api.example.net" autocomplete="off" required></label><label class="field"><span>Path type</span><select class="operation-path-type"><option value="path">Exact path</option><option value="path_pattern">Bounded pattern</option></select></label><label class="field"><span>Path</span><input class="operation-path" placeholder="/v1/search" autocomplete="off" required></label><label class="field"><span>Description (optional)</span><input class="operation-description" maxlength="200" placeholder="Owner-approved read operation"></label><button type="button" class="secondary remove-operation">Remove</button>';
   row.querySelector('.remove-operation').addEventListener('click', () => row.remove());
+  const graphql = document.createElement('label');
+  graphql.className = 'filter-check';
+  graphql.innerHTML = '<input type="checkbox" class="operation-graphql"> GraphQL queries only';
+  graphql.title = 'Require an explicit GraphQL query; mutations, subscriptions and unverified persisted operations remain blocked. Bodies are never logged or replayed.';
+  row.querySelector('.remove-operation').before(graphql);
   byId('read-post-operations').append(row);
 }
 
@@ -159,7 +189,7 @@ function approvedReadPostOperations() {
       if (segments.filter((segment) => segment !== '{segment}').length < 2 || segments.some((segment) => /[{}]/.test(segment) && segment !== '{segment}')) throw new Error('A bounded POST pattern requires at least two literal path segments and only {segment} placeholders.');
     } else if (/[{}]/.test(path)) throw new Error('Use Bounded pattern for {segment} placeholders.');
     const description = row.querySelector('.operation-description').value.trim();
-    return {method:'POST',host,[pathType]:path,...(description ? {description} : {})};
+    return {method:'POST',host,[pathType]:path,...(description ? {description} : {}),...(row.querySelector('.operation-graphql').checked ? {graphql_queries_only:true} : {})};
   });
 }
 
@@ -327,7 +357,7 @@ function renderRows() {
   const query = byId('result-search').value.trim().toLowerCase();
   const filter = byId('result-filter').value;
   const navigationFilter = byId('navigation-filter').value;
-  const rows = [...lastReport.results].map((item) => ({...item, warning_findings:routeWarnings(item).length, console_count:(item.console_errors?.length || 0) + (item.page_errors?.length || 0)})).filter((item) => {
+  let rows = [...lastReport.results].map((item) => ({...item, warning_findings:routeWarnings(item).length, console_count:(item.console_errors?.length || 0) + (item.page_errors?.length || 0)})).filter((item) => {
     const haystack = `${item.url} ${item.route_name || ''} ${item.display_path || ''} ${item.document_title || item.title || ''} ${item.navigation_label || item.route_label || ''} ${item.classification} ${item.failure_reason || ''}`.toLowerCase();
     return (!query || haystack.includes(query)) && matchesOutcome(item, filter) && matchesDrilldown(item) && (navigationFilter === 'all' || item.navigation_type === navigationFilter);
   });
@@ -338,6 +368,7 @@ function renderRows() {
     return compareValues(leftValue, rightValue, numericRouteKeys.has(key)) * routeSort.direction;
   });
   updateAriaSort('[data-sort]', routeSort, 'sort');
+  rows = paginateTable('route', rows);
   byId('result-list').innerHTML = rows.map((item) => {
     const route = routeDisplay(item);
     const routeIdentity = {requested_url:item.requested_url,discovered_url:item.discovered_url,final_url:item.final_url,origin:item.origin,host:item.host,pathname:item.pathname,query_sanitized:item.query_sanitized,fragment:item.fragment,spa_route:item.spa_route,canonical_route:item.canonical_route,display_path:item.display_path,route_name:item.route_name,route_name_source:item.route_name_source,route_name_confidence:item.route_name_confidence,discovery_sources:item.discovery_sources,duplicate_discovery_count:item.duplicate_discovery_count};
@@ -409,7 +440,7 @@ function renderApiInventory() {
   const policy = byId('api-policy-filter').value;
   const route = byId('api-route-filter')?.value || 'all';
   const failedOnly = apiFailureOnly || byId('api-failed-only').checked;
-  const visible = inventory.filter((item) => {
+  let visible = inventory.filter((item) => {
     const outcome = item.observation_outcome || (item.health === 'DEGRADED' ? 'WARNING' : item.health);
     const policies = apiDisplayPolicies(item);
     const targetFailure = Number(item.status_4xx || 0) + Number(item.status_5xx || 0) + Number(item.network_failures || 0) + Number(item.response_body_failures || 0) > 0;
@@ -423,6 +454,7 @@ function renderApiInventory() {
   visible.sort((left, right) => compareValues(left[apiSort.key], right[apiSort.key], numericApiKeys.has(apiSort.key)) * apiSort.direction);
   updateAriaSort('[data-api-sort]', apiSort, 'apiSort');
   byId('api-count').textContent = visible.length === inventory.length ? `${inventory.length} unique APIs observed` : `${visible.length} of ${inventory.length} unique APIs observed`;
+  visible = paginateTable('api', visible);
   byId('api-list').innerHTML = visible.map((item, index) => {
     const outcome = item.observation_outcome || (item.health === 'DEGRADED' ? 'WARNING' : item.health);
     const healthLabel = item.health === 'NOT_EXECUTED' ? 'NOT_EXECUTED' : outcome;
@@ -457,7 +489,7 @@ function renderResourceDetails() {
   const status = byId('resource-status-filter').value;
   const failedOnly = byId('resource-failed-only').checked;
   const knownTypes = new Set(['image','script','stylesheet','font','xhr','fetch']);
-  const visible = details.filter((item) => {
+  let visible = details.filter((item) => {
     const type = String(item.type || item.resource_type || '').toLowerCase();
     return (filter === 'all' || (filter === 'failed' ? resourceIsFailed(item) : filter === 'api' ? ['xhr','fetch'].includes(type) : filter === 'other' ? !knownTypes.has(type) : type === filter))
       && (!search || `${item.host} ${item.path || item.endpoint || ''} ${item.content_type || ''}`.toLowerCase().includes(search))
@@ -468,6 +500,7 @@ function renderResourceDetails() {
   }).sort((left, right) => compareValues(left[resourceSort.key], right[resourceSort.key], numericResourceKeys.has(resourceSort.key)) * resourceSort.direction);
   updateAriaSort('[data-resource-sort]', resourceSort, 'resourceSort');
   byId('resource-count').textContent = `${visible.length} of ${details.length} resource observations`;
+  visible = paginateTable('resource', visible);
   byId('resource-list').innerHTML = visible.map((item) => `<tr><td>${escapeHtml(item.type || item.resource_type || 'OTHER')}</td><td>${escapeHtml(item.host || '')}</td><td class="resource-path" title="${escapeHtml(item.content_type || 'Content type unavailable')}"><code>${escapeHtml(item.path || item.endpoint || item.url || '')}</code></td><td>${escapeHtml(formatBytes(item.transfer_size_bytes))}</td><td>${escapeHtml(formatBytes(item.encoded_body_size_bytes))}</td><td>${escapeHtml(formatBytes(item.decoded_body_size_bytes))}</td><td>${escapeHtml(item.duration_ms == null ? 'N/A' : `${item.duration_ms} ms`)}</td><td class="resource-path">${escapeHtml(item.route || '')}</td><td>${escapeHtml(item.status ?? 'N/A')}</td><td title="${escapeHtml(item.warning_threshold_bytes == null ? 'No size warning' : `Configured threshold: ${formatBytes(item.warning_threshold_bytes)}`)}">${escapeHtml((item.size_categories || []).join(', ') || '—')}</td><td><span class="dimension-state ${resourceIsFailed(item) ? 'warning' : 'pass'}">${resourceIsFailed(item) ? 'WARNING' : 'OBSERVED'}</span></td></tr>`).join('') || '<tr><td colspan="11" class="empty-table">No observed resources match these filters.</td></tr>';
   refreshScrollSync();
 }
@@ -540,6 +573,7 @@ function terminationMessage(coverage) {
 
 function renderReport(report) {
   lastReport = report;
+  Object.values(tablePagination).forEach((state) => { state.page = 0; state.key = ''; });
   try { byId('result-title').textContent = new URL(report.target).hostname; }
   catch (_) { byId('result-title').textContent = 'Portal health'; }
   const duration = report.summary.duration_ms > 1000 ? `${(report.summary.duration_ms / 1000).toFixed(1)}s` : `${report.summary.duration_ms}ms`;
@@ -556,7 +590,11 @@ function renderReport(report) {
   activeDrilldown = 'all';
   apiFailureOnly = false;
   byId('api-failed-only').checked = false;
-  byId('api-policy-filter').value = 'all';
+  // A filter left over from a previous scan must not silently hide new POST
+  // observations. Column/density preferences remain separate and persistent.
+  ['result-filter','navigation-filter','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','resource-type-filter','resource-route-filter','resource-status-filter'].forEach((id) => { if (byId(id)) byId(id).value = 'all'; });
+  ['result-search','api-search','resource-search'].forEach((id) => { byId(id).value = ''; });
+  ['resource-failed-only','resource-large-only'].forEach((id) => { byId(id).checked = false; });
   updateApiMethodFilter(report.api_inventory || []);
   updateApiRouteFilter(report.api_inventory || []);
   renderRows();

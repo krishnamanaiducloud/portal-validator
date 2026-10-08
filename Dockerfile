@@ -1,6 +1,6 @@
-FROM cgr.dev/chainguard/wolfi-base:latest@sha256:9c2092b053779e14c82fb50f77b37bcc38b7d2c83972352d5813280f9d035b03 AS runtime-base
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:238642d42c5613936474d00b900c4e65fb6f637d8991c913403ff09a09cf43a3 AS runtime-base
 
-FROM cgr.dev/chainguard/python:latest-dev@sha256:1c830d26eef0eb4231d8c119e037bee325329aa0ac67c527a86d6e62c05d23d1 AS builder
+FROM cgr.dev/chainguard/python:latest-dev@sha256:630df1be3733f7b38d1b535872904248adfe23fbea4befcb08da47cb7436ddb2 AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
@@ -17,7 +17,7 @@ RUN python -m venv /app/.venv \
     && /app/.venv/bin/pip uninstall -y pip setuptools
 
 # Download an exact, signed APK transaction without shipping download/build tools.
-FROM cgr.dev/chainguard/python:latest-dev@sha256:1c830d26eef0eb4231d8c119e037bee325329aa0ac67c527a86d6e62c05d23d1 AS runtime-packages
+FROM cgr.dev/chainguard/python:latest-dev@sha256:630df1be3733f7b38d1b535872904248adfe23fbea4befcb08da47cb7436ddb2 AS runtime-packages
 ARG APK_REPOSITORY=https://apk.cgr.dev/chainguard
 USER 0
 COPY --from=runtime-base / /tmp/apk-root/
@@ -31,7 +31,7 @@ RUN --mount=type=cache,id=portal-validator-apks,target=/tmp/apks set -eu; \
     printf '%s\n' /runtime-repository > /etc/apk/repositories; \
     transaction="$(apk --root /tmp/apk-root --initdb --keys-dir /etc/apk/keys \
       --repositories-file /etc/apk/repositories --no-network --simulate --no-progress \
-      add python-3.14 libnss-tools openssl font-opensans libatk-bridge-2.0 \
+      add 'glibc>=2.44-r8' python-3.14 libnss-tools openssl font-opensans libatk-bridge-2.0 \
       cups-libs libxcomposite libxdamage libxfixes libxrandr libxkbcommon \
       mesa-gbm alsa-lib pango libx11 libxcb libxext libstdc++ libexpat1 dbus-libs libudev 2>&1)" \
       || { printf '%s\n' "$transaction" >&2; exit 1; }; \
@@ -75,6 +75,9 @@ RUN --mount=type=bind,from=runtime-packages,source=/runtime-repository,target=/r
     set -eux; \
     printf '%s\n' /runtime-repository > /etc/apk/repositories; \
     apk --no-network --no-progress add --no-cache $(cat /runtime-repository/constraints); \
+    glibc_version="$(awk '/^P:/ { package=substr($0,3) } /^V:/ && package ~ /^glibc(-[0-9.]+)?$/ { print substr($0,3); exit }' /usr/lib/apk/db/installed)"; \
+    test -n "$glibc_version"; \
+    test "$(apk version -t "$glibc_version" 2.44-r8)" != '<'; \
     printf '%s\n' "$APK_REPOSITORY" > /etc/apk/repositories; \
     addgroup -g 10001 validator; \
     adduser -D -H -u 10001 -G validator -s /sbin/nologin validator; \

@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from graphql import GraphQLError, OperationType, get_operation_ast, parse
+from graphql.language.ast import OperationDefinitionNode
+
 from app.security import JWT_RE, SENSITIVE_KEYS, normalized_host, sanitize_text, sanitize_url
 
 
@@ -216,6 +219,7 @@ class ApprovedRequestRule:
     path: str
     classification: str
     path_pattern: bool = False
+    graphql_queries_only: bool = False
 
     def matches(self, method: str, url: str) -> bool:
         parsed = urlparse(url)
@@ -254,6 +258,51 @@ class ApprovedRequestRule:
         )
 
 
+def is_read_only_graphql_body(body: str | None) -> bool:
+    """Validate configured GraphQL queries in memory; never retain/log payloads.
+
+    Endpoint approval is still mandatory. Persisted operations without a query
+    cannot be proven read-only here and therefore fail closed. No execution or
+    replay is performed by this parser.
+    """
+    if not isinstance(body, str) or not body:
+        return False
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                # Different JSON decoders may select different duplicate values.
+                # Never approve an ambiguous operation or variable payload.
+                raise ValueError("Duplicate JSON object key")
+            result[key] = value
+        return result
+
+    try:
+        if len(body.encode("utf-8")) > 65536:
+            return False
+        payload = json.loads(body, object_pairs_hook=unique_object)
+        operations = payload if isinstance(payload, list) else [payload]
+        if not operations or len(operations) > 20:
+            return False
+        for operation in operations:
+            if not isinstance(operation, dict) or not isinstance(operation.get("query"), str):
+                return False
+            name = operation.get("operationName")
+            if name is not None and not isinstance(name, str):
+                return False
+            document = parse(operation["query"], no_location=True, max_tokens=10000)
+            definitions = [item for item in document.definitions if isinstance(item, OperationDefinitionNode)]
+            if not definitions or any(item.operation != OperationType.QUERY for item in definitions):
+                return False
+            if get_operation_ast(document, name) is None:
+                return False
+        return True
+    except (ValueError, TypeError, GraphQLError, RecursionError):
+        # Parser exception messages may include source payloads: never expose them.
+        return False
+
+
 @dataclass(frozen=True)
 class AccessGateRule:
     host: str
@@ -266,10 +315,10 @@ class ReadOnlyPolicy:
     access_gates: tuple[AccessGateRule, ...] = ()
 
     def match(self, method: str, url: str) -> ApprovedRequestRule | None:
-        return next(
-            (rule for rule in self.safe_application_requests if rule.matches(method, url)),
-            None,
-        )
+        matches = [rule for rule in self.safe_application_requests if rule.matches(method, url)]
+        # An overlapping legacy endpoint exception must not bypass an explicit
+        # query-only restriction on that same operation.
+        return next((rule for rule in matches if rule.graphql_queries_only), matches[0] if matches else None)
 
     def access_gate_for(self, url: str) -> AccessGateRule | None:
         host = normalized_host(urlparse(url).hostname or "")
@@ -356,12 +405,18 @@ def load_read_only_policy(
                 )
         if classification not in POLICY_CLASSIFICATIONS:
             raise ValueError("Policy rule classification is not supported")
+        graphql_queries_only = item.get("graphql_queries_only", False)
+        if not isinstance(graphql_queries_only, bool):
+            raise ValueError("graphql_queries_only must be a boolean")
+        if graphql_queries_only and classification not in {"APPROVED_READ_POST", "APPROVED_READ_REQUEST"}:
+            raise ValueError("GraphQL query restrictions require a read-only application rule")
         rules.append(ApprovedRequestRule(
             method=method,
             host=host,
             path=raw_path,
             classification=classification,
             path_pattern=has_path_pattern,
+            graphql_queries_only=graphql_queries_only,
         ))
 
     gates: list[AccessGateRule] = []

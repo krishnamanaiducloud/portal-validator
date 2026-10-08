@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
-from playwright.async_api import BrowserContext, Route, async_playwright
+from playwright.async_api import BrowserContext, Error as PlaywrightError, Route, async_playwright
 
 from app.authentication import (
     AuthenticationConfigurationError,
@@ -61,6 +61,7 @@ from app.network import (
     PassiveNetworkObserver,
     ReadOnlyPolicy,
     RouteNetworkActivity,
+    is_read_only_graphql_body,
     load_read_only_policy,
     request_identity,
     safe_api_identity,
@@ -113,7 +114,7 @@ SECURITY_HEADERS = (
 COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
     "ac", "co", "com", "edu", "gov", "net", "org",
 })
-VALIDATOR_VERSION = "1.9.0"
+VALIDATOR_VERSION = "1.10.0"
 REPORT_SCHEMA_VERSION = "2.3"
 
 
@@ -194,6 +195,7 @@ class ApprovedReadPostOperation(BaseModel):
     path: str | None = Field(default=None, max_length=2048)
     path_pattern: str | None = Field(default=None, max_length=2048)
     description: str | None = Field(default=None, max_length=256)
+    graphql_queries_only: bool = False
 
     @model_validator(mode="after")
     def validate_explicit_operation(self):
@@ -1436,10 +1438,20 @@ async def execute_scan(
                                 request.url,
                                 post_data,
                             )
-                        approved_rule = (
-                            None if auth_navigation_allowed else
-                            approved_operation
-                        )
+                        approved_rule = approved_operation
+                        if approved_rule is not None and approved_rule.graphql_queries_only:
+                            # An OAuth-looking URL must not override an explicit
+                            # endpoint restriction on the submitted operation.
+                            if api_event is not None:
+                                api_event["protocol"] = "GRAPHQL"
+                            try:
+                                graphql_body = request.post_data
+                            except PlaywrightError:
+                                graphql_body = None
+                            if not is_read_only_graphql_body(graphql_body):
+                                await abort_by_validator(route, "read_only_mutation_policy")
+                                return
+                            auth_navigation_allowed = False
                         if not auth_navigation_allowed and approved_rule is None:
                             await abort_by_validator(route, "read_only_mutation_policy")
                             return
@@ -1834,6 +1846,18 @@ async def execute_scan(
                                         )
                                         safe_routes = list(navigation_actions.pop("routes", []))
                                         if navigation_actions["activated"]:
+                                            # Expanded menus may load asynchronously. Give them the
+                                            # same bounded, configurable observation policy as the
+                                            # route, within its existing deadline. This is discovery
+                                            # overhead, not application performance time.
+                                            await wait_for_render_settle(
+                                                page,
+                                                settle_ms=req.render_settle_ms,
+                                                maximum_ms=max(0, round((route_deadline - time.perf_counter()) * 1000)),
+                                                network_activity=lambda: route_network_activity.snapshot(active_route_id),
+                                                minimum_observation_ms=req.min_observation_ms,
+                                                network_quiet_ms=req.network_quiet_ms,
+                                            )
                                             log_event(
                                                 logging.INFO,
                                                 "NAVIGATION_MENU_EXPANDED",
@@ -1853,6 +1877,22 @@ async def execute_scan(
                                         page,
                                         req.max_discovery_scrolls,
                                     )
+                                    for frame in page.frames:
+                                        if frame == page.main_frame or not url_in_scan_scope(
+                                            frame.url, root_host, req.allow_subdomains,
+                                            approved_portal_hosts,
+                                        ):
+                                            continue
+                                        try:
+                                            frame_routes = await discover_page_routes(
+                                                frame, req.max_discovery_scrolls,
+                                            )
+                                        except PlaywrightError:
+                                            # A detached frame must not discard routes already
+                                            # discovered in healthy documents.
+                                            log_event(logging.INFO, "FRAME_DISCOVERY_UNAVAILABLE", scan_id=scan_id)
+                                            continue
+                                        discovered.extend(frame_routes)
                                     discovered.extend(popup_routes[popup_start:])
                                     unique_discovered: dict[str, DiscoveredRoute] = {}
                                     for route in discovered:

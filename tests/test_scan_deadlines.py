@@ -222,7 +222,11 @@ async def test_runtime_route_and_depth_limits_preserve_counter_invariants(
     await require_browser()
     origin, handler = production_spa
     handler.routes = 3
-    report = await execute_scan(scan_request(origin, **limits))
+    # These cases test count/depth limits, not machine-speed-dependent deadlines.
+    # Dedicated deadline tests above retain their deliberately short budgets.
+    report = await execute_scan(scan_request(
+        origin, timeout_ms=10000, total_timeout_ms=60000, **limits,
+    ))
     summary = report["summary"]
     assert summary["routes_validated"] == validated
     assert summary["termination_reason"] == termination

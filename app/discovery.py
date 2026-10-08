@@ -418,6 +418,9 @@ async (maximumScrolls) => {
   }
   scrollables.forEach((element, index) => { element.scrollTop = originalPositions[index]; });
   for (const observed of (window.__portalValidatorObservedRoutes || [])) {
+    // The init-script's document baseline is not a history transition. In
+    // particular, do not fabricate a SPA activation for an embedded document.
+    if (typeof observed === 'object' && observed.mode === 'document') continue;
     const url = typeof observed === 'string' ? observed : observed.url;
     if (!url) continue;
     if (!seen.has(url)) {
@@ -565,7 +568,8 @@ SEMANTIC_ROUTE_ACTIVATION_SCRIPT = r"""
       try {
         const resolved = new URL(raw, document.baseURI);
         urlMatches = resolved.origin === candidate.origin &&
-          resolved.pathname === candidate.pathname && resolved.hash === candidate.hash;
+          resolved.pathname === candidate.pathname && resolved.search === candidate.search &&
+          resolved.hash === candidate.hash;
       } catch (_) {}
     }
     const semanticControl = source === 'safe-click' && expected && label === expected &&
@@ -637,6 +641,7 @@ async def expand_safe_navigation(page, maximum: int) -> dict[str, object]:
 
 
 async def discover_page_routes(page, maximum_scrolls: int = 3) -> list[DiscoveredRoute]:
+    """Discover one document or frame; its own URL/baseURI resolves relative links."""
     raw = await page.evaluate(DISCOVER_ROUTES_SCRIPT, max(0, min(maximum_scrolls, 20)))
     document_url = page.url
     routes: list[DiscoveredRoute] = []

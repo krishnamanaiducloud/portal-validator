@@ -215,6 +215,7 @@ def test_explicit_policy_source_does_not_inherit_deployment_environment(tmp_path
 def production_spa(monkeypatch):
     class Handler(BaseHTTPRequestHandler):
         routes = 1
+        graphql_operation = None
         post_status = 201
         query_secrets = False
         authentication_flow = False
@@ -349,6 +350,11 @@ def production_spa(monkeypatch):
                         """const optionalImage=new Image(); optionalImage.src='/optional-missing.svg';
                         document.querySelector('main').append(optionalImage);
                         return; fetch('/micro/config.json')""",
+                    )
+                if self.graphql_operation is not None:
+                    body = body.replace(
+                        "JSON.stringify({password:'fixture-private-body'})",
+                        "JSON.stringify({query:" + json.dumps(self.graphql_operation) + "})",
                     )
                 body = body.encode()
                 self.send_response(200)

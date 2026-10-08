@@ -27,6 +27,11 @@ def test_runtime_uses_signed_exact_apk_transaction_and_debug_adds_only_delta():
     assert "--allow-untrusted" not in dockerfile
     assert "--no-check-certificate" not in dockerfile
     assert "apk upgrade" not in dockerfile
+    assert "'glibc>=2.44-r8'" in dockerfile
+    for containerfile in (dockerfile, debugfile):
+        assert "/usr/lib/apk/db/installed" in containerfile
+        assert 'apk version -t "$glibc_version" 2.44-r8' in containerfile
+        assert "apk info --exists" not in containerfile
     assert "FROM ${PRODUCTION_IMAGE}" in debugfile
     assert "COPY --from" not in debugfile
     assert "python -m pip uninstall -y pip setuptools" in debugfile

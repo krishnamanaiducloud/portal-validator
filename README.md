@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.9.0 is an authenticated, read-only browser health validator for public,
+Portal Validator 1.10.0 is an authenticated, read-only browser health validator for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -41,6 +41,17 @@ Browser navigation and crawling intentionally have different boundaries:
 - Only ports 80, 443, 8080, and 8443 are accepted.
 
 ### Passive API observation and read-only policy
+
+For a shared GraphQL endpoint, enable **GraphQL queries only** on its explicit
+host/path approval (`"graphql_queries_only": true` in administrator policy).
+The syntax parser accepts queries but blocks mutations, subscriptions, malformed
+operations and unverifiable persisted-query hashes. It inspects the operation in
+memory only: payloads are never retained, logged or replayed. Endpoint approval
+remains mandatory. Batches are limited to 20 operations and payloads to 64 KiB.
+
+Route, API and resource tables paginate at 50 rows by default. Use **Rows per
+page**, **Previous** and **Next**; filters/sorts apply to the entire inventory,
+and exports retain all observations rather than just the displayed page.
 
 Observed API Inventory is passive: it records safe metadata for every natural
 browser request method, but it never probes, replays, retries, or transforms an
@@ -215,10 +226,10 @@ runs as UID/GID 10001 while supporting an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.9.0 .
+docker build -t mohankrishna999/portal-validator:1.10.0 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.9.0 \
-  -t mohankrishna999/portal-validator:1.9.0-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.10.0 \
+  -t mohankrishna999/portal-validator:1.10.0-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -233,7 +244,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.9.0
+  mohankrishna999/portal-validator:1.10.0
 ```
 
 ## OpenShift

@@ -1,4 +1,4 @@
-ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.9.0
+ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.10.0
 FROM ${PRODUCTION_IMAGE}
 
 ENV MAX_CONCURRENT_SCANS=1
@@ -6,6 +6,10 @@ ENV MAX_CONCURRENT_SCANS=1
 USER 0
 WORKDIR /app
 RUN --mount=type=bind,source=requirements-dev.txt,target=/tmp/requirements-dev.txt \
+    set -eu; \
+    glibc_version="$(awk '/^P:/ { package=substr($0,3) } /^V:/ && package ~ /^glibc(-[0-9.]+)?$/ { print substr($0,3); exit }' /usr/lib/apk/db/installed)"; \
+    test -n "$glibc_version"; \
+    test "$(apk version -t "$glibc_version" 2.44-r8)" != '<'; \
     export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
     CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt; \
