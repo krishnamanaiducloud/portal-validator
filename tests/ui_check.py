@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+from pathlib import Path
 
 from playwright.async_api import async_playwright
 
@@ -36,6 +37,39 @@ async def main():
         assert await page.locator("#min-observation").input_value() == "500"
         assert await page.locator("#network-quiet").input_value() == "300"
         assert await page.locator("#slow-threshold").input_value() == "5000"
+        assert await page.locator("#timeout").get_attribute("max") == "120000"
+        assert await page.locator("#total-timeout").get_attribute("max") == "900000"
+        assert await page.evaluate("phaseConfiguration()") == {}
+        await page.locator("#scan-timing-settings > summary").click()
+        concurrency = page.locator("#concurrency-limit")
+        concurrency_cap = int(await concurrency.get_attribute("max"))
+        assert concurrency_cap >= 1
+        assert await concurrency.input_value() == ""
+        await concurrency.fill("1")
+        assert await page.evaluate("phaseConfiguration()") == {"concurrency_limit": 1}
+        await concurrency.fill(str(concurrency_cap + 1))
+        assert f"integer between 1 and {concurrency_cap}" in await page.evaluate("""() => {
+          try { phaseConfiguration(); return ''; } catch (error) { return error.message; }
+        }""")
+        await concurrency.fill("")
+        assert "concurrency_limit" not in await page.evaluate("phaseConfiguration()")
+        for control in ("navigation-timeout", "authentication-timeout", "api-timeout", "readiness-timeout"):
+            await page.locator(f"#{control}").fill("12345")
+        await page.locator("#readiness-selector").fill("[data-app-ready]")
+        await page.locator("#authentication-hosts").fill("login.example.net, identity.example.org")
+        assert await page.evaluate("phaseConfiguration()") == {
+            "navigation_timeout_ms": 12345, "authentication_timeout_ms": 12345,
+            "api_timeout_ms": 12345, "readiness_timeout_ms": 12345,
+            "readiness_selector": "[data-app-ready]",
+            "authentication_hosts": ["login.example.net", "identity.example.org"],
+        }
+        await page.locator("#api-timeout").fill("1")
+        assert "integer between" in await page.evaluate("""() => {
+          try { phaseConfiguration(); return ''; } catch (error) { return error.message; }
+        }""")
+        for control in ("navigation-timeout", "authentication-timeout", "api-timeout", "readiness-timeout", "readiness-selector", "authentication-hosts"):
+            await page.locator(f"#{control}").fill("")
+        await page.locator("#scan-timing-settings > summary").click()
         await page.locator("#auth-mode").select_option("storage_state")
         assert await page.get_by_text("Mounted SSO profile", exact=True).is_visible()
         await page.locator("#read-post-settings > summary").click()
@@ -69,7 +103,8 @@ async def main():
             target:'https://portal.example.com', pages:1, run_id:'ui-check',
             summary:{routes_discovered:3,routes_validated:1,healthy_routes:1,routes_with_warnings:1,
               failed_pages:0,auth_issues:0,api_failures:0,resource_failures:0,slow_pages:0,
-              read_only_blocks:5,duration_ms:125,routes_not_tested:2,console_failures:0,
+              read_only_blocks:5,duration_ms:125,total_scan_duration_ms:8500,routes_not_tested:2,console_failures:0,
+              post_summary:{observed_calls:11,approved_read_only_calls:9,executed_approved_calls:8},
               unique_apis:6,security_recommendations:1},
             coverage:{scan_completeness:'PARTIAL',termination_reason:'MAX_ROUTES_REACHED',routes_discovered:3,routes_validated:1,routes_not_tested:2,routes_remaining:2},
             api_inventory:[{method:'GET',host:'api.example.net',endpoint:'/health',calls:1,status_2xx:1,
@@ -112,6 +147,66 @@ async def main():
         assert await page.locator("#result-list tr").count() == 1
         assert await page.locator("#result-list .route-name-cell strong").text_content() == "Health"
         assert await page.locator("#result-list .route-cell code").text_content() == "/health"
+        assert await page.get_by_role("button", name="Show Scan duration evidence").locator("strong").inner_text() == "8.5s"
+        assert await page.locator("#post-summary-observed_calls").inner_text() == "11"
+        assert await page.locator("#post-summary-approved_read_only_calls").inner_text() == "9"
+        assert await page.locator("#post-summary-executed_approved_calls").inner_text() == "8"
+        await page.evaluate("delete lastReport.summary.total_scan_duration_ms; renderReport(lastReport)")
+        assert await page.get_by_role("button", name="Show Scan duration evidence").locator("strong").inner_text() == "175ms"
+        await page.evaluate("lastReport.summary.total_scan_duration_ms = 8500; renderReport(lastReport)")
+        await page.evaluate("""() => {
+          window.uiViewOriginalReport = lastReport;
+          const baseline = lastReport.results[0];
+          renderReport({...lastReport, results:[baseline, ...['Service reports','Recent activity'].map((name,index) =>
+            ({...baseline, route_id:`UI_VIEW_fixture_${index}`, view_type:'UI_TAB',
+              route_name:name,navigation_type:'UI_VIEW_ACTIVATION'}))]});
+        }""")
+        assert await page.locator("#result-list .route-row").count() == 3
+        await page.locator("#navigation-filter").select_option("UI_VIEW_ACTIVATION")
+        assert await page.locator("#result-list .route-name-cell strong").all_text_contents() == ["Recent activity", "Service reports"]
+        await page.locator("#result-list .route-inspect").first.click()
+        await page.locator("#route-inspector .inspect-raw > summary").click()
+        assert "UI_VIEW_fixture_1" in await page.locator("#route-inspector").inner_text()
+        await page.evaluate("renderReport(window.uiViewOriginalReport); delete window.uiViewOriginalReport")
+        route_panel = page.locator("#route-results-panel")
+        route_handle = page.locator("#route-results-resize")
+        # Restoring the report starts its intentional smooth document scroll.
+        # Stop that animation before measuring screen coordinates for a drag;
+        # otherwise the handle can move between bounding_box and pointerdown.
+        await page.evaluate("window.scrollTo({top: window.scrollY, behavior: 'instant'})")
+        await route_handle.evaluate(
+            "element => element.scrollIntoView({behavior:'instant', block:'center'})"
+        )
+        initial_route_height = await route_panel.evaluate("element => element.getBoundingClientRect().height")
+        handle_box = await route_handle.bounding_box()
+        await page.mouse.move(handle_box["x"] + handle_box["width"] / 2, handle_box["y"] + handle_box["height"] / 2)
+        await page.mouse.down()
+        await page.mouse.move(handle_box["x"] + handle_box["width"] / 2, handle_box["y"] + handle_box["height"] / 2 - 100, steps=5)
+        await page.mouse.up()
+        resized_route_height = await route_panel.evaluate("element => element.getBoundingClientRect().height")
+        assert abs(resized_route_height - (initial_route_height - 100)) <= 2, (
+            initial_route_height, resized_route_height, handle_box
+        )
+        await route_handle.press("ArrowDown")
+        route_panel_height = await route_panel.evaluate("element => element.getBoundingClientRect().height")
+        assert abs(route_panel_height - (resized_route_height + 25)) <= 2
+        assert int(await route_handle.get_attribute("aria-valuenow")) == round(route_panel_height)
+        await page.locator("#route-results-expand").click()
+        assert await page.locator("#route-results-expand").inner_text() == "Collapse"
+        assert await route_panel.evaluate("element => element.getBoundingClientRect().height") > route_panel_height
+        await page.locator("#route-results-expand").click()
+        assert abs(await route_panel.evaluate("element => element.getBoundingClientRect().height") - route_panel_height) <= 2
+        await page.locator("#route-results-fullscreen").click()
+        assert await page.locator("#route-results-dialog").evaluate("element => element.open && element.matches(':modal')")
+        assert await route_panel.evaluate("element => element.clientHeight >= window.innerHeight - 2")
+        await page.locator("#route-results-close").click()
+        assert abs(await route_panel.evaluate("element => element.getBoundingClientRect().height") - route_panel_height) <= 2
+        await page.locator("#route-results-fullscreen").click()
+        await page.keyboard.press("Escape")
+        assert not await page.locator("#route-results-dialog").evaluate("element => element.open")
+        assert await page.locator("#route-results-fullscreen").evaluate("element => document.activeElement === element")
+        assert "Coverage: PARTIAL" in await page.locator("#coverage").text_content()
+        assert "Execution: FINISHED" in await page.locator("#coverage").text_content()
         await page.get_by_role("button", name="Show Healthy evidence", exact=True).click()
         assert await page.locator("#result-list .route-row").count() == 1
         await page.evaluate("activeDrilldown = 'all'; renderRows()")
@@ -124,6 +219,29 @@ async def main():
         assert await page.locator("#api-list tr").count() == 2
         assert await page.locator("#api-list tr td:first-child").all_text_contents() == ["POST", "POST"]
         await page.locator("#api-method-filter").select_option("all")
+        await page.evaluate("""() => {
+          const challenge = lastReport.api_inventory.find(item => item.endpoint === '/blocked/0');
+          Object.assign(challenge, {traffic_role:'CHALLENGE',traffic_roles:{CHALLENGE:1},observed_calls:1,
+            allowed_calls:0,blocked_calls:1,sent_calls:0,responded_calls:0,completed_calls:0,
+            failed_calls:0,canceled_calls:0,incomplete_calls:0});
+          lastReport.api_inventory.find(item => item.endpoint === '/query').traffic_role = 'BUSINESS';
+          renderApiInventory();
+        }""")
+        await page.locator("#api-role-filter").select_option("CHALLENGE")
+        assert await page.locator("#api-list tr").count() == 1
+        assert await page.locator("#api-list .api-role-cell").text_content() == "CHALLENGE"
+        assert "BLOCKED_BY_VALIDATOR" in await page.locator("#api-list").text_content()
+        await page.locator("#api-list .api-endpoint").click()
+        lifecycle = await page.locator("#evidence-content .inspect-section dl").evaluate("""element =>
+          Object.fromEntries([...element.children].map(row => [row.querySelector('dt').textContent, row.querySelector('dd').textContent]))
+        """)
+        assert lifecycle["observed"] == "1"
+        assert lifecycle["blocked"] == "1"
+        assert lifecycle["sent"] == "0"
+        assert lifecycle["completed"] == "0"
+        assert lifecycle["incomplete"] == "0"
+        await page.locator("#evidence-close").click()
+        await page.locator("#api-role-filter").select_option("all")
         await page.locator("#api-policy-filter").select_option("blocked")
         assert await page.locator("#api-list tr").count() == 5
         await page.locator("#api-policy-filter").select_option("all")
@@ -164,7 +282,27 @@ async def main():
         assert await page.locator("#api-list .empty-table").text_content() == "No POST requests were observed for this scan."
         await page.evaluate("lastReport.api_inventory = window.savedInventory; delete window.savedInventory; updateApiMethodFilter(lastReport.api_inventory)")
         await page.locator("#api-method-filter").select_option("all")
-        assert await page.locator("#api-list .not-executed").count() == 4
+        assert await page.locator("#api-list .blocked-by-validator").count() == 4
+        await page.evaluate("window.lifecycleInventory = lastReport.api_inventory")
+        for outcome in ("INCOMPLETE", "CANCELED"):
+            await page.evaluate("""outcome => {
+              lastReport.api_inventory = [{...window.lifecycleInventory[0],
+                health:'NOT_EXECUTED',observation_outcome:outcome,
+                sent_calls:1,responded_calls:0,completed_calls:0,failed_calls:0,
+                incomplete_calls:outcome === 'INCOMPLETE' ? 1 : 0,
+                canceled_calls:outcome === 'CANCELED' ? 1 : 0}];
+              renderApiInventory();
+            }""", outcome)
+            assert await page.locator("#api-list .dimension-state").text_content() == outcome
+            assert "NOT_EXECUTED" not in await page.locator("#api-list").text_content()
+            await page.locator("#api-list .api-endpoint").click()
+            lifecycle = await page.locator("#evidence-content .inspect-section dl").evaluate("""element =>
+              Object.fromEntries([...element.children].map(row => [row.querySelector('dt').textContent, row.querySelector('dd').textContent]))
+            """)
+            assert lifecycle["sent"] == "1" and lifecycle["completed"] == "0"
+            assert lifecycle["incomplete" if outcome == "INCOMPLETE" else "canceled"] == "1"
+            await page.locator("#evidence-close").click()
+        await page.evaluate("lastReport.api_inventory = window.lifecycleInventory; delete window.lifecycleInventory; renderApiInventory()")
         assert await page.locator("#api-table-wrap table").get_attribute("data-density") == "compact"
         await page.locator("#api-density").select_option("comfortable")
         assert await page.locator("#api-table-wrap table").get_attribute("data-density") == "comfortable"
@@ -174,7 +312,7 @@ async def main():
         assert await page.locator('[data-api-sort="average_duration_ms"]').text_content() == "Average Time (ms)"
         assert await page.locator('[data-api-sort="worst_duration_ms"]').text_content() == "Worst Time (ms)"
         await page.locator("#api-columns > summary").click()
-        assert await page.locator("#api-columns input[type=checkbox]").count() == 20
+        assert await page.locator("#api-columns input[type=checkbox]").count() == 21
         screenshot_base, screenshot_extension = os.path.splitext(screenshot)
         await page.screenshot(path=f"{screenshot_base}-columns{screenshot_extension or '.png'}")
         await page.locator('[data-column-kind="api"][data-column-key="host"]').uncheck()
@@ -199,6 +337,7 @@ async def main():
         await page.evaluate("localStorage.setItem('portal-validator.api-columns', JSON.stringify({host:false}))")
         await page.reload(wait_until="networkidle")
         await page.evaluate("report => renderReport(report)", saved_report)
+        assert abs(await route_panel.evaluate("element => element.getBoundingClientRect().height") - route_panel_height) <= 2
         assert not await page.locator('[data-api-sort="host"]').is_visible()
         assert not await page.locator('[data-sort="authentication_status"]').is_visible()
         assert await page.locator("#api-table-wrap th").last.text_content() == "Policy"
@@ -209,6 +348,83 @@ async def main():
             await page.locator(f"#{kind}-columns > summary").click()
         assert await page.locator('[data-api-sort="host"]').is_visible()
         assert await page.locator('[data-sort="authentication_status"]').is_visible()
+        # Inspect is outside the table's clipping/scroll context, and presents
+        # selected server-sanitized evidence instead of credential form values.
+        await page.evaluate("""() => {
+          const route = lastReport.results[0];
+          route.storage_state = {cookies:[{value:'do-not-export-cookie'}]};
+          route.authorization = 'do-not-export-authorization';
+          route.page_errors = ['Long diagnostic: ' + 'detail '.repeat(500) + 'END_OF_DIAGNOSTIC'];
+          route.requested_url = 'https://portal.example.com/health?code=%5BREDACTED%5D';
+          Object.defineProperty(navigator, 'clipboard', {configurable:true,
+            value:{writeText:async value => {window.copiedRouteDiagnostics = value;}}});
+          renderRows();
+        }""")
+        inspect = page.locator("#result-list .route-inspect").first
+        await inspect.click()
+        assert await inspect.get_attribute("aria-expanded") == "true"
+        assert await page.locator("#route-inspector").is_visible()
+        assert "END_OF_DIAGNOSTIC" in await page.locator("#route-inspector-content").inner_text()
+        assert await page.locator("#route-inspector-content pre").first.evaluate("element => getComputedStyle(element).whiteSpace") == "pre-wrap"
+        assert await page.locator("#route-inspector-content h4").all_text_contents() == [
+            "1. Overview", "2. Page load", "3. Navigation", "4. Authentication",
+            "5. APIs", "6. Resources", "7. Console", "8. TLS", "9. Security headers",
+            "Performance",
+        ]
+        assert await page.locator("#route-inspector").evaluate(
+            "element => element.getBoundingClientRect().width > document.querySelector('#results').clientWidth - 60"
+        )
+        initial_height = await page.locator("#route-inspector").evaluate("element => element.clientHeight")
+        await page.locator("#route-inspector-resize").press("ArrowDown")
+        resized_inspect_height = await page.locator("#route-inspector").evaluate("element => element.clientHeight")
+        assert resized_inspect_height > initial_height
+        await page.locator("#route-inspector-expand").click()
+        assert await page.locator("#route-inspector-expand").text_content() == "Collapse"
+        assert await page.locator("#route-inspector").evaluate("element => element.clientHeight") > initial_height
+        assert await page.locator("#route-inspector").evaluate("element => getComputedStyle(element).resize") == "vertical"
+        # Opening Inspect intentionally smooth-scrolls the outer document. Stop
+        # that still-running animation before testing inner-scroll isolation;
+        # separate CDP round trips must not mistake animation progress for an
+        # outer scroll caused by the inspector's own scrollTop assignment.
+        await page.evaluate("window.scrollTo({top: window.scrollY, behavior: 'instant'})")
+        initial_scroll = await page.evaluate("window.scrollY")
+        assert await page.locator("#route-inspector-content").evaluate("""element => {
+          element.scrollTop = 300;
+          return element.scrollTop > 0 && element.scrollHeight > element.clientHeight;
+        }""")
+        assert await page.evaluate("window.scrollY") == initial_scroll
+        await page.locator("#route-inspector-copy").click()
+        copied = await page.evaluate("window.copiedRouteDiagnostics")
+        assert "[REDACTED]" in copied or "%5BREDACTED%5D" in copied
+        assert "do-not-export" not in copied
+        assert "storage_state" not in copied
+        assert "authorization" not in copied
+        async with page.expect_download() as route_download:
+            await page.locator("#route-inspector-download").click()
+        downloaded = await route_download.value
+        assert downloaded.suggested_filename == "portal-route-diagnostics.json"
+        assert json.loads(Path(await downloaded.path()).read_text(encoding="utf-8")) == json.loads(copied)
+        await page.locator("#route-inspector-fullscreen").click()
+        assert await page.locator("#route-inspector-dialog").evaluate("element => element.open && element.matches(':modal')")
+        assert await page.locator("#route-inspector").evaluate("element => element.clientHeight >= window.innerHeight - 2")
+        # Native dialog keeps keyboard focus inside diagnostics.
+        await page.locator("#route-inspector-content").focus()
+        await page.keyboard.press("Tab")
+        assert await page.locator("#route-inspector-dialog").evaluate("element => element.contains(document.activeElement)")
+        await page.keyboard.press("Escape")
+        assert not await page.locator("#route-inspector").is_visible()
+        assert not await page.locator("#route-inspector-dialog").evaluate("element => element.open")
+        assert await inspect.evaluate("element => document.activeElement === element")
+        assert await inspect.get_attribute("aria-expanded") == "false"
+        await inspect.press("Enter")
+        # Closing a route or modal must not discard the user's panel size.
+        assert await page.locator("#route-inspector-expand").text_content() == "Collapse"
+        await page.locator("#route-inspector-expand").click()
+        assert await page.locator("#route-inspector-expand").text_content() == "Expand"
+        assert await page.locator("#route-inspector").evaluate("element => element.clientHeight") == resized_inspect_height
+        await page.locator("#route-inspector-close").click()
+        assert await inspect.evaluate("element => document.activeElement === element")
+        await page.evaluate("delete lastReport.results[0].storage_state; delete lastReport.results[0].authorization")
         await page.locator(".warning-count").click()
         assert "CONSOLE_WARNING" in await page.locator("#evidence-content").text_content()
         assert "Optional component emitted a warning" in await page.locator("#evidence-content").text_content()
@@ -358,6 +574,8 @@ async def main():
         await page.locator("#large-js-threshold").fill("1536")
         await page.locator("#large-css-font-threshold").fill("768")
         await page.locator("#slow-threshold").fill("7250")
+        await page.locator("#scan-timing-settings").evaluate("element => { element.open = true; }")
+        await concurrency.fill("1")
         await page.locator("#run-button").click()
         await page.wait_for_function("() => !document.getElementById('run-button').disabled && document.getElementById('progress').hidden")
         assert len(submitted) == 1
@@ -372,6 +590,9 @@ async def main():
         assert submitted[0]["min_observation_ms"] == 100
         assert submitted[0]["network_quiet_ms"] == 150
         assert submitted[0]["slow_page_threshold_ms"] == 7250
+        assert submitted[0]["concurrency_limit"] == 1
+        await concurrency.fill("")
+        await page.locator("#scan-timing-settings").evaluate("element => { element.open = false; }")
         await page.unroute("**/api/scans", capture_scan)
         await page.unroute("**/api/scans/ui-policy", completed_status)
         await page.unroute("**/api/scans/ui-policy/report", fixture_report)
@@ -417,6 +638,41 @@ async def main():
             warnings:document.querySelectorAll('#result-list .warning-count').length};
         }""")
         assert route_coverage == {"rows": 44, "warnings": 33}
+        assert await page.locator("#route-table-wrap").evaluate("""element => {
+          element.scrollTop = 300;
+          const header = element.querySelector('th').getBoundingClientRect();
+          const frame = element.getBoundingClientRect();
+          return element.scrollTop > 0 && Math.abs(header.top - frame.top) < 3;
+        }""")
+        await page.locator("#route-table-wrap").evaluate("element => { element.scrollTop = 0; }")
+        await page.locator("#route-results-fullscreen").click()
+        await page.locator("#result-list .route-inspect").first.click()
+        assert await page.locator("#route-inspector-dialog").evaluate("element => element.open && element.matches(':modal')")
+        await page.keyboard.press("Escape")
+        assert await page.locator("#route-results-dialog").evaluate("element => element.open")
+        await page.keyboard.press("Escape")
+        assert not await page.locator("#route-results-dialog").evaluate("element => element.open")
+        await page.evaluate("""() => {
+          window.paginationRoutes = lastReport.results;
+          const first = lastReport.results[0];
+          lastReport.results = Array.from({length:52}, (_, index) => ({...first,
+            route_name:`Pagination route ${index}`,display_path:`/pagination/${index}`,
+            classification:'PASS',warning_findings:0,warning_reasons:[]}));
+          renderRows();
+        }""")
+        first_route_page = await page.locator("#result-list .route-name-cell strong").all_text_contents()
+        assert len(first_route_page) == 50
+        assert "of 52" in await page.locator("#route-page-status").inner_text()
+        await page.locator("#route-page-next").click()
+        second_route_page = await page.locator("#result-list .route-name-cell strong").all_text_contents()
+        assert len(second_route_page) == 2
+        assert "Page 2" in await page.locator("#route-page-status").inner_text()
+        assert not set(first_route_page) & set(second_route_page)
+        assert len(set(first_route_page + second_route_page)) == 52
+        await page.locator("#route-page-prev").click()
+        assert await page.locator("#result-list .route-name-cell strong").all_text_contents() == first_route_page
+        await page.evaluate("lastReport.results = window.paginationRoutes; delete window.paginationRoutes; renderRows()")
+        assert await page.locator("#result-list .route-row").count() == 44
         await page.locator("#api-method-filter").select_option("GET")
         await page.locator("#api-status-filter").select_option("FAILED")
         await page.locator("#api-search").fill("previous-scan-filter")
@@ -454,6 +710,18 @@ async def main():
         ):
             await page.set_viewport_size(viewport)
             assert await page.get_by_role("button", name="Run validation →").is_visible()
+            await page.locator("#route-results-fullscreen").click()
+            assert await route_panel.evaluate("element => element.getBoundingClientRect().width <= window.innerWidth")
+            assert await page.locator("#route-table-wrap").evaluate("element => element.clientHeight > 100")
+            await page.keyboard.press("Escape")
+            await page.locator("#result-list .route-inspect").first.click()
+            assert await page.locator("#route-inspector").is_visible()
+            await page.locator("#route-inspector-fullscreen").click()
+            assert await page.locator("#route-inspector").evaluate(
+                "element => element.getBoundingClientRect().width <= window.innerWidth"
+            )
+            await page.keyboard.press("Escape")
+            assert not await page.locator("#route-inspector").is_visible()
             await page.locator("#resource-details").evaluate("element => { element.open = true; }")
             await page.locator("#read-post-settings > summary").click()
             await page.locator("#add-read-post").click()
@@ -488,7 +756,7 @@ async def main():
             if "Cross-Origin-Opener-Policy header has been ignored" not in error
         ]
         assert not actionable_errors, actionable_errors
-        print("UI_SMOKE_PASSED: POST form contract, blocked methods, columns/persistence, density, warnings, resource filters, synchronized scrolling, 44 routes, 1000 paginated API records, mobile layouts, strict CSP")
+        print("UI_SMOKE_PASSED: phase controls, traffic roles/lifecycle, POST form contract/counters, actual scan duration, blocked methods, columns/persistence, density, warnings, pointer/keyboard panel resizing and session persistence, expandable/fullscreen sanitized diagnostic copy/export, long diagnostics, independent scrolling/sticky headers/keyboard focus, resource filters, synchronized scrolling, 44 routes, 52 paginated routes, 1000 paginated API records, mobile layouts, strict CSP")
         await browser.close()
 
 

@@ -53,7 +53,7 @@ def test_home_health_and_security_headers():
     assert "Know your portal" in response.text
     assert response.headers["x-frame-options"] == "DENY"
     assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
-    assert client.get("/healthz").json() == {"status": "ok", "version": "1.10.0"}
+    assert client.get("/healthz").json() == {"status": "ok", "version": "1.12.1"}
 
 
 @pytest.mark.parametrize("max_pages", [5, 10, 40])
@@ -234,7 +234,7 @@ def test_cross_origin_sso_redirect_chain_is_recorded_but_not_crawled():
 
 
 def test_authentication_navigation_allows_generic_oauth_saml_chain():
-    policy = AuthenticationNavigationPolicy()
+    policy = AuthenticationNavigationPolicy(approved_hosts=frozenset({"federation.example.org"}))
     assert policy.allows_main_frame_method("GET", "https://portal.example.com")
     assert policy.allows_main_frame_method(
         "GET",

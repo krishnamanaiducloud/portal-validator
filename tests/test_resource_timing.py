@@ -7,7 +7,7 @@ from threading import Thread
 import pytest
 from playwright.async_api import async_playwright
 
-from app.health import assess_page_health, route_performance_timing, wait_for_render_settle
+from app.health import assess_page_health, document_navigation_timing, route_performance_timing, wait_for_render_settle
 from app.resources import (
     RESOURCE_TIMING_SCRIPT,
     build_resource_report,
@@ -197,6 +197,38 @@ def test_genuine_application_delay_remains_slow():
     assert {item["type"] for item in findings} == {"SLOW_ROUTE"}
 
 
+def test_navigation_policy_delay_is_validator_overhead_not_slow_target_time():
+    timing = route_performance_timing(
+        navigation_ms=6000,
+        navigation_policy_ms=5500,
+        render_health={"settle_application_ms": 0, "settle_render_ready_ms": 0},
+        total_validation_ms=6000,
+    )
+    assert timing["raw_navigation_ms"] == timing["total_validation_ms"] == 6000
+    assert timing["validator_navigation_ms"] == timing["validator_overhead_ms"] == 5500
+    assert timing["application_navigation_ms"] == timing["application_load_ms"] == 500
+    assert timing["render_ready_ms"] == 6000
+    assert timing["application_load_ms"] + timing["validator_overhead_ms"] == timing["total_validation_ms"]
+    _, findings = assess_page_health(
+        {"text_length": 100, "visible_elements": 10, "busy_indicators": 0},
+        load_ms=timing["application_load_ms"], slow_page_threshold_ms=5000,
+    )
+    assert "SLOW_ROUTE" not in {item["type"] for item in findings}
+
+
+@pytest.mark.parametrize("policy_ms,expected_policy_ms", [(-100, 0), (0, 0), (9000, 6000)])
+def test_navigation_policy_accounting_is_clamped_and_does_not_inflate_settle(policy_ms, expected_policy_ms):
+    timing = route_performance_timing(
+        navigation_ms=6000, navigation_policy_ms=policy_ms,
+        render_health={"settle_application_ms": 9000}, total_validation_ms=6500,
+    )
+    assert timing["validator_navigation_ms"] == expected_policy_ms
+    assert timing["application_navigation_ms"] == 6000 - expected_policy_ms
+    assert timing["application_settle_ms"] == 500
+    assert timing["validator_overhead_ms"] == expected_policy_ms
+    assert timing["application_load_ms"] + timing["validator_overhead_ms"] == 6500
+
+
 def test_pre_render_validator_work_is_not_application_navigation_or_settle():
     timing = route_performance_timing(
         navigation_ms=100, render_start_ms=6000,
@@ -304,6 +336,56 @@ async def test_slow_dom_diagnostic_is_bounded_and_not_application_slow_time(monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("previously_ready", [False, True])
+async def test_readiness_check_timeout_preserves_current_unproven_condition(monkeypatch, previously_ready):
+    import app.health as health
+    clock = [0.0]
+
+    async def sleep(seconds):
+        clock[0] += seconds
+
+    async def capture(_):
+        return {
+            "ready_state": "complete", "title": "Generic portal", "text_length": 100,
+            "visible_elements": 10, "busy_indicators": 0, "challenge_indicators": 0,
+        }
+
+    class ReadinessLocator:
+        calls = 0
+
+        @property
+        def first(self):
+            return self
+
+        async def is_visible(self):
+            self.calls += 1
+            if previously_ready and self.calls == 1:
+                return True
+            clock[0] = 0.5
+            raise TimeoutError("visibility check exhausted its observation budget")
+
+    class Page:
+        readiness = ReadinessLocator()
+
+        def locator(self, selector):
+            assert selector == "#ready"
+            return self.readiness
+
+    monkeypatch.setattr(health, "capture_render_health", capture)
+    monkeypatch.setattr(health.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(health.asyncio, "sleep", sleep)
+    page = Page()
+    snapshot = await wait_for_render_settle(
+        page, settle_ms=1000, maximum_ms=500,
+        readiness_selector="#ready", minimum_observation_ms=0, network_quiet_ms=0,
+    )
+    assert page.readiness.calls == (2 if previously_ready else 1)
+    assert snapshot["ready_state"] == "complete"
+    assert snapshot["settle_reason"] == "BOUNDED_TIMEOUT"
+    assert snapshot["configured_readiness_met"] is False
+
+
+@pytest.mark.asyncio
 async def test_visible_loader_and_network_activity_are_not_confused_with_quiet_confirmation(monkeypatch):
     import app.health as health
     clock = [0.0]
@@ -372,6 +454,29 @@ async def test_settle_tracks_ready_time_separately_from_stability_confirmation(m
     assert snapshot["settle_application_ms"] == 0
     assert snapshot["settle_validator_observation_ms"] >= 2000
     assert snapshot["settle_render_ready_ms"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ipc_delay_seconds", [0, 2.4])
+async def test_document_clock_alignment_excludes_browser_ipc_return_delay(monkeypatch, ipc_delay_seconds):
+    import app.health as health
+    clock = {"monotonic": 100.0, "epoch": 1700000000.0}
+
+    class Page:
+        async def evaluate(self, _script):
+            # The browser sampled its Navigation Timing before an arbitrarily
+            # delayed response reached Python. Neither the duration nor the
+            # document's window for subtracting policy waits may move.
+            clock["monotonic"] += ipc_delay_seconds
+            clock["epoch"] += ipc_delay_seconds
+            return {"duration": 500, "epochStart": 1699999999000}
+
+    monkeypatch.setattr(health.time, "perf_counter", lambda: clock["monotonic"])
+    monkeypatch.setattr(health.time, "time", lambda: clock["epoch"])
+    duration, started, finished = await document_navigation_timing(Page())
+    assert duration == 500
+    assert started == pytest.approx(99.0)
+    assert finished == pytest.approx(99.5)
 
 
 @pytest.mark.asyncio

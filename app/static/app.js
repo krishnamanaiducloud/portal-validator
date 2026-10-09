@@ -18,6 +18,105 @@ let activeDrilldown = 'all';
 let apiFailureOnly = false;
 let activeScanId = null;
 let scrollSynchronizers = [];
+let inspectedRoute = null;
+let inspectTrigger = null;
+// Panel preferences contain dimensions only, never report or authentication data.
+const panelSizes = {};
+
+function initializeResizablePanel(kind, minimum) {
+  const panel = byId(kind === 'route-results' ? 'route-results-panel' : kind);
+  const handle = byId(`${kind}-resize`);
+  const expand = byId(`${kind}-expand`);
+  const storageKey = `portal-validator.${kind}-size`;
+  let saved = {};
+  try { saved = JSON.parse(sessionStorage.getItem(storageKey) || '{}') || {}; }
+  catch (_) { /* Dimensions remain session-local when storage is unavailable. */ }
+  const state = {height:Number.isFinite(saved.height) ? saved.height : null, expanded:saved.expanded === true};
+  const maximum = () => Math.max(minimum, Math.floor(window.innerHeight * .9));
+  const persist = () => {
+    try { sessionStorage.setItem(storageKey, JSON.stringify(state)); }
+    catch (_) { /* In-memory preferences still work without session storage. */ }
+  };
+  const apply = () => {
+    panel.classList.toggle('expanded', state.expanded);
+    if (state.expanded) panel.style.height = `${maximum()}px`;
+    else if (state.height !== null) panel.style.height = `${Math.max(minimum, Math.min(maximum(), state.height))}px`;
+    else panel.style.removeProperty('height');
+    expand.textContent = state.expanded ? 'Collapse' : 'Expand';
+    expand.setAttribute('aria-expanded', String(state.expanded));
+    handle.setAttribute('aria-valuemin', String(minimum));
+    handle.setAttribute('aria-valuemax', String(maximum()));
+    handle.setAttribute('aria-valuenow', String(Math.round(panel.getBoundingClientRect().height || state.height || minimum)));
+    refreshScrollSync();
+  };
+  const resize = (height) => {
+    state.height = Math.max(minimum, Math.min(maximum(), Math.round(height)));
+    state.expanded = false;
+    apply();
+    persist();
+  };
+  let drag = null;
+  handle.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    drag = {y:event.clientY,height:panel.getBoundingClientRect().height};
+    handle.setPointerCapture(event.pointerId);
+    handle.focus({preventScroll:true});
+    event.preventDefault();
+  });
+  handle.addEventListener('pointermove', (event) => {
+    if (drag) resize(drag.height + event.clientY - drag.y);
+  });
+  const finishDrag = () => { drag = null; };
+  handle.addEventListener('pointerup', finishDrag);
+  handle.addEventListener('pointercancel', finishDrag);
+  handle.addEventListener('lostpointercapture', finishDrag);
+  handle.addEventListener('keydown', (event) => {
+    const current = panel.getBoundingClientRect().height;
+    const step = event.shiftKey ? 100 : 25;
+    const changes = {ArrowUp:current-step,ArrowDown:current+step,Home:minimum,End:maximum()};
+    if (!(event.key in changes)) return;
+    event.preventDefault();
+    resize(changes[event.key]);
+  });
+  expand.addEventListener('click', () => {
+    state.expanded = !state.expanded;
+    apply();
+    persist();
+  });
+  window.addEventListener('resize', apply);
+  if (window.ResizeObserver && kind === 'route-inspector') {
+    // Preserve the existing native CSS resize grip as well as the accessible
+    // handle. Only an explicit inline height change represents user resizing.
+    new ResizeObserver(() => {
+      const height = Number.parseFloat(panel.style.height);
+      if (!panel.hidden && !panel.closest('dialog[open]') && !state.expanded && Number.isFinite(height) && height !== state.height) resize(height);
+    }).observe(panel);
+  }
+  panelSizes[kind] = {apply};
+  apply();
+}
+
+function closeRouteResultsFullscreen() {
+  const dialog = byId('route-results-dialog');
+  if (!dialog.open) return;
+  dialog.close();
+  byId('route-results-host').append(byId('route-results-panel'));
+  byId('route-results-fullscreen').textContent = 'Full screen';
+  byId('route-results-close').hidden = true;
+  panelSizes['route-results'].apply();
+  byId('route-results-fullscreen').focus({preventScroll:true});
+}
+
+function toggleRouteResultsFullscreen() {
+  const dialog = byId('route-results-dialog');
+  if (dialog.open) { closeRouteResultsFullscreen(); return; }
+  dialog.append(byId('route-results-panel'));
+  byId('route-results-fullscreen').textContent = 'Exit full screen';
+  byId('route-results-close').hidden = false;
+  dialog.showModal();
+  byId('route-results-close').focus({preventScroll:true});
+  refreshScrollSync();
+}
 
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
 const splitList = (value) => value.split(',').map((item) => item.trim()).filter(Boolean);
@@ -52,6 +151,7 @@ const tableColumns = {
     ['average_duration_ms','Average Time (ms)','Mean actual completed API response duration in milliseconds; excludes blocked and no-response calls.'],
     ['worst_duration_ms','Worst Time (ms)','Maximum actual completed API response duration in milliseconds.'],
     ['observation_outcome','Health','Aggregated API health; policy-blocked-only calls are NOT_EXECUTED.'],
+    ['traffic_role','Traffic role','Evidence-based authentication, challenge, configuration, business, or unclassified traffic; independent of request authorization.'],
     ['policies','Policy','Observed read-only approval/block decisions. No bodies are retained; explicit GraphQL query rules inspect operation types in memory.'],
   ],
   route: [
@@ -88,10 +188,10 @@ const tablePagination = Object.fromEntries(['route','api','resource'].map((kind)
 
 function paginateTable(kind, items) {
   const state = tablePagination[kind];
-  const controls = kind === 'route' ? ['result-search','result-filter','navigation-filter'] : kind === 'api' ? ['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-failed-only'] : ['resource-search','resource-type-filter','resource-route-filter','resource-status-filter','resource-failed-only','resource-large-only'];
+  const controls = kind === 'route' ? ['result-search','result-filter','navigation-filter'] : kind === 'api' ? ['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','api-failed-only'] : ['resource-search','resource-type-filter','resource-route-filter','resource-status-filter','resource-failed-only','resource-large-only'];
   const filters = controls.map((id) => { const input = byId(id); return input.type === 'checkbox' ? input.checked : input.value; });
   const sort = kind === 'route' ? routeSort : kind === 'api' ? apiSort : resourceSort;
-  const key = JSON.stringify([filters,sort,activeDrilldown,apiFailureOnly,items.map((item) => item.canonical_route || item.url || [item.method,item.host,item.endpoint,item.path])]);
+  const key = JSON.stringify([filters,sort,activeDrilldown,apiFailureOnly,items.map((item) => item.route_id || item.canonical_route || item.url || [item.method,item.host,item.endpoint,item.path])]);
   if (key !== state.key) { state.page = 0; state.key = key; }
   const pages = Math.max(1, Math.ceil(items.length / state.size));
   state.page = Math.min(state.page, pages - 1);
@@ -191,6 +291,23 @@ function approvedReadPostOperations() {
     const description = row.querySelector('.operation-description').value.trim();
     return {method:'POST',host,[pathType]:path,...(description ? {description} : {}),...(row.querySelector('.operation-graphql').checked ? {graphql_queries_only:true} : {})};
   });
+}
+
+function phaseConfiguration() {
+  const configuration = {};
+  const fields = {navigation_timeout_ms:'navigation-timeout',authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout',concurrency_limit:'concurrency-limit'};
+  for (const [name,id] of Object.entries(fields)) {
+    const input = byId(id);
+    if (!input.value.trim()) continue;
+    const value = Number(input.value);
+    if (!Number.isInteger(value) || value < Number(input.min) || value > Number(input.max)) throw new Error(`${input.closest('label').querySelector('span').textContent} must be an integer between ${input.min} and ${input.max}.`);
+    configuration[name] = value;
+  }
+  const readiness = byId('readiness-selector').value.trim();
+  if (readiness) configuration.readiness_selector = readiness;
+  const hosts = splitList(byId('authentication-hosts').value);
+  if (hosts.length) configuration.authentication_hosts = hosts;
+  return configuration;
 }
 
 function notify(message, isError = false) {
@@ -330,6 +447,97 @@ function detailSection(title, value) {
   return `<details class="technical-detail"><summary>${escapeHtml(title)}</summary><pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre></details>`;
 }
 
+// Diagnostics are selected from the server-sanitized report only. Never read
+// credential form inputs, browser storage, or an arbitrary full route object.
+function routeDiagnostics(item) {
+  return {
+    overview: {route_name:item.route_name || item.route_label,classification:item.classification,validation_status:item.validation_status,warning_reasons:routeWarnings(item),finding_details:item.finding_details},
+    page_load: {status:item.page_load_status,http_status:item.http_status_display ?? item.status ?? null,render_status:item.render_status,failure_dimension:item.failure_dimension,failure_reason:item.failure_reason},
+    navigation: {requested_url:item.requested_url,discovered_url:item.discovered_url,final_url:item.final_url,redirects:item.redirects,type:item.navigation_type,status:item.navigation_status,identity:{route_id:item.route_id,view_type:item.view_type,canonical_route:item.canonical_route,display_path:item.display_path,origin:item.origin,host:item.host,pathname:item.pathname,query_sanitized:item.query_sanitized,fragment:item.fragment,spa_route:item.spa_route,route_name:item.route_name,route_name_source:item.route_name_source,route_name_confidence:item.route_name_confidence,discovery_sources:item.discovery_sources,duplicate_discovery_count:item.duplicate_discovery_count,depth:item.depth}},
+    authentication: {status:item.authentication_status,stage:item.authentication_stage},
+    apis: {status:item.api_status,coverage:item.api_coverage,observed:item.apis_observed,application_observed:item.application_apis_observed,blocked:item.blocked_api_attempts,failures:item.api_failures,requests:item.api_requests,read_only_status:item.read_only_status,read_only_blocks:item.read_only_blocks},
+    resources: {status:item.resource_status,failures:item.resource_failure_count,observations:item.resources,failed_resources:item.failed_resources,frames:item.frames,external_links:item.external_links},
+    console: {status:item.console_status,messages:item.console_errors,page_errors:item.page_errors},
+    tls: {status:item.tls_status,basis:item.tls_basis},
+    security_headers: {status:item.security_headers_status,findings:item.security_headers},
+    performance: {application_navigation_ms:item.application_navigation_ms ?? item.navigation_ms,application_settle_ms:item.application_settle_ms,validator_overhead_ms:item.validator_overhead_ms,validator_observation_ms:item.validator_observation_ms,total_validation_ms:item.total_validation_ms,application_load_ms:item.application_load_ms,render_health:item.render_health,timings:item.timings},
+  };
+}
+
+function inspectSection(title, value) {
+  const entries = Object.entries(value || {}).filter(([,entry]) => entry !== undefined);
+  const content = entries.length ? `<dl>${entries.map(([key,entry]) => `<div><dt>${escapeHtml(key.replaceAll('_', ' '))}</dt><dd>${entry !== null && typeof entry === 'object' ? `<pre>${escapeHtml(JSON.stringify(entry, null, 2))}</pre>` : escapeHtml(entry ?? 'Not recorded')}</dd></div>`).join('')}</dl>` : '<p class="empty-detail">No observations recorded.</p>';
+  return `<section class="inspect-section"><h4>${escapeHtml(title)}</h4>${content}</section>`;
+}
+
+function showRouteInspector(item, trigger) {
+  closeRouteInspector(false);
+  inspectedRoute = routeDiagnostics(item);
+  inspectTrigger = trigger;
+  trigger.setAttribute('aria-expanded', 'true');
+  const panel = byId('route-inspector');
+  const title = item.route_name || item.route_label || item.display_path || 'Route';
+  byId('route-inspector-title').textContent = `Inspect: ${title}`;
+  byId('route-inspector-content').innerHTML = [
+    inspectSection('1. Overview', inspectedRoute.overview),
+    inspectSection('2. Page load', inspectedRoute.page_load),
+    inspectSection('3. Navigation', inspectedRoute.navigation),
+    inspectSection('4. Authentication', inspectedRoute.authentication),
+    inspectSection('5. APIs', inspectedRoute.apis),
+    inspectSection('6. Resources', inspectedRoute.resources),
+    inspectSection('7. Console', inspectedRoute.console),
+    inspectSection('8. TLS', inspectedRoute.tls),
+    inspectSection('9. Security headers', inspectedRoute.security_headers),
+    inspectSection('Performance', inspectedRoute.performance),
+    `<details class="inspect-raw"><summary>10. Raw sanitized diagnostics</summary><pre>${escapeHtml(JSON.stringify(inspectedRoute, null, 2))}</pre></details>`,
+  ].join('');
+  panel.hidden = false;
+  panelSizes['route-inspector'].apply();
+  if (byId('route-results-dialog').open) toggleInspectorFullscreen();
+  byId('route-inspector-content').scrollTop = 0;
+  panel.scrollIntoView({block:'nearest'});
+  byId('route-inspector-close').focus({preventScroll:true});
+}
+
+function closeRouteInspector(restoreFocus = true) {
+  const panel = byId('route-inspector');
+  const dialog = byId('route-inspector-dialog');
+  if (dialog.open) dialog.close();
+  byId('route-inspector-host').append(panel);
+  panel.hidden = true;
+  byId('route-inspector-fullscreen').textContent = 'Full screen';
+  inspectTrigger?.setAttribute('aria-expanded', 'false');
+  if (restoreFocus && inspectTrigger?.isConnected) inspectTrigger.focus({preventScroll:true});
+  inspectTrigger = null;
+  inspectedRoute = null;
+  byId('route-inspector-content').replaceChildren();
+}
+
+function toggleInspectorFullscreen() {
+  const dialog = byId('route-inspector-dialog');
+  const panel = byId('route-inspector');
+  if (dialog.open) {
+    dialog.close();
+    byId('route-inspector-host').append(panel);
+    byId('route-inspector-fullscreen').textContent = 'Full screen';
+  } else {
+    dialog.append(panel);
+    dialog.showModal();
+    byId('route-inspector-fullscreen').textContent = 'Exit full screen';
+  }
+  panelSizes['route-inspector'].apply();
+  byId('route-inspector-fullscreen').focus({preventScroll:true});
+}
+
+function downloadDiagnostics(value, filename) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], {type:'application/json'}));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 function routeWarnings(item) {
   if (item.classification === 'PASS') return [];
   if (Array.isArray(item.warning_reasons)) return item.warning_reasons;
@@ -369,17 +577,17 @@ function renderRows() {
   });
   updateAriaSort('[data-sort]', routeSort, 'sort');
   rows = paginateTable('route', rows);
+  closeRouteInspector(false);
   byId('result-list').innerHTML = rows.map((item) => {
     const route = routeDisplay(item);
-    const routeIdentity = {requested_url:item.requested_url,discovered_url:item.discovered_url,final_url:item.final_url,origin:item.origin,host:item.host,pathname:item.pathname,query_sanitized:item.query_sanitized,fragment:item.fragment,spa_route:item.spa_route,canonical_route:item.canonical_route,display_path:item.display_path,route_name:item.route_name,route_name_source:item.route_name_source,route_name_confidence:item.route_name_confidence,discovery_sources:item.discovery_sources,duplicate_discovery_count:item.duplicate_discovery_count};
-    const detail = {route_identity:routeIdentity,redirects:item.redirects,navigation_type:item.navigation_type,tls_basis:item.tls_basis,render_health:item.render_health,timings:{application_navigation_ms:item.application_navigation_ms ?? item.navigation_ms,application_settle_ms:item.application_settle_ms,validator_overhead_ms:item.validator_overhead_ms,validator_observation_ms:item.validator_observation_ms,total_validation_ms:item.total_validation_ms,application_load_ms:item.application_load_ms,...(item.timings || {})},warning_reasons:item.warning_reasons,api_coverage:item.api_coverage,apis_observed:item.apis_observed,application_apis_observed:item.application_apis_observed,blocked_api_attempts:item.blocked_api_attempts,api_failures:item.api_failures,resource_failures:item.resource_failure_count,api_requests:item.api_requests,resources:item.resources,failed_resources:item.failed_resources,frames:item.frames,security_headers:item.security_headers,external_links:item.external_links};
     const failure = item.failure_reason ? `<small class="failure-reason"><b>${escapeHtml(item.failure_dimension || 'VALIDATION')}</b>${escapeHtml(item.failure_reason)}</small>` : '';
-    return `<tr class="route-row outcome-${statusClass(item.classification)}"><td><span class="outcome-badge ${statusClass(item.classification)}">${escapeHtml(item.classification)}</span>${failure}</td><td class="route-name-cell"><strong>${escapeHtml(item.route_name || item.route_label || 'Unnamed route')}</strong><small>${escapeHtml(item.route_name_source || 'FALLBACK')}</small></td><td class="route-cell"><span>${escapeHtml(route.host)}</span><code>${escapeHtml(route.path)}</code></td><td><span class="dimension-state ${statusClass(item.navigation_status)}">${escapeHtml(item.navigation_type || 'DOCUMENT_NAVIGATION')}</span></td><td><strong class="http-status">${escapeHtml(item.http_status_display ?? item.status ?? 'N/A')}</strong></td><td><span class="time-value ${item.slow ? 'slow' : ''}">${escapeHtml(item.load_ms ?? '—')} ms</span></td><td><span class="dimension-state ${statusClass(item.api_status)}">${escapeHtml(item.api_status)}</span></td><td><span class="dimension-state ${statusClass(item.resource_status)}">${escapeHtml(item.resource_status)}</span></td><td><span class="dimension-state ${statusClass(item.console_status)}">${escapeHtml(item.console_status)}</span></td><td><span class="dimension-state ${statusClass(item.authentication_status)}">${escapeHtml(item.authentication_status)}</span></td><td><span class="dimension-state ${statusClass(item.tls_status)}">${escapeHtml(item.tls_status)}</span></td><td><strong>${escapeHtml(item.warning_findings || 0)}</strong></td><td><details class="route-detail"><summary>Inspect</summary><div class="detail-drawer"><div class="result-overview"><div><span>Page load</span><strong class="state ${statusClass(item.page_load_status)}">${escapeHtml(item.page_load_status)}</strong></div><div><span>Validation</span><strong class="state ${statusClass(item.validation_status)}">${escapeHtml(item.validation_status)}</strong></div><div><span>Render</span><strong class="state ${statusClass(item.render_status)}">${escapeHtml(item.render_status)}</strong></div><div><span>TLS</span><strong class="state ${statusClass(item.tls_status)}">${escapeHtml(item.tls_status)}</strong></div><div><span>Security headers</span><strong class="state ${statusClass(item.security_headers_status)}">${escapeHtml(item.security_headers_status)}</strong></div><div><span>Read-only</span><strong class="state ${statusClass(item.read_only_status)}">${escapeHtml(item.read_only_status)}</strong></div><div><span>Navigation</span><strong>${escapeHtml(item.navigation_type || 'DOCUMENT_NAVIGATION')}</strong></div><div><span>Discovery</span><strong>${escapeHtml(item.discovery_type || item.route_source || 'route')}</strong></div><div><span>Depth</span><strong>${escapeHtml(item.depth)}</strong></div></div>${item.failure_reason ? `<h3>Failure explanation</h3><p class="failure-explanation"><b>${escapeHtml(item.failure_dimension || 'VALIDATION')}</b>${escapeHtml(item.failure_reason)}</p>` : ''}<h3>Route identity</h3>${detailSection('Identity and provenance', routeIdentity)}<h3>Findings</h3>${findingsMarkup(item)}${detailSection('Navigation and redirects', {requested_url:item.requested_url,final_url:item.final_url,redirects:item.redirects})}${detailSection('API / XHR', item.api_requests)}${detailSection('Resources', item.resources)}${detailSection('Console', {console:item.console_errors,page_errors:item.page_errors})}${detailSection('Security headers', item.security_headers)}${detailSection('Performance', item.render_health)}${detailSection('Read-only safety', {status:item.read_only_status,blocks:item.read_only_blocks})}<details class="technical-detail"><summary>Technical route data</summary><pre>${escapeHtml(JSON.stringify(detail, null, 2))}</pre></details></div></details></td></tr>`;
+    return `<tr class="route-row outcome-${statusClass(item.classification)}"><td><span class="outcome-badge ${statusClass(item.classification)}">${escapeHtml(item.classification)}</span>${failure}</td><td class="route-name-cell"><strong>${escapeHtml(item.route_name || item.route_label || 'Unnamed route')}</strong><small>${escapeHtml(item.route_name_source || 'FALLBACK')}</small></td><td class="route-cell"><span>${escapeHtml(route.host)}</span><code>${escapeHtml(route.path)}</code></td><td><span class="dimension-state ${statusClass(item.navigation_status)}">${escapeHtml(item.navigation_type || 'DOCUMENT_NAVIGATION')}</span></td><td><strong class="http-status">${escapeHtml(item.http_status_display ?? item.status ?? 'N/A')}</strong></td><td><span class="time-value ${item.slow ? 'slow' : ''}">${escapeHtml(item.load_ms ?? '—')} ms</span></td><td><span class="dimension-state ${statusClass(item.api_status)}">${escapeHtml(item.api_status)}</span></td><td><span class="dimension-state ${statusClass(item.resource_status)}">${escapeHtml(item.resource_status)}</span></td><td><span class="dimension-state ${statusClass(item.console_status)}">${escapeHtml(item.console_status)}</span></td><td><span class="dimension-state ${statusClass(item.authentication_status)}">${escapeHtml(item.authentication_status)}</span></td><td><span class="dimension-state ${statusClass(item.tls_status)}">${escapeHtml(item.tls_status)}</span></td><td><strong>${escapeHtml(item.warning_findings || 0)}</strong></td><td><button type="button" class="secondary route-inspect" aria-expanded="false" aria-controls="route-inspector" aria-label="Inspect ${escapeHtml(item.route_name || item.display_path || 'route')}">Inspect</button></td></tr>`;
   }).join('') || '<tr><td colspan="13" class="empty-table">No routes match this filter.</td></tr>';
   byId('result-list').querySelectorAll('.route-row').forEach((row, index) => {
     const item = rows[index];
+    const inspect = row.querySelector('.route-inspect');
+    inspect.addEventListener('click', () => showRouteInspector(item, inspect));
     const warnings = routeWarnings(item);
-    if (warnings.length) row.querySelector('.result-overview').insertAdjacentHTML('afterend', `<h3>Why this route has warnings</h3>${warningReasonsMarkup(item)}`);
     if (!Number(item.warning_findings || 0)) return;
     const cell = row.children[11];
     const button = document.createElement('button');
@@ -434,10 +642,22 @@ function apiDisplayPolicies(item) {
 
 function renderApiInventory() {
   const inventory = lastReport?.api_inventory || [];
+  const posts = lastReport?.summary?.post_summary || {};
+  [['observed_calls','Observed POST'],['approved_read_only_calls','Approved read-only POST'],['executed_approved_calls','Executed approved POST']].forEach(([key,label]) => {
+    const value = Number.isFinite(posts[key]) ? posts[key] : 'Not recorded';
+    byId(`post-summary-${key}`).textContent = String(value);
+    byId(`post-summary-${key}`).setAttribute('aria-label', `${label}: ${value}`);
+  });
+  const roleFilter = byId('api-role-filter');
+  const previousRole = roleFilter.value;
+  const roles = [...new Set(inventory.map((item) => item.traffic_role || 'UNCLASSIFIED'))].sort();
+  roleFilter.innerHTML = `<option value="all">All traffic</option>${roles.map((role) => `<option value="${escapeHtml(role)}">${escapeHtml(role)}</option>`).join('')}`;
+  if (roles.includes(previousRole)) roleFilter.value = previousRole;
   const search = byId('api-search').value.trim().toLowerCase();
   const method = byId('api-method-filter').value;
   const health = byId('api-status-filter').value;
   const policy = byId('api-policy-filter').value;
+  const trafficRole = roleFilter.value;
   const route = byId('api-route-filter')?.value || 'all';
   const failedOnly = apiFailureOnly || byId('api-failed-only').checked;
   let visible = inventory.filter((item) => {
@@ -447,6 +667,7 @@ function renderApiInventory() {
     return (!search || `${item.host} ${item.endpoint}`.toLowerCase().includes(search))
       && (method === 'all' || item.method === method)
       && (health === 'all' || outcome === health)
+      && (trafficRole === 'all' || (item.traffic_role || 'UNCLASSIFIED') === trafficRole)
       && (policy === 'all' || (policy === 'blocked' ? Number(item.blocked_count || 0) > 0 : policy === 'approved-post' ? item.method === 'POST' && policies.includes('APPROVED_READ_ONLY') : policy === 'target-failures' ? targetFailure : Number(item.allowed_calls ?? item.calls ?? 0) > 0))
       && (route === 'all' || (item.routes_using_endpoint || []).includes(route))
       && (!failedOnly || ['FAILED','WARNING'].includes(outcome));
@@ -457,14 +678,18 @@ function renderApiInventory() {
   visible = paginateTable('api', visible);
   byId('api-list').innerHTML = visible.map((item, index) => {
     const outcome = item.observation_outcome || (item.health === 'DEGRADED' ? 'WARNING' : item.health);
-    const healthLabel = item.health === 'NOT_EXECUTED' ? 'NOT_EXECUTED' : outcome;
+    // The observation outcome distinguishes a blocked attempt from a sent
+    // request that was canceled or remained incomplete. Legacy aggregate
+    // health must not erase that execution evidence.
+    const healthLabel = outcome;
     const numbers = [item.calls,item.status_2xx,item.status_3xx,item.status_4xx,item.status_5xx,item.network_failures,item.route_count,item.allowed_calls ?? Math.max(0, Number(item.calls || 0) - Number(item.blocked_count || 0)),item.blocked_count || 0,item.application_bootstrap_phase_count || 0,item.authentication_phase_count || 0,item.route_validation_phase_count ?? item.validation_phase_count ?? 0,item.session_refresh_phase_count || 0,item.average_duration_ms ?? 'N/A',item.worst_duration_ms ?? 'N/A'];
     const policies = apiDisplayPolicies(item);
-    return `<tr><td><strong>${escapeHtml(item.method)}</strong></td><td>${escapeHtml(item.host)}</td><td><button class="api-endpoint" type="button" data-api-index="${index}" title="${escapeHtml(item.endpoint)}">${escapeHtml(item.endpoint)}</button></td>${numbers.map((value) => `<td>${escapeHtml(value)}</td>`).join('')}<td><span class="dimension-state ${statusClass(healthLabel)}">${escapeHtml(healthLabel)}</span></td><td class="api-policy-cell">${escapeHtml(policies.join(', ') || 'N/A')}</td></tr>`;
-  }).join('') || `<tr><td colspan="20" class="empty-table">${method === 'POST' && !inventory.some((item) => item.method === 'POST') ? 'No POST requests were observed for this scan.' : failedOnly || policy === 'target-failures' ? 'No target API failures match these filters.' : 'No API requests match these filters.'}</td></tr>`;
+    return `<tr><td><strong>${escapeHtml(item.method)}</strong></td><td>${escapeHtml(item.host)}</td><td><button class="api-endpoint" type="button" data-api-index="${index}" title="${escapeHtml(item.endpoint)}">${escapeHtml(item.endpoint)}</button></td>${numbers.map((value) => `<td>${escapeHtml(value)}</td>`).join('')}<td><span class="dimension-state ${statusClass(healthLabel)}">${escapeHtml(healthLabel)}</span></td><td class="api-role-cell">${escapeHtml(item.traffic_role || 'UNCLASSIFIED')}</td><td class="api-policy-cell">${escapeHtml(policies.join(', ') || 'N/A')}</td></tr>`;
+  }).join('') || `<tr><td colspan="21" class="empty-table">${method === 'POST' && !inventory.some((item) => item.method === 'POST') ? 'No POST requests were observed for this scan.' : failedOnly || policy === 'target-failures' ? 'No target API failures match these filters.' : 'No API requests match these filters.'}</td></tr>`;
   byId('api-list').querySelectorAll('[data-api-index]').forEach((button) => button.addEventListener('click', () => {
     const item = visible[Number(button.dataset.apiIndex)];
     showEvidence(`${item.method} ${item.host}${item.endpoint}`, item);
+    byId('evidence-content').insertAdjacentHTML('afterbegin', inspectSection('Request lifecycle', {traffic_role:item.traffic_role || 'UNCLASSIFIED',traffic_roles:item.traffic_roles,observed:item.observed_calls ?? item.calls ?? null,allowed:item.allowed_calls ?? null,blocked:item.blocked_calls ?? item.blocked_count ?? null,sent:item.sent_calls ?? null,responded:item.responded_calls ?? null,completed:item.completed_calls ?? null,failed:item.failed_calls ?? null,canceled:item.canceled_calls ?? null,incomplete:item.incomplete_calls ?? null}));
   }));
   refreshScrollSync();
 }
@@ -567,7 +792,7 @@ function terminationMessage(coverage) {
   const validated = Number(coverage.routes_validated || 0);
   const discovered = Number(coverage.routes_discovered || validated);
   const notTested = Number(coverage.routes_not_tested ?? coverage.routes_remaining ?? 0);
-  const reasons = {MAX_ROUTES_REACHED:'Maximum route limit reached.',SCAN_TIMEOUT:'Total scan time budget was exhausted.',USER_CANCELLED:'The scan was cancelled.',MAX_DEPTH_REACHED:'Maximum discovery depth was reached.',DISCOVERY_EXHAUSTED:'All eligible discovered routes were processed.'};
+  const reasons = {MAX_ROUTES_REACHED:'Maximum route limit reached.',SCAN_TIMEOUT:'Total scan time budget was exhausted.',USER_CANCELLED:'The scan was cancelled.',MAX_DEPTH_REACHED:'Maximum discovery depth was reached.',DISCOVERY_EXHAUSTED:'All eligible discovered routes were processed.',AUTHENTICATION_INCOMPLETE:'Authentication did not reach an authorized application page.',AUTH_REQUIRED:'Authentication is required before application coverage can be evaluated.',SESSION_EXPIRED:'The authenticated session expired.',ACCESS_RESTRICTED:'The target restricted browser access; application coverage is limited.',NAVIGATION_BLOCKED:'Navigation was blocked by policy.'};
   return `${reasons[coverage.termination_reason] || coverage.termination_reason || 'Scan finished.'} ${validated} of ${discovered} discovered routes were validated. ${notTested} routes were not tested.`;
 }
 
@@ -576,7 +801,8 @@ function renderReport(report) {
   Object.values(tablePagination).forEach((state) => { state.page = 0; state.key = ''; });
   try { byId('result-title').textContent = new URL(report.target).hostname; }
   catch (_) { byId('result-title').textContent = 'Portal health'; }
-  const duration = report.summary.duration_ms > 1000 ? `${(report.summary.duration_ms / 1000).toFixed(1)}s` : `${report.summary.duration_ms}ms`;
+  const scanDuration = report.summary.total_scan_duration_ms ?? report.scan_timing?.total_scan_ms ?? report.summary.duration_ms;
+  const duration = scanDuration > 1000 ? `${(scanDuration / 1000).toFixed(1)}s` : `${scanDuration}ms`;
   const notTested = report.summary.routes_not_tested ?? report.summary.not_tested ?? 0;
   const summaryMetrics = [
     ['Discovered routes', report.summary.routes_discovered, '', 'discovered'], ['Validated routes', report.summary.routes_validated, '', 'validated'], ['Healthy', report.summary.healthy_routes, 'good', 'healthy'], ['Passed with warnings', report.summary.routes_with_warnings, report.summary.routes_with_warnings ? 'warn' : '', 'warnings'], ['Failed', report.summary.failed_pages, report.summary.failed_pages ? 'bad' : 'good', 'failed'], ['Auth issues', report.summary.auth_issues, report.summary.auth_issues ? 'auth' : '', 'auth'], ['Not tested', notTested, notTested ? 'warn' : 'good', 'not-tested'], ['Unique APIs observed', report.summary.unique_apis || 0, '', 'apis'], ['API failures', report.summary.api_failures, report.summary.api_failures ? 'bad' : 'good', 'api-failures'], ['Resources observed', report.summary.unique_resources || 0, '', 'resources'], ['Resource failures', report.summary.resource_failures, report.summary.resource_failures ? 'warn' : 'good', 'resource-failures'], ['Console issues', report.summary.console_failures || 0, report.summary.console_failures ? 'warn' : 'good', 'console'], ['Slow routes', report.summary.slow_pages, report.summary.slow_pages ? 'warn' : 'good', 'slow'], ['Read-only blocks', report.summary.read_only_blocks, report.summary.read_only_blocks ? 'warn' : 'good', 'read-only'], ['Security recommendations', report.summary.security_recommendations || 0, report.summary.security_recommendations ? 'warn' : 'good', 'security'], ['Scan duration', duration, '', 'validated'],
@@ -584,7 +810,9 @@ function renderReport(report) {
   byId('summary').innerHTML = summaryMetrics.map(([label, value, kind, action]) => `<button type="button" class="metric ${kind}" data-summary-action="${action}" aria-label="Show ${escapeHtml(label)} evidence"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></button>`).join('');
   byId('summary').querySelectorAll('[data-summary-action]').forEach((button) => button.addEventListener('click', () => activateSummary(button.dataset.summaryAction, button.querySelector('strong').textContent, button)));
   const coverage = report.coverage || {};
-  byId('coverage').innerHTML = `<strong>${escapeHtml(coverage.scan_completeness || 'UNKNOWN')} SCAN</strong><span>${escapeHtml(terminationMessage(coverage))}</span>`;
+  const coverageStatus = coverage.coverage_status || coverage.scan_completeness || 'UNKNOWN';
+  const executionStatus = coverage.execution_status || 'FINISHED';
+  byId('coverage').innerHTML = `<strong>Coverage: ${escapeHtml(coverageStatus)}</strong><span>Execution: ${escapeHtml(executionStatus)}. ${escapeHtml(terminationMessage(coverage))}</span>`;
   byId('scan-diagnostics-content').innerHTML = `${detailSection('Effective scan configuration', report.scan_configuration || report.scan_config || {})}${detailSection('Scan timing breakdown', report.scan_timing || report.scan_timings || {})}`;
   byId('raw-report').textContent = JSON.stringify(report, null, 2);
   activeDrilldown = 'all';
@@ -592,7 +820,7 @@ function renderReport(report) {
   byId('api-failed-only').checked = false;
   // A filter left over from a previous scan must not silently hide new POST
   // observations. Column/density preferences remain separate and persistent.
-  ['result-filter','navigation-filter','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','resource-type-filter','resource-route-filter','resource-status-filter'].forEach((id) => { if (byId(id)) byId(id).value = 'all'; });
+  ['result-filter','navigation-filter','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','resource-type-filter','resource-route-filter','resource-status-filter'].forEach((id) => { if (byId(id)) byId(id).value = 'all'; });
   ['result-search','api-search','resource-search'].forEach((id) => { byId(id).value = ''; });
   ['resource-failed-only','resource-large-only'].forEach((id) => { byId(id).checked = false; });
   updateApiMethodFilter(report.api_inventory || []);
@@ -602,6 +830,7 @@ function renderReport(report) {
   renderResourceSummary();
   renderSecurityRecommendations();
   results.hidden = false;
+  panelSizes['route-results'].apply();
   scrollAndFocus(results);
 }
 
@@ -685,11 +914,28 @@ if (!byId('api-route-filter')) {
 
 const apiPolicyHeader = document.createElement('th');
 apiPolicyHeader.textContent = 'Policy';
+const apiRoleHeader = document.createElement('th');
+apiRoleHeader.textContent = 'Traffic role';
+document.querySelector('#api-table-wrap thead tr').append(apiRoleHeader);
 document.querySelector('#api-table-wrap thead tr').append(apiPolicyHeader);
+const apiRoleLabel = document.createElement('label');
+apiRoleLabel.className = 'field';
+apiRoleLabel.innerHTML = '<span>Traffic role</span><select id="api-role-filter"><option value="all">All traffic</option></select>';
+document.querySelector('.api-tools').append(apiRoleLabel);
+const postSummary = document.createElement('dl');
+postSummary.className = 'api-post-summary';
+postSummary.setAttribute('aria-label', 'Observed POST request counts across the complete scan');
+postSummary.innerHTML = [['observed_calls','Observed POST'],['approved_read_only_calls','Approved read-only POST'],['executed_approved_calls','Executed approved POST']].map(([key,label]) => `<div><dt>${label}</dt><dd id="post-summary-${key}">Not recorded</dd></div>`).join('');
+document.querySelector('.api-tools').before(postSummary);
 byId('api-policy-filter').insertAdjacentHTML('beforeend', '<option value="approved-post">Approved read-only POST</option><option value="target-failures">Target failures</option>');
 setupTableControls('route');
 setupTableControls('api');
 setupTableControls('resource');
+initializeResizablePanel('route-results', 280);
+initializeResizablePanel('route-inspector', 260);
+byId('route-results-fullscreen').addEventListener('click', toggleRouteResultsFullscreen);
+byId('route-results-close').addEventListener('click', closeRouteResultsFullscreen);
+byId('route-results-dialog').addEventListener('cancel', (event) => { event.preventDefault(); closeRouteResultsFullscreen(); });
 byId('add-read-post').addEventListener('click', addReadPostOperation);
 byId('resource-type-filter').addEventListener('change', renderResourceDetails);
 byId('resource-large-only').addEventListener('change', renderResourceDetails);
@@ -699,8 +945,24 @@ authMode.addEventListener('change', renderAuthFields);
 byId('result-search').addEventListener('input', renderRows);
 byId('result-filter').addEventListener('change', renderRows);
 byId('navigation-filter').addEventListener('change', renderRows);
-['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-failed-only'].forEach((id) => byId(id)?.addEventListener(id === 'api-search' ? 'input' : 'change', () => { if (id === 'api-failed-only') apiFailureOnly = false; renderApiInventory(); }));
+['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','api-failed-only'].forEach((id) => byId(id)?.addEventListener(id === 'api-search' ? 'input' : 'change', () => { if (id === 'api-failed-only') apiFailureOnly = false; renderApiInventory(); }));
 byId('evidence-close').addEventListener('click', () => { byId('evidence-panel').hidden = true; });
+byId('route-inspector-close').addEventListener('click', () => closeRouteInspector());
+byId('route-inspector-fullscreen').addEventListener('click', toggleInspectorFullscreen);
+byId('route-inspector-dialog').addEventListener('cancel', (event) => { event.preventDefault(); closeRouteInspector(); });
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !byId('route-inspector').hidden) { event.preventDefault(); closeRouteInspector(); }
+});
+byId('route-inspector-copy').addEventListener('click', async () => {
+  if (!inspectedRoute) return;
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(inspectedRoute, null, 2));
+    notify('Sanitized route diagnostics copied.');
+  } catch (_) { notify('Clipboard unavailable. Download sanitized diagnostics instead.', true); }
+});
+byId('route-inspector-download').addEventListener('click', () => {
+  if (inspectedRoute) downloadDiagnostics(inspectedRoute, 'portal-route-diagnostics.json');
+});
 document.querySelectorAll('[data-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.sort; routeSort = {key, direction:routeSort.key === key ? -routeSort.direction : 1}; renderRows(); }));
 document.querySelectorAll('[data-api-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.apiSort; apiSort = {key, direction:apiSort.key === key ? -apiSort.direction : 1}; renderApiInventory(); }));
 document.querySelectorAll('[data-resource-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.resourceSort; resourceSort = {key, direction:resourceSort.key === key ? -resourceSort.direction : 1}; renderResourceDetails(); }));
@@ -720,6 +982,7 @@ form.addEventListener('submit', async (event) => {
   try {
     payload = {target:byId('target').value.trim(),max_pages:Number(byId('pages').value),max_depth:Number(byId('depth').value),max_redirects:Number(byId('redirects').value),timeout_ms:Number(byId('timeout').value),total_timeout_ms:Number(byId('total-timeout').value),check_links:byId('links').checked,check_console:byId('console').checked,check_resources:byId('resources').checked,check_performance:byId('performance').checked,check_security_headers:byId('headers').checked,allow_subdomains:byId('subdomains').checked,allow_private_networks:byId('private-network').checked,portal_hosts:splitList(byId('portal-hosts').value),resource_hosts:splitList(byId('resource-hosts').value),credential_hosts:splitList(byId('credential-hosts').value),query_parameter_policy:byId('query-policy').value,allowed_query_parameters:splitList(byId('query-parameters').value),slow_page_threshold_ms:Number(byId('slow-threshold').value),render_settle_ms:Number(byId('render-settle').value),max_navigation_actions:Number(byId('navigation-actions').value),max_discovery_scrolls:Number(byId('discovery-scrolls').value),authentication:authenticationPayload(),allow_mutations:false};
     payload.approved_read_post_operations = approvedReadPostOperations();
+    Object.assign(payload, phaseConfiguration());
     payload.large_resource_threshold_bytes = Number(byId('large-resource-threshold').value) * 1024;
     payload.large_image_threshold_bytes = Number(byId('large-image-threshold').value) * 1024;
     payload.large_js_threshold_bytes = Number(byId('large-js-threshold').value) * 1024;
@@ -736,19 +999,15 @@ form.addEventListener('submit', async (event) => {
     activeScanId = created.scan_id;
     const report = await pollScan(activeScanId);
     renderReport(report);
-    notify(`Validation complete · ${report.pages} route${report.pages === 1 ? '' : 's'} checked`);
+    const coverage = report.coverage || {};
+    notify(`Execution finished · Coverage: ${coverage.coverage_status || coverage.scan_completeness || 'UNKNOWN'} · ${report.summary.routes_validated ?? report.pages} routes validated`);
   } catch (error) { notify(error.message || 'Validation failed', true); }
   finally { stopProgress(); runButton.disabled = false; runButton.querySelector('span').textContent = 'Run validation'; }
 });
 
 byId('download-button').addEventListener('click', () => {
   if (!lastReport) return;
-  const blob = new Blob([JSON.stringify(lastReport, null, 2)], {type:'application/json'});
-  const link = document.createElement('a');
-  link.href = URL.createObjectURL(blob);
-  link.download = `portal-validation-${lastReport.run_id}.json`;
-  link.click();
-  URL.revokeObjectURL(link.href);
+  downloadDiagnostics(lastReport, `portal-validation-${lastReport.run_id}.json`);
 });
 
 setupScrollSync();
@@ -756,5 +1015,9 @@ requestJson('/api/auth-profiles', {}, 'Authentication profile request').then((da
   profileNames = data.profiles || [];
   refreshProfiles = new Set(data.refresh_enabled_profiles || []);
   profileMessage = data.message || '';
+  if (Number.isInteger(data.maximum_concurrent_scans) && data.maximum_concurrent_scans > 0) {
+    byId('concurrency-limit').max = data.maximum_concurrent_scans;
+    byId('concurrency-limit').placeholder = `Deployment default (${data.maximum_concurrent_scans})`;
+  }
   renderAuthFields();
 }).catch(() => renderAuthFields());

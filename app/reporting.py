@@ -6,7 +6,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app.navigation import classify_navigation_error
-from app.network import public_policy_classification, safe_api_identity, summarize_route_api_coverage
+from app.network import (
+    public_policy_classification,
+    safe_api_identity,
+    summarize_post_observation,
+    summarize_route_api_coverage,
+)
 from app.security import sanitize_text, sanitize_url
 
 
@@ -31,6 +36,7 @@ FAILURE_OUTCOMES = frozenset({
     "FAIL",
 })
 API_WARNING_TYPES = frozenset({
+    "API_REQUEST_CANCELED", "API_OBSERVATION_INCOMPLETE",
     "API_AUTHENTICATION_FAILURE", "API_AUTHORIZATION_FAILURE", "API_BAD_REQUEST",
     "API_CLIENT_ERROR", "API_CONFLICT", "API_CORS_FAILURE", "API_DNS_FAILURE",
     "API_NETWORK_FAILURE", "API_NOT_FOUND", "API_RATE_LIMITED", "API_REQUEST_FAILED",
@@ -527,7 +533,10 @@ def refresh_route_api_health(
     )
     failed_events = [
         event for event in target_events
-        if event.get("error") or (
+        if (
+            event.get("error") and not event.get("request_canceled")
+            and event.get("lifecycle_status") != "INCOMPLETE"
+        ) or (
             isinstance(event.get("status"), int) and event["status"] >= 400
         )
     ]
@@ -588,6 +597,7 @@ def aggregate_report(
     routes_remaining: int = 0,
     routes_skipped: int = 0,
     termination_reason: str = "DISCOVERY_EXHAUSTED",
+    api_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     load_counts = Counter(result["page_load_status"] for result in results)
     classification_counts = Counter(result["classification"] for result in results)
@@ -611,6 +621,72 @@ def aggregate_report(
     }.get(termination_reason, "NOT_TESTED")
     not_tested_reason_counts = (
         {not_tested_reason: not_tested_count} if not_tested_count else {}
+    )
+    # Finishing the queue is an execution fact, not proof that protected portal
+    # content was reached or that route discovery had comprehensive visibility.
+    coverage_reasons: Counter[str] = Counter()
+    observed_api_requests: dict[object, dict[str, Any]] = {}
+    for result in results:
+        classification = result["classification"]
+        if classification in AUTH_OUTCOMES:
+            coverage_reasons[
+                "ACCESS_RESTRICTED" if classification == "ACCESS_RESTRICTED"
+                else "AUTHENTICATION_INCOMPLETE"
+            ] += 1
+        elif classification == "CHALLENGE_REQUIRED":
+            coverage_reasons["CHALLENGE_REQUIRED"] += 1
+        elif classification in LIMITED_OUTCOMES:
+            coverage_reasons["DISCOVERY_LIMITATION"] += 1
+        elif result["page_load_status"] != "LOADED" or classification in {
+            "TLS_ERROR", "DNS_ERROR", "NETWORK_ERROR", "HTTP_ERROR", "TIMEOUT", "NAVIGATION_ERROR",
+        }:
+            coverage_reasons["NAVIGATION_FAILED"] += 1
+        elif classification == "PAGE_RENDER_ERROR":
+            coverage_reasons["APPLICATION_NOT_READY"] += 1
+        limitations = int(result.get("discovery_limitations", 0))
+        if limitations:
+            coverage_reasons["DISCOVERY_LIMITATION"] += limitations
+        for event in result.get("api_requests", []):
+            request_key = event.get("request_id") or id(event)
+            previous = observed_api_requests.get(request_key)
+            if previous is None or previous.get("lifecycle_status") not in {
+                "COMPLETED", "FAILED", "BLOCKED", "CANCELED",
+            }:
+                observed_api_requests[request_key] = event
+    # The continuous observer is authoritative for late and discovery traffic
+    # that may not belong to a completed route snapshot.
+    for event in api_events or []:
+        observed_api_requests[event.get("request_id") or id(event)] = event
+    incomplete_api_requests = sum(
+        event.get("lifecycle_status") == "INCOMPLETE"
+        or event.get("observation_outcome") == "INCOMPLETE"
+        for event in observed_api_requests.values()
+    )
+    if incomplete_api_requests:
+        coverage_reasons["API_OBSERVATION_INCOMPLETE"] = incomplete_api_requests
+    application_routes_validated = sum(
+        result["page_load_status"] == "LOADED"
+        and result["classification"] not in AUTH_OUTCOMES | LIMITED_OUTCOMES
+        and result["classification"] not in {
+            "TLS_ERROR", "DNS_ERROR", "NETWORK_ERROR", "HTTP_ERROR", "TIMEOUT",
+            "NAVIGATION_ERROR", "PAGE_RENDER_ERROR",
+        }
+        for result in results
+    )
+    if not_tested_count:
+        coverage_reasons["ROUTES_NOT_TESTED"] = not_tested_count
+    if skipped_count:
+        coverage_reasons["ROUTES_SKIPPED"] = skipped_count
+    if termination_reason != "DISCOVERY_EXHAUSTED":
+        coverage_reasons[termination_reason] += 1
+    if not application_routes_validated:
+        coverage_reasons["NO_APPLICATION_ROUTES"] = 1
+    coverage_complete = not coverage_reasons
+    execution_status = (
+        "CANCELLED" if termination_reason == "USER_CANCELLED"
+        else "TIMED_OUT" if termination_reason == "SCAN_TIMEOUT"
+        else "FAILED" if termination_reason in {"ERROR", "SCAN_FAILED", "INTERNAL_ERROR"}
+        else "COMPLETE"
     )
     summary = {
         "total_pages": len(results),
@@ -656,6 +732,7 @@ def aggregate_report(
         "routes_with_warnings": classification_counts["PASS_WITH_WARNINGS"],
         "auth_issues": sum(classification_counts[item] for item in AUTH_OUTCOMES),
         "api_failures": sum(int(result.get("api_failures", 0)) for result in results),
+        "post_summary": summarize_post_observation(list(observed_api_requests.values())),
         "resource_failures": sum(int(result.get("resource_failure_count", 0)) for result in results),
         "console_failures": sum(
             len(result.get("console_errors", [])) + len(result.get("page_errors", []))
@@ -668,18 +745,29 @@ def aggregate_report(
         "discovery_limitations": sum(int(result.get("discovery_limitations", 0)) for result in results),
         "classifications": dict(classification_counts),
         "termination_reason": termination_reason,
+        "execution_status": execution_status,
+        "execution_complete": execution_status == "COMPLETE",
+        "coverage_status": (
+            "COMPLETE" if coverage_complete
+            else "NONE" if not application_routes_validated else "PARTIAL"
+        ),
+        "coverage_complete": coverage_complete,
+        "coverage_reasons": [
+            {"code": code, "count": count} for code, count in sorted(coverage_reasons.items())
+        ],
+        "application_routes_validated": application_routes_validated,
         "scan_completeness": (
             "CANCELLED" if termination_reason == "USER_CANCELLED"
             else "PARTIAL" if termination_reason == "SCAN_TIMEOUT"
-            else "COMPLETE" if termination_reason == "DISCOVERY_EXHAUSTED" and not_tested_count == 0
+            else "COMPLETE" if coverage_complete
             else "FAILED" if not results
             else "PARTIAL"
         ),
         "discovery_status": (
-            "COMPLETE" if termination_reason == "DISCOVERY_EXHAUSTED" else "PARTIAL"
+            "COMPLETE" if coverage_complete else "PARTIAL"
         ),
         "validation_status": (
-            "COMPLETE" if not_tested_count == 0 else "PARTIAL"
+            "COMPLETE" if coverage_complete else "PARTIAL"
         ),
     }
     invariants = {
@@ -751,6 +839,16 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 "calls": 0,
                 "allowed_calls": 0,
                 "blocked_calls": 0,
+                "observed_calls": 0,
+                "sent_calls": 0,
+                "responded_calls": 0,
+                "completed_calls": 0,
+                "approved_read_only_calls": 0,
+                "executed_approved_calls": 0,
+                "failed_calls": 0,
+                "canceled_calls": 0,
+                "incomplete_calls": 0,
+                "business_success_calls": 0,
                 "status_2xx": 0,
                 "status_3xx": 0,
                 "status_4xx": 0,
@@ -774,8 +872,22 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 "block_reasons": Counter(),
                 "importance": Counter(),
                 "traffic_categories": Counter(),
+                "traffic_roles": Counter(),
             })
             item["calls"] += 1
+            item["observed_calls"] += 1
+            post_summary = summarize_post_observation([event])
+            item["approved_read_only_calls"] += post_summary["approved_read_only_calls"]
+            item["executed_approved_calls"] += post_summary["executed_approved_calls"]
+            role = str(event.get("traffic_role") or event.get("traffic_category") or "UNCLASSIFIED_API")
+            item["traffic_roles"][role] += 1
+            canceled = bool(event.get("request_canceled"))
+            item["sent_calls"] += bool(event.get("request_dispatched"))
+            item["responded_calls"] += bool(event.get("response_seen", isinstance(event.get("status"), int)))
+            item["completed_calls"] += bool(event.get("response_completed", isinstance(event.get("status"), int) and not event.get("error")))
+            item["canceled_calls"] += canceled
+            item["failed_calls"] += bool(event.get("request_failed", bool(event.get("error")))) and not canceled and not event.get("blocked_by_validator")
+            item["incomplete_calls"] += event.get("lifecycle_status") == "INCOMPLETE" or event.get("lifecycle") == "PENDING_AT_SCAN_END"
             phase = str(event.get("phase") or "VALIDATION").upper()
             phase_field = {
                 "DISCOVERY": "discovery_phase_count",
@@ -807,20 +919,27 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                     event.get("block_reason") or "VALIDATOR_POLICY_BLOCK"
                 )] += 1
                 continue
-            item["allowed_calls"] += 1
+            item["allowed_calls"] += (
+                event.get("policy_decision") == "ALLOW" if "policy_decision" in event
+                else event.get("allowed_by_policy", True)
+            )
             status = event.get("status")
             if isinstance(status, int) and 200 <= status < 600:
                 item[f"status_{status // 100}xx"] += 1
-            if event.get("error") and not isinstance(status, int):
+            if canceled:
+                item["failure_classifications"]["REQUEST_CANCELED"] += 1
+            elif event.get("error") and not isinstance(status, int):
                 item["network_failures"] += 1
             elif event.get("error"):
                 item["response_body_failures"] += 1
-            classification = (
+            classification = "UNKNOWN" if canceled else (
                 "API_RESPONSE_BODY_FAILURE" if event.get("error") and isinstance(status, int)
                 else classify_api_status(status, event.get("error"))
             )
             if classification not in {"SUCCESS", "REDIRECT", "UNKNOWN"}:
                 item["failure_classifications"][classification] += 1
+            if role == "APPLICATION_API" and isinstance(status, int) and 200 <= status < 400 and not event.get("error") and event.get("response_completed", True):
+                item["business_success_calls"] += 1
             duration = event.get("duration_ms")
             if (
                 isinstance(status, int) and 200 <= status < 600
@@ -839,6 +958,7 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
         block_reasons = dict(item.pop("block_reasons"))
         importance = dict(item.pop("importance"))
         traffic_categories = dict(item.pop("traffic_categories"))
+        traffic_roles = dict(item.pop("traffic_roles"))
         target_failures = item["status_4xx"] + item["status_5xx"] + item["network_failures"] + item["response_body_failures"]
         status_counts = {
             "2xx": item["status_2xx"],
@@ -853,6 +973,8 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             "BLOCKED_BY_VALIDATOR"
             if item["blocked_calls"] and not item["allowed_calls"] else
             "WARNING" if item["blocked_calls"] else
+            "INCOMPLETE" if item["incomplete_calls"] or item["canceled_calls"] else
+            "NOT_EXECUTED" if not item["responded_calls"] else
             "HEALTHY"
         )
         item.update({
@@ -876,6 +998,8 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             "block_reasons": block_reasons,
             "importance_counts": importance,
             "traffic_categories": traffic_categories,
+            "traffic_roles": traffic_roles,
+            "traffic_role": max(traffic_roles, key=traffic_roles.get, default="UNCLASSIFIED_API"),
             "traffic_category": max(
                 traffic_categories,
                 key=traffic_categories.get,
@@ -887,6 +1011,7 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             "health": (
                 "FAILED" if item["status_5xx"] or item["network_failures"] else
                 "DEGRADED" if item["status_4xx"] or item["response_body_failures"] else
+                "INCOMPLETE" if item["incomplete_calls"] or item["canceled_calls"] else
                 "NOT_EXECUTED" if not item["status_2xx"] and not item["status_3xx"] else
                 "HEALTHY"
             ),

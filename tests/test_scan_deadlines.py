@@ -71,7 +71,12 @@ async def test_route_maximum_bounds_a_persistent_visible_loader(production_spa, 
         self.wfile.write(body)
 
     monkeypatch.setattr(handler, "do_GET", fixture_get)
-    report = await execute_scan(scan_request(origin, max_pages=2))
+    # Allow the initial document to be discovered on a contended CI host;
+    # the busy route must still stop at the explicitly configured deadline.
+    route_budget_ms = 5000
+    report = await execute_scan(scan_request(
+        origin, max_pages=2, timeout_ms=route_budget_ms, total_timeout_ms=30000,
+    ))
     busy = next(item for item in report["results"] if item["requested_url"].endswith("#/busy"))
     if busy["render_health"] is None:
         # The enclosing absolute route deadline can win the same-time race
@@ -80,9 +85,9 @@ async def test_route_maximum_bounds_a_persistent_visible_loader(production_spa, 
     else:
         assert busy["render_health"]["settle_reason"] == "BOUNDED_TIMEOUT"
     assert busy["classification"] in {"PASS_WITH_WARNINGS", "TIMEOUT"}
-    assert 800 <= busy["total_validation_ms"] < 1800
+    assert route_budget_ms - 200 <= busy["total_validation_ms"] < route_budget_ms + 800
     assert report["summary"]["routes_validated"] == 2
-    assert report["scan_configuration"]["timeout_ms"] == 1000
+    assert report["scan_configuration"]["timeout_ms"] == route_budget_ms
 
 
 @pytest.mark.asyncio
@@ -179,7 +184,12 @@ async def test_fast_spa_uses_adaptive_observation_not_the_route_timeout(producti
     ))
     route = next(item for item in report["results"] if item["requested_url"].endswith("#/route-1"))
     assert route["navigation_type"] != "DOCUMENT_NAVIGATION"
-    assert route["total_validation_ms"] < 2500
+    # Assert adaptive readiness directly. Full validation also includes DOM
+    # diagnostics/security instrumentation and host scheduling; a 2.5s total
+    # wall-clock limit falsely failed when readiness actually completed in 603ms.
+    assert route["render_health"]["settle_reason"] == "DOM_AND_NETWORK_QUIET"
+    assert route["render_health"]["settle_elapsed_ms"] < 2500
+    assert route["total_validation_ms"] < report["scan_configuration"]["timeout_ms"] / 2
     assert route["application_load_ms"] < 1200
     assert not route["slow"]
     assert not any(reason["code"] == "SLOW_ROUTE" for reason in route["warning_reasons"])
@@ -203,12 +213,18 @@ async def test_optional_resource_diagnostics_cannot_extend_route_deadline(produc
         await asyncio.sleep(20)
 
     monkeypatch.setattr(main, "enrich_resource_timings", slow_diagnostic)
-    report = await execute_scan(scan_request(origin, max_pages=1))
+    # Reaching optional diagnostics requires a successfully loaded document.
+    # Give fixture setup room without relaxing the deadline under test: the
+    # twenty-second diagnostic must be cancelled by this five-second budget.
+    route_budget_ms = 5000
+    report = await execute_scan(scan_request(
+        origin, max_pages=1, timeout_ms=route_budget_ms, total_timeout_ms=30000,
+    ))
     route = report["results"][0]
     assert diagnostic_started
     assert route["page_load_status"] == "LOADED"
     assert route["passed"] is True
-    assert route["total_validation_ms"] < 1800
+    assert route_budget_ms - 200 <= route["total_validation_ms"] < route_budget_ms + 800
 
 
 @pytest.mark.asyncio

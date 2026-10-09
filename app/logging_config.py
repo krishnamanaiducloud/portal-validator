@@ -15,11 +15,20 @@ LOGGER_NAME = "portal_validator"
 
 class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = sanitize_text(record.msg)
-        if isinstance(record.args, dict):
-            record.args = sanitize_data(record.args)
-        elif isinstance(record.args, tuple):
-            record.args = tuple(sanitize_data(item) for item in record.args)
+        try:
+            payload = json.loads(record.getMessage())
+        except (json.JSONDecodeError, RecursionError):
+            record.msg = sanitize_text(record.msg)
+            if isinstance(record.args, dict):
+                record.args = sanitize_data(record.args)
+            elif isinstance(record.args, tuple):
+                record.args = tuple(sanitize_data(item) for item in record.args)
+        else:
+            # Redact values, not serialized JSON syntax. Regex redaction of an
+            # OAuth URL could consume a closing quote; whole-message truncation
+            # could also invalidate JSON. Logger and handler filters may both run.
+            record.msg = json.dumps(sanitize_data(payload), sort_keys=True, separators=(",", ":"))
+            record.args = ()
         if record.exc_info:
             record.exc_text = "[REDACTED_EXCEPTION]"
         return True

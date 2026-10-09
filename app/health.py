@@ -80,6 +80,28 @@ async def capture_render_health(page) -> dict[str, Any]:
     }
 
 
+async def document_navigation_timing(page) -> tuple[int, float, float] | None:
+    """Map the local browser's document timing onto the validator's clock.
+
+    Chromium and Python run in the same container and share the Unix epoch.
+    Using performance.timeOrigin avoids treating evaluate()/IPC return latency
+    as part of the document's clock offset and clipping away policy pauses.
+    """
+    timing = await page.evaluate("""() => {
+      const entry = performance.getEntriesByType('navigation')[0];
+      return entry && entry.domContentLoadedEventEnd > 0
+        ? {duration: entry.domContentLoadedEventEnd - entry.startTime,
+           epochStart: performance.timeOrigin + entry.startTime}
+        : null;
+    }""")
+    if not timing:
+        return None
+    duration_ms = max(0, round(timing["duration"]))
+    epoch_to_monotonic = time.perf_counter() - time.time()
+    started = timing["epochStart"] / 1000 + epoch_to_monotonic
+    return duration_ms, started, started + duration_ms / 1000
+
+
 async def wait_for_render_settle(
     page,
     *,
@@ -88,6 +110,7 @@ async def wait_for_render_settle(
     network_activity: Callable[[], dict[str, int | float]] | None = None,
     minimum_observation_ms: int = 500,
     network_quiet_ms: int = 300,
+    readiness_selector: str | None = None,
 ) -> dict[str, Any]:
     """Wait for bounded DOM stability and route-scoped network quiet.
 
@@ -106,6 +129,7 @@ async def wait_for_render_settle(
         "ready_state": "unknown", "title": "", "text_length": 0,
         "visible_elements": 0, "busy_indicators": 0,
         "challenge_indicators": 0, "alert_text": "",
+        "configured_readiness_met": not bool(readiness_selector),
     }
     initial_activity = network_activity() if network_activity is not None else {}
     last_generation = int(initial_activity.get("generation", 0))
@@ -161,6 +185,15 @@ async def wait_for_render_settle(
         capture_started = time.perf_counter()
         try:
             latest = await asyncio.wait_for(capture_render_health(page), timeout=remaining)
+            # A fresh DOM snapshot does not carry the configured condition. If
+            # its visibility check exhausts the budget, readiness is unproven,
+            # not implicitly successful or inherited from an earlier sample.
+            latest["configured_readiness_met"] = not bool(readiness_selector)
+            if readiness_selector:
+                latest["configured_readiness_met"] = await asyncio.wait_for(
+                    page.locator(readiness_selector).first.is_visible(),
+                    timeout=max(0.001, deadline - time.perf_counter()),
+                )
         except TimeoutError:
             capture_intervals.append((capture_started, time.perf_counter()))
             activity = network_activity() if network_activity is not None else {}
@@ -177,12 +210,14 @@ async def wait_for_render_settle(
             latest["busy_indicators"],
             latest["challenge_indicators"],
             latest["title"],
+            latest.get("configured_readiness_met", True),
         )
         activity = network_activity() if network_activity is not None else {}
         generation = int(activity.get("generation", 0))
         pending = int(activity.get("pending", 0))
         if first_render_ready is None and (
             latest["ready_state"] in {"interactive", "complete"}
+            and latest.get("configured_readiness_met", True)
             and not latest["busy_indicators"]
             and (latest["text_length"] >= 20 or latest["visible_elements"] >= 3)
         ):
@@ -190,7 +225,7 @@ async def wait_for_render_settle(
         if pending:
             api_active_until = capture_started
             application_active_until = max(application_active_until, capture_started)
-        if latest["busy_indicators"] or latest["ready_state"] == "loading":
+        if latest["busy_indicators"] or latest["ready_state"] == "loading" or not latest.get("configured_readiness_met", True):
             dom_active_until = capture_started
             application_active_until = max(application_active_until, capture_started)
         if generation != last_generation:
@@ -201,7 +236,15 @@ async def wait_for_render_settle(
             application_active_until = max(
                 application_active_until, min(now, max(started, last_activity))
             )
-        if settle_ms == 0:
+        # Disabling DOM stability confirmation does not disable the separately
+        # configured network/minimum observation windows. In particular, an
+        # already requested popup document must not disappear before discovery.
+        if (
+            settle_ms == 0 and latest.get("configured_readiness_met", True)
+            and pending == 0
+            and (now - started) * 1000 >= minimum_observation_ms
+            and (now - network_quiet_since) * 1000 >= network_quiet_ms
+        ):
             return finish("SETTLE_DISABLED", now, pending, generation)
         if signature == previous:
             if stable_since is None:
@@ -214,6 +257,7 @@ async def wait_for_render_settle(
             )
             content_ready = (
                 latest["ready_state"] in {"interactive", "complete"}
+                and latest.get("configured_readiness_met", True)
                 and not latest["busy_indicators"]
                 and (latest["text_length"] >= 20 or latest["visible_elements"] >= 3)
             )
@@ -236,21 +280,28 @@ def route_performance_timing(
     render_health: dict[str, Any] | None,
     total_validation_ms: int,
     render_start_ms: int | None = None,
+    navigation_policy_ms: int = 0,
 ) -> dict[str, int | None | str]:
     """Split application-readiness evidence from deliberate observation waits.
 
     For same-document routes navigation_ms measures semantic activation/URL
     transition, not a new document handshake. application_load_ms includes that
     activation plus observed render/network work, but excludes the final
-    stability confirmation and discovery/reporting overhead. This is a passive
-    readiness estimate, not Core Web Vitals or a user-interaction benchmark.
+    stability confirmation and discovery/reporting overhead. Explicitly measured
+    navigation-policy pauses are validator work, not target navigation time.
+    This is a passive readiness estimate, not Core Web Vitals or a
+    user-interaction benchmark.
     """
-    navigation_ms = max(0, int(navigation_ms))
-    total_validation_ms = max(navigation_ms, int(total_validation_ms))
+    raw_navigation_ms = max(0, int(navigation_ms))
+    validator_navigation_ms = min(raw_navigation_ms, max(0, int(navigation_policy_ms)))
+    navigation_ms = raw_navigation_ms - validator_navigation_ms
+    total_validation_ms = max(raw_navigation_ms, int(total_validation_ms))
     snapshot = render_health or {}
-    render_offset = max(navigation_ms, int(render_start_ms or navigation_ms))
+    # Readiness timestamps remain relative to the real route-start clock. A
+    # policy pause must not shift them or become available render-settle time.
+    render_offset = max(raw_navigation_ms, int(render_start_ms or raw_navigation_ms))
     application_settle_ms = min(
-        max(0, total_validation_ms - navigation_ms),
+        max(0, total_validation_ms - raw_navigation_ms),
         max(0, int(snapshot.get("settle_application_ms") or 0)),
     )
     observation_ms = max(0, int(snapshot.get("settle_validator_observation_ms") or 0))
@@ -259,6 +310,8 @@ def route_performance_timing(
     return {
         "application_navigation_ms": navigation_ms,
         "navigation_ms": navigation_ms,
+        "raw_navigation_ms": raw_navigation_ms,
+        "validator_navigation_ms": validator_navigation_ms,
         "render_ready_ms": render_offset + max(0, int(ready_ms)) if ready_ms is not None else None,
         "dom_ready_ms": render_offset + max(0, int(ready_ms)) if ready_ms is not None else None,
         "application_settle_ms": application_settle_ms,
@@ -353,21 +406,21 @@ def api_health_findings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "target_failure": True,
             "validator_block": False,
         }
-        if event.get("error"):
-            upper_error = str(event["error"]).upper()
-            failure_type = (
-                "API_TLS_FAILURE" if "CERT" in upper_error or "TLS" in upper_error else
-                "API_DNS_FAILURE" if "NAME_NOT_RESOLVED" in upper_error else
-                "API_TIMEOUT" if "TIMEOUT" in upper_error else
-                "API_NETWORK_FAILURE"
-            )
+        if event.get("request_canceled"):
             findings.append(finding(
-                failure_type,
-                "WARNING",
-                "An observed application API request failed.",
-                **detail,
+                "API_REQUEST_CANCELED", "WARNING",
+                "The browser canceled an API request; no server or network failure is inferred.",
+                **{**detail, "target_failure": False},
             ))
-        elif isinstance(status, int) and status >= 500:
+        elif event.get("lifecycle_status") == "INCOMPLETE":
+            findings.append(finding(
+                "API_OBSERVATION_INCOMPLETE", "WARNING",
+                "API observation ended before a complete response was available.",
+                **{**detail, "target_failure": False},
+            ))
+        # A known HTTP error remains target evidence even when observation of
+        # its response body is incomplete or the browser later cancels it.
+        if isinstance(status, int) and status >= 500:
             findings.append(finding(
                 "API_SERVER_ERROR" if required else "API_SERVER_ERROR_OPTIONAL",
                 "ERROR" if required else "WARNING",
@@ -393,6 +446,20 @@ def api_health_findings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 failure_type,
                 "WARNING",
                 f"An observed application API returned HTTP {status}.",
+                **detail,
+            ))
+        elif event.get("error") and not event.get("request_canceled") and event.get("lifecycle_status") != "INCOMPLETE":
+            upper_error = str(event["error"]).upper()
+            failure_type = (
+                "API_TLS_FAILURE" if "CERT" in upper_error or "TLS" in upper_error else
+                "API_DNS_FAILURE" if "NAME_NOT_RESOLVED" in upper_error else
+                "API_TIMEOUT" if "TIMEOUT" in upper_error else
+                "API_NETWORK_FAILURE"
+            )
+            findings.append(finding(
+                failure_type,
+                "WARNING",
+                "An observed application API request failed.",
                 **detail,
             ))
     return findings

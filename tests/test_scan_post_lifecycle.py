@@ -164,7 +164,7 @@ def test_body_failure_after_http_response_keeps_status_but_excludes_response_dur
     )
     observer.mark_allowed(request, "APPROVED_READ_POST")
     observer.record_response(request, 201)
-    observer.record_failure(request, "net::ERR_ABORTED")
+    observer.record_failure(request, "net::ERR_CONNECTION_RESET")
     inventory = aggregate_api_events(events)[0]
     assert event["request_failed"] is True and event["response_completed"] is False
     assert event["failure_category"] == "RESPONSE_BODY_FAILURE"
@@ -458,7 +458,7 @@ def production_spa(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("approve_post", "route_count"), [(False, 1), (True, 1), (True, 43)])
+@pytest.mark.parametrize(("approve_post", "route_count"), [(False, 1), (True, 1), (True, 51)])
 async def test_full_scan_natural_spa_post_observer_policy_network_and_report(production_spa, approve_post, route_count):
     origin, handler = production_spa
     handler.routes = route_count
@@ -605,6 +605,7 @@ async def test_actual_scan_authentication_document_post_remains_allowed_and_reda
         target=origin, allow_private_networks=True, max_pages=1, max_depth=0,
         timeout_ms=8000, render_settle_ms=500, max_navigation_actions=0,
         max_discovery_scrolls=0, check_security_headers=False,
+        authentication_hosts=["127.0.0.1"],
     ))
     auth_post = next(item for item in report["api_inventory"] if item["endpoint"] == "/idp/SSO.saml2")
     assert handler.authentication_posts == 1

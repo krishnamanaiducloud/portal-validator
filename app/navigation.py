@@ -3,25 +3,16 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlparse, urldefrag
+
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from app.security import DestinationError, normalized_host, sanitize_url
 
 
-AUTH_QUERY_KEYS = frozenset({
-    "client_id",
-    "redirect_uri",
-    "response_type",
-    "scope",
-    "samlrequest",
-    "samlresponse",
-    "relaystate",
-})
-AUTH_FORM_KEYS = frozenset({
-    "samlrequest", "samlresponse", "relaystate", "code", "id_token", "state", "error",
-})
 AUTH_PATH_MARKERS = frozenset({
-    "authorize", "authorization", "oauth", "oidc", "saml", "sso", "signin", "login", "idp",
+    "auth", "authorize", "authorization", "oauth", "oidc", "saml", "sso", "signin", "login", "idp",
 })
 
 
@@ -119,42 +110,170 @@ class NavigationTracker:
 
 def auth_protocol_signal(url: str) -> bool:
     parsed = urlparse(url)
-    keys = {key.lower() for key in parse_qs(parsed.query, keep_blank_values=True)}
-    path_tokens = {token for token in re.split(r"[^a-z0-9]+", parsed.path.lower()) if token}
-    return bool(keys & AUTH_QUERY_KEYS or path_tokens & AUTH_PATH_MARKERS)
+
+    def populated_keys(query: str) -> set[str]:
+        return {
+            key.lower() for key, values in parse_qs(query, keep_blank_values=True).items()
+            if any(value.strip() for value in values)
+        }
+
+    keys = populated_keys(parsed.query)
+    fragment_path, _, fragment_query = parsed.fragment.partition("?")
+    keys.update(populated_keys(fragment_query))
+    # OAuth implicit callbacks may carry their parameters directly in the fragment.
+    if "=" in parsed.fragment and not fragment_query:
+        keys.update(populated_keys(parsed.fragment))
+    path_tokens = {
+        token for token in re.split(r"[^a-z0-9]+", f"{parsed.path}/{fragment_path}".lower()) if token
+    }
+    callback = bool({"code", "id_token", "error"} & keys and "state" in keys)
+    authorization = "client_id" in keys and bool({"redirect_uri", "response_type"} & keys)
+    return bool(
+        {"samlrequest", "samlresponse"} & keys or path_tokens & AUTH_PATH_MARKERS
+        or authorization or callback
+    )
 
 
 def authentication_form_signal(post_data: str | None) -> bool:
     if not post_data:
         return False
     try:
-        keys = {key.lower() for key in parse_qs(post_data, keep_blank_values=True)}
+        values = {
+            key.lower(): value for key, value in parse_qs(post_data, keep_blank_values=True).items()
+            if any(item.strip() for item in value)
+        }
     except (TypeError, ValueError):
         return False
-    return bool(keys & AUTH_FORM_KEYS)
+    keys = set(values)
+    # Generic business forms frequently contain state/error. Neither is proof of SSO.
+    return bool(
+        {"samlrequest", "samlresponse"} & keys
+        or ("state" in keys and {"code", "id_token", "error"} & keys)
+    )
 
 
 @dataclass
 class AuthenticationNavigationPolicy:
     """Track an SSO navigation chain without broadening crawler or resource scope."""
 
+    approved_hosts: frozenset[str] = frozenset()
     active: bool = False
 
-    def observe(self, url: str) -> None:
-        self.active = self.active or auth_protocol_signal(url)
+    def __post_init__(self) -> None:
+        self.approved_hosts = frozenset(normalized_host(host) for host in self.approved_hosts)
 
-    def allows_main_frame_method(self, method: str, url: str, post_data: str | None = None) -> bool:
+    def observe(self, url: str, method: str = "GET") -> None:
+        # A denied mutation must not manufacture an active authentication chain.
+        if method.upper() in {"GET", "HEAD"}:
+            host = normalized_host(urlparse(url).hostname or "")
+            self.active = self.active or auth_protocol_signal(url) or host in self.approved_hosts
+
+    def allows_main_frame_method(
+        self, method: str, url: str, post_data: str | None = None, *, portal_scoped: bool = False,
+    ) -> bool:
         normalized_method = method.upper()
         url_signal = auth_protocol_signal(url)
-        self.observe(url)
         if normalized_method in {"GET", "HEAD", "OPTIONS"}:
+            self.observe(url, normalized_method)
             return True
         if normalized_method != "POST":
             return False
         form_signal = authentication_form_signal(post_data)
-        allowed = form_signal or (self.active and url_signal)
-        self.active = self.active or form_signal
+        host_approved = normalized_host(urlparse(url).hostname or "") in self.approved_hosts
+        # IdP POSTs require explicit host approval AND protocol evidence. Portal
+        # callbacks may finish an already observed flow, never initiate arbitrary POSTs.
+        error_response = bool(
+            post_data and "error" in {key.lower() for key in parse_qs(post_data)}
+        )
+        allowed = self.active and form_signal and (not error_response or url_signal) and (
+            host_approved or portal_scoped
+        )
+        if allowed:
+            self.active = True
         return allowed
+
+
+async def settle_authentication_navigation(
+    page: Any,
+    *,
+    in_portal_scope: Callable[[str], bool],
+    detect_signals: Callable[[Any], Awaitable[Any]],
+    timeout_ms: int,
+    flow_active: bool = False,
+    status: int | None = None,
+    current_status: Callable[[], int | None] | None = None,
+    is_approved_authentication_host: Callable[[str], bool] | None = None,
+) -> dict[str, Any]:
+    """Observe natural SSO redirects; never submit forms or alter browser security.
+
+    DOMContentLoaded is not authentication completion: auto-post and callback
+    scripts can still be running. Only an application surface ends that wait.
+    Interactive login/MFA pages stop immediately for honest classification.
+    """
+    started = time.perf_counter()
+    deadline = started + max(0, timeout_ms) / 1000
+    active = flow_active
+
+    def result(stage: str, *, completed: bool = False, timed_out: bool = False,
+               password: bool = False, mfa: bool = False) -> dict[str, Any]:
+        return {
+            "stage": stage, "completed": completed, "timed_out": timed_out,
+            "password_form": password, "mfa_form": mfa,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000),
+            "final_host": normalized_host(urlparse(page.url).hostname or ""),
+        }
+
+    while True:
+        current_url = page.url
+        signals = await detect_signals(page)
+        if isinstance(signals, dict):
+            password = bool(signals.get("password_form"))
+            mfa = bool(signals.get("mfa_form"))
+        else:
+            password, mfa = map(bool, signals)
+        if mfa:
+            return result("MFA_REQUIRED", mfa=True, password=password)
+        if password:
+            return result("LOGIN_REQUIRED", password=True)
+        effective_status = current_status() if current_status is not None else status
+        if effective_status is not None and effective_status >= 400:
+            return result("HTTP_ERROR")
+        portal_scoped = in_portal_scope(current_url)
+        approved_external_identity = bool(
+            not portal_scoped and is_approved_authentication_host is not None
+            and is_approved_authentication_host(normalized_host(urlparse(current_url).hostname or ""))
+        )
+        auth_surface = auth_protocol_signal(current_url) or approved_external_identity
+        active = active or auth_surface
+        if portal_scoped and not auth_surface:
+            return result("APPLICATION", completed=True)
+        if not auth_surface and not portal_scoped:
+            # An active chain is not permission to treat every unrelated page as
+            # authentication. A protocol auto-post form is concrete bridge evidence.
+            protocol_form = active and await page.evaluate("""() => Array.from(document.forms).some(form => {
+                if (form.method.toUpperCase() !== 'POST') return false;
+                const fields = new Map(Array.from(form.elements)
+                    .filter(field => field.name && typeof field.value === 'string' && field.value.trim())
+                    .map(field => [field.name.toLowerCase(), true]));
+                return fields.has('samlrequest') || fields.has('samlresponse') ||
+                    (fields.has('state') && (fields.has('code') || fields.has('id_token')));
+            })""")
+            if not protocol_form:
+                return result("OUTSIDE_PORTAL")
+        if not active:
+            return result("OUTSIDE_PORTAL")
+        remaining_ms = (deadline - time.perf_counter()) * 1000
+        if remaining_ms <= 0:
+            return result("AUTHENTICATION_PENDING", timed_out=True)
+        try:
+            # The short observation bound also notices a login form that appears
+            # without a URL change. It is not a target-performance measurement.
+            await page.wait_for_url(
+                lambda url: str(url) != current_url,
+                wait_until="domcontentloaded", timeout=max(1, min(250, remaining_ms)),
+            )
+        except PlaywrightTimeoutError:
+            continue
 
 
 def classify_authentication(
@@ -179,7 +298,7 @@ def classify_authentication(
         return "ACCESS_RESTRICTED"
     if mfa_form:
         return "MFA_REQUIRED"
-    if auth_surface and not target_in_scope:
+    if auth_surface:
         if authentication_mode == "storage_state":
             return "SESSION_EXPIRED"
         if authentication_mode == "none":
@@ -187,6 +306,8 @@ def classify_authentication(
         return "AUTH_FAILED"
     if status is not None and status >= 400:
         return "HTTP_ERROR"
+    if not target_in_scope:
+        return "NAVIGATION_ERROR"
     return "PASS"
 
 

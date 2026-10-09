@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import ipaddress
 import os
@@ -43,7 +44,42 @@ POLICY_CLASSIFICATIONS = frozenset({
 })
 
 
-def _policy_hostname(value: Any) -> str:
+def api_timeout_init_script(timeout_ms: int) -> str:
+    """Apply an explicitly requested browser API deadline without replaying calls.
+
+    Preserve the caller's payload, credentials and existing cancellation signal.
+    This is opt-in; the default scan does not wrap fetch/XHR. Synchronous XHR
+    does not support timeouts and remains bounded by the outer scan deadline.
+    """
+    if not 1000 <= timeout_ms <= 120000:
+        raise ValueError("API timeout is outside the supported range")
+    return """(() => {
+      const timeout = TIMEOUT_MS;
+      const originalFetch = window.fetch;
+      window.fetch = function(input, init) {
+        const existing = init && init.signal !== undefined ? init.signal :
+          (input instanceof Request ? input.signal : undefined);
+        const deadline = AbortSignal.timeout(timeout);
+        const signal = existing ? AbortSignal.any([existing, deadline]) : deadline;
+        return originalFetch.call(this, input, {...init, signal});
+      };
+      const originalOpen = XMLHttpRequest.prototype.open;
+      const originalSend = XMLHttpRequest.prototype.send;
+      const asynchronous = new WeakMap();
+      XMLHttpRequest.prototype.open = function(method, url, async = true, ...rest) {
+        asynchronous.set(this, async !== false);
+        return originalOpen.call(this, method, url, async, ...rest);
+      };
+      XMLHttpRequest.prototype.send = function(body) {
+        if (asynchronous.get(this) !== false) {
+          this.timeout = this.timeout > 0 ? Math.min(this.timeout, timeout) : timeout;
+        }
+        return originalSend.call(this, body);
+      };
+    })();""".replace("TIMEOUT_MS", str(timeout_ms))
+
+
+def policy_hostname(value: Any) -> str:
     host = normalized_host(str(value or ""))
     try:
         return str(ipaddress.ip_address(host))
@@ -68,6 +104,7 @@ def classify_traffic(
     resource_type: str,
     phase: str,
     blocked_by_validator: bool = False,
+    classification: str = "",
 ) -> str:
     """Classify safe network metadata without inspecting headers or bodies."""
     if blocked_by_validator:
@@ -75,21 +112,32 @@ def classify_traffic(
     normalized_type = resource_type.lower()
     normalized_path = endpoint.lower()
     normalized_phase = phase.upper()
-    if normalized_type == "document":
-        return "DOCUMENT"
-    if normalized_phase == "AUTHENTICATION":
-        return "AUTH_API"
-    if normalized_phase == "SESSION_REFRESH":
-        return "SESSION_REFRESH"
-    if normalized_type not in {"xhr", "fetch"}:
-        return "STATIC_RESOURCE"
+    # Traffic purpose and execution policy are independent. A challenge POST
+    # must not become a successful business API just because it returned 200.
+    if classification == "ACCESS_GATE" or any(marker in normalized_path for marker in (
+        "/cdn-cgi/challenge-platform/", "/challenge/", "/captcha/", "/turnstile/",
+    )):
+        return "CHALLENGE_API"
     if normalized_path.endswith("/config.json") or normalized_path == "/config.json":
         return "MICROFRONTEND_CONFIG"
+    if classification == "SESSION_REFRESH" or normalized_phase == "SESSION_REFRESH":
+        return "SESSION_REFRESH"
+    auth_tokens = set(re.split(r"[^a-z0-9]+", normalized_path))
+    if classification == "AUTH_FLOW" or auth_tokens & {
+        "oauth", "oauth2", "oidc", "saml", "saml2", "authorize", "authorization", "login", "signin",
+    }:
+        return "AUTH_API"
+    if normalized_type == "document":
+        return "DOCUMENT"
+    if normalized_type not in {"xhr", "fetch"}:
+        return "STATIC_RESOURCE"
     if any(marker in normalized_path for marker in (
         "/analytics", "/beacon", "/collect", "/metrics", "/telemetry",
     )):
         return "TELEMETRY"
-    return "APPLICATION_API"
+    if classification in {"APPROVED_READ_POST", "APPROVED_READ_REQUEST"} or normalized_path.startswith("/api/") or normalized_path.endswith("/graphql"):
+        return "APPLICATION_API"
+    return "UNCLASSIFIED_API"
 
 
 def request_identity(request: Any) -> Any:
@@ -148,8 +196,10 @@ def summarize_route_api_coverage(events: list[dict[str, Any]]) -> dict[str, int 
     application_events = [
         event for event in events
         if (
-            event.get("traffic_category") == "APPLICATION_API"
+            event.get("traffic_role", event.get("traffic_category")) == "APPLICATION_API"
             or (
+                "traffic_role" not in event
+                and
                 event.get("traffic_category") == "VALIDATOR_BLOCKED"
                 and event.get("resource_type") in {"xhr", "fetch"}
                 and not str(event.get("endpoint") or "").lower().endswith("/config.json")
@@ -158,7 +208,12 @@ def summarize_route_api_coverage(events: list[dict[str, Any]]) -> dict[str, int 
         )
     ]
     blocked = sum(bool(event.get("blocked_by_validator")) for event in application_events)
-    executed = len(application_events) - blocked
+    executed = sum(
+        not event.get("blocked_by_validator")
+        and bool(event.get("request_dispatched") or event.get("response_seen")
+                 or ("request_dispatched" not in event and isinstance(event.get("status"), int)))
+        for event in application_events
+    )
     return {
         "api_coverage": (
             "APPLICATION_API_OBSERVED" if executed else
@@ -170,6 +225,39 @@ def summarize_route_api_coverage(events: list[dict[str, Any]]) -> dict[str, int 
         "application_apis_executed": executed,
         "blocked_api_attempts": blocked,
     }
+
+
+def summarize_post_observation(events: list[dict[str, Any]]) -> dict[str, int]:
+    """Count observed POST calls without inventing approval or replay evidence.
+
+    Authentication, challenge and unapproved POST attempts are observations,
+    not explicitly approved read-only operations. A response proves dispatch,
+    including native redirect requests that bypass Playwright's route handler;
+    it does not itself establish read-only execution approval.
+    """
+    summary = {
+        "observed_calls": 0,
+        "approved_read_only_calls": 0,
+        "executed_approved_calls": 0,
+    }
+    for event in events:
+        if str(event.get("method") or "GET").upper() != "POST":
+            continue
+        summary["observed_calls"] += 1
+        classification = str(
+            event.get("policy_classification") or event.get("request_classification") or ""
+        )
+        approved = (
+            classification in {"APPROVED_READ_POST", "APPROVED_READ_REQUEST", "APPROVED_READ_ONLY"}
+            and not event.get("blocked_by_validator")
+            and event.get("policy_decision") not in {"BLOCK", "PENDING"}
+        )
+        summary["approved_read_only_calls"] += approved
+        summary["executed_approved_calls"] += approved and bool(
+            event.get("request_dispatched") or event.get("response_seen")
+            or ("response_seen" not in event and isinstance(event.get("status"), int))
+        )
+    return summary
 
 
 def normalize_api_endpoint(path: str) -> str:
@@ -361,7 +449,7 @@ def load_read_only_policy(
         if not isinstance(item, dict):
             raise ValueError("Each safe application request rule must be an object")
         method = str(item.get("method") or "").strip().upper()
-        host = _policy_hostname(item.get("host"))
+        host = policy_hostname(item.get("host"))
         has_exact_path = "path" in item
         has_path_pattern = "path_pattern" in item
         if has_exact_path == has_path_pattern:
@@ -444,6 +532,11 @@ class PassiveNetworkObserver:
         # (which contain headers/bodies) alive for the duration of a scan.
         self._events_by_request: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
         self._sequence = 0
+        self._finalized = False
+
+    @property
+    def finalized(self) -> bool:
+        return self._finalized
 
     def observe_request(
         self,
@@ -459,6 +552,8 @@ class PassiveNetworkObserver:
         existing = self._events_by_request.get(key)
         if existing is not None:
             return existing
+        if self._finalized:
+            raise RuntimeError("Network observation has been finalized")
         method = str(request.method).upper()
         self._sequence += 1
         safe_url, host, endpoint = safe_api_identity(str(request.url))
@@ -507,6 +602,7 @@ class PassiveNetworkObserver:
             "allowed_by_policy": method in SAFE_HTTP_METHODS,
             "target_reached": None,
             "lifecycle": "REQUESTED",
+            "lifecycle_status": "OBSERVED",
             "traffic_category": classify_traffic(
                 method=method,
                 endpoint=endpoint,
@@ -515,6 +611,7 @@ class PassiveNetworkObserver:
             ),
             "_started_at": time.perf_counter(),
         }
+        event["traffic_role"] = event["traffic_category"]
         self._events_by_request[key] = event
         self.events.append(event)
         return event
@@ -527,6 +624,8 @@ class PassiveNetworkObserver:
         phase: str | None = None,
         importance: str | None = None,
     ) -> dict[str, Any] | None:
+        if self._finalized:
+            return None
         event = self._events_by_request.get(self._request_key(request))
         if event is None:
             return None
@@ -534,6 +633,7 @@ class PassiveNetworkObserver:
         event["policy_classification"] = public_policy_classification(classification)
         event["allowed_by_policy"] = True
         event["lifecycle"] = "ALLOWED"
+        event["lifecycle_status"] = "ALLOWED"
         event.update(policy_evaluated=True, policy_decision="ALLOW", policy_reason=classification)
         if phase is not None:
             event["phase"] = phase
@@ -544,7 +644,9 @@ class PassiveNetworkObserver:
             endpoint=str(event.get("endpoint") or "/"),
             resource_type=str(event.get("resource_type") or "other"),
             phase=str(event.get("phase") or "VALIDATION"),
+            classification=classification,
         )
+        event["traffic_role"] = event["traffic_category"]
         return event
 
     def mark_blocked(
@@ -554,6 +656,8 @@ class PassiveNetworkObserver:
         *,
         classification: str = "BLOCKED_MUTATION",
     ) -> dict[str, Any] | None:
+        if self._finalized:
+            return None
         event = self._events_by_request.get(self._request_key(request))
         if event is None:
             return None
@@ -565,6 +669,7 @@ class PassiveNetworkObserver:
             "allowed_by_policy": False,
             "target_reached": False,
             "lifecycle": "BLOCKED",
+            "lifecycle_status": "BLOCKED",
             "duration_ms": self._duration(event),
             "policy_evaluated": True,
             "policy_decision": "BLOCK",
@@ -576,6 +681,8 @@ class PassiveNetworkObserver:
         return event
 
     def record_response(self, request: Any, status: int) -> dict[str, Any] | None:
+        if self._finalized:
+            return None
         event = self._events_by_request.get(self._request_key(request))
         if event is None or event.get("lifecycle") == "BLOCKED":
             return event
@@ -587,14 +694,20 @@ class PassiveNetworkObserver:
             "status": int(status),
             "target_reached": True,
             "lifecycle": "RESPONSE",
+            "lifecycle_status": "RESPONDED",
             "duration_ms": self._duration(event),
             "request_reached_network": True,
+            # Native redirect hops bypass context.route(). Their response is
+            # positive dispatch evidence, not a route-handler/policy approval.
+            "request_dispatched": True,
             "response_seen": True,
             "response_status": int(status),
         })
         return event
 
     def record_failure(self, request: Any, error: str) -> dict[str, Any] | None:
+        if self._finalized:
+            return None
         event = self._events_by_request.get(self._request_key(request))
         if event is not None and event.get("lifecycle") == "BLOCKED":
             event["request_failed"] = True
@@ -603,31 +716,48 @@ class PassiveNetworkObserver:
             return event
         if event.get("request_classification") == "UNKNOWN":
             event["request_classification"] = "APPLICATION_REQUEST"
+        canceled = any(marker in str(error).upper() for marker in (
+            "ERR_ABORTED", "ABORTERROR", "NS_BINDING_ABORTED", "CANCELLED", "CANCELED",
+        ))
         event.update({
             "error": sanitize_text(str(error).splitlines()[0], limit=1000),
             "target_reached": True if event.get("response_seen") else None,
             "lifecycle": "FAILED",
+            "lifecycle_status": "CANCELED" if canceled else "FAILED",
+            "request_canceled": canceled,
             "duration_ms": self._duration(event),
             "request_reached_network": True if event.get("response_seen") else None,
             "request_failed": True,
-            "failure_category": "RESPONSE_BODY_FAILURE" if event.get("response_seen") else "NETWORK_FAILURE",
+            "failure_category": (
+                "REQUEST_CANCELED" if canceled else
+                "RESPONSE_BODY_FAILURE" if event.get("response_seen") else "NETWORK_FAILURE"
+            ),
             "response_completed": False,
         })
         return event
 
     def mark_route_handler(self, request: Any) -> None:
+        if self._finalized:
+            return
         event = self._events_by_request.get(self._request_key(request))
         if event is not None:
             event["route_handler_seen"] = True
 
     def mark_dispatched(self, request: Any) -> None:
+        if self._finalized:
+            return
         event = self._events_by_request.get(self._request_key(request))
         if event is not None:
             event["request_dispatched"] = True
+            # The response event can race route.continue_(). Never regress it.
+            if event.get("lifecycle_status") == "ALLOWED":
+                event["lifecycle_status"] = "SENT"
 
     def record_finished(self, request: Any) -> None:
+        if self._finalized:
+            return
         event = self._events_by_request.get(self._request_key(request))
-        if event is None or not event.get("response_seen") or event.get("blocked_by_validator"):
+        if event is None or not event.get("response_seen") or event.get("blocked_by_validator") or event.get("request_failed"):
             return
         try:
             response_end = request.timing.get("responseEnd")
@@ -638,14 +768,28 @@ class PassiveNetworkObserver:
             else self._duration(event)
         )
         event["response_completed"] = True
+        event["lifecycle_status"] = "COMPLETED"
 
     def finalize_pending(self) -> None:
+        # Freeze evidence at the explicit observation cutoff. Closing a context
+        # generates cancellation/failure events that are validator cleanup, not
+        # natural target outcomes, and must not overwrite unfinished evidence.
+        if self._finalized:
+            return
+        self._finalized = True
         for event in self.events:
             if event.get("lifecycle") in {"REQUESTED", "ALLOWED"}:
                 if event.get("request_classification") == "UNKNOWN":
                     event["request_classification"] = "APPLICATION_REQUEST"
                 event["lifecycle"] = "PENDING_AT_SCAN_END"
                 event["duration_ms"] = self._duration(event)
+            if not event.get("blocked_by_validator") and not event.get("request_failed") and not event.get("response_completed"):
+                event["lifecycle_status"] = "INCOMPLETE"
+                event["incomplete_reason"] = (
+                    "RESPONSE_BODY_NOT_COMPLETED" if event.get("response_seen") else
+                    "NO_RESPONSE_BEFORE_SCAN_END" if event.get("request_dispatched") else
+                    "NOT_DISPATCHED_BEFORE_SCAN_END"
+                )
             event.pop("_started_at", None)
 
     @staticmethod
@@ -659,6 +803,76 @@ class PassiveNetworkObserver:
     def _duration(event: dict[str, Any]) -> int | None:
         started = event.get("_started_at")
         return round((time.perf_counter() - started) * 1000) if isinstance(started, float) else None
+
+
+async def drain_pending_api_observations(
+    observer: PassiveNetworkObserver,
+    *,
+    maximum_ms: int,
+    quiet_ms: int,
+    cancel_event: asyncio.Event | None = None,
+) -> dict[str, Any]:
+    """Allow naturally observed requests to finish within a bounded final window.
+
+    Includes optional, discovery and popup traffic, not just required APIs on
+    the last route. New attempts and lifecycle changes reset the quiet window.
+    The caller owns the total scan deadline and freezes observation afterward.
+    No requests are issued, retried or replayed by this function.
+    """
+    maximum_ms = max(0, int(maximum_ms))
+    quiet_ms = max(0, int(quiet_ms))
+    started = time.perf_counter()
+    deadline = started + maximum_ms / 1000
+    last_change = started
+    previous: tuple[tuple[object, ...], ...] | None = None
+
+    def snapshot() -> tuple[tuple[tuple[object, ...], ...], int]:
+        signature = tuple(
+            (
+                event.get("request_id"), event.get("lifecycle_status"),
+                bool(event.get("response_seen")), bool(event.get("response_completed")),
+                bool(event.get("request_failed")), bool(event.get("blocked_by_validator")),
+            )
+            for event in observer.events
+        )
+        pending = sum(
+            not event.get("blocked_by_validator")
+            and not event.get("request_failed")
+            and not event.get("response_completed")
+            for event in observer.events
+        )
+        return signature, pending
+
+    while True:
+        now = time.perf_counter()
+        signature, pending = snapshot()
+        if signature != previous:
+            previous = signature
+            last_change = now
+        cancelled = bool(cancel_event is not None and cancel_event.is_set())
+        ready = pending == 0 and (now - last_change) * 1000 >= quiet_ms
+        timed_out = not ready and now >= deadline
+        if observer.finalized or cancelled or ready or timed_out:
+            return {
+                "pending": pending,
+                "observed_requests": len(observer.events),
+                "elapsed_ms": max(0, round((now - started) * 1000)),
+                "timed_out": timed_out,
+                "cancelled": cancelled,
+                "reason": (
+                    "OBSERVATION_ALREADY_FINALIZED" if observer.finalized else
+                    "CANCELLED" if cancelled else
+                    "API_QUIET" if ready else "FINALIZATION_TIMEOUT"
+                ),
+            }
+        pause = min(0.05, max(0.0, deadline - now))
+        if cancel_event is None:
+            await asyncio.sleep(pause)
+        else:
+            try:
+                await asyncio.wait_for(cancel_event.wait(), timeout=pause)
+            except TimeoutError:
+                pass
 
 
 def _observed_at() -> str:

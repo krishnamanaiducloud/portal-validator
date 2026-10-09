@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import OrderedDict
+from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -22,6 +24,63 @@ SCAN_STATES = frozenset({
 
 class ScanCapacityError(RuntimeError):
     pass
+
+
+class ScanAdmissionCancelled(RuntimeError):
+    pass
+
+
+class ScanConcurrencyLimiter:
+    """Fair per-process browser admission honoring every active scan's limit.
+
+    Routes stay serial inside their shared authenticated context. A request for
+    one concurrent scan runs exclusively; it cannot raise the deployment cap.
+    """
+
+    def __init__(self, maximum: int):
+        self.maximum = max(1, maximum)
+        self._condition = asyncio.Condition()
+        self._active: dict[object, int] = {}
+        self._waiting: deque[object] = deque()
+
+    @asynccontextmanager
+    async def slot(self, limit: int, cancel_event: asyncio.Event | None = None):
+        if not 1 <= limit <= self.maximum:
+            raise ValueError("Concurrent scan limit exceeds the deployment capacity")
+        ticket = object()
+        admitted = False
+
+        async def notify_cancellation():
+            await cancel_event.wait()
+            async with self._condition:
+                self._condition.notify_all()
+
+        watcher = asyncio.create_task(notify_cancellation()) if cancel_event is not None else None
+        try:
+            async with self._condition:
+                self._waiting.append(ticket)
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise ScanAdmissionCancelled("Scan canceled while queued")
+                    effective_limit = min(self.maximum, limit, *self._active.values())
+                    if self._waiting[0] is ticket and len(self._active) < effective_limit:
+                        self._waiting.popleft()
+                        self._active[ticket] = limit
+                        admitted = True
+                        self._condition.notify_all()
+                        break
+                    await self._condition.wait()
+            yield
+        finally:
+            if watcher is not None:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+            async with self._condition:
+                if admitted:
+                    self._active.pop(ticket, None)
+                elif ticket in self._waiting:
+                    self._waiting.remove(ticket)
+                self._condition.notify_all()
 
 
 def _utc_now() -> str:
