@@ -188,7 +188,9 @@ async def test_noop_tab_does_not_pass_because_its_panel_was_already_visible():
     async with _local_page(body) as page:
         with pytest.raises((RuntimeError, PlaywrightTimeoutError)):
             await activate_ui_view(
-                page, {"panel": "reports-panel", "label": "Reports"}, 1500,
+                # Allow click dispatch on a contended browser test runner; the
+                # unchanged assertions still require the no-op to fail once.
+                page, {"panel": "reports-panel", "label": "Reports"}, 5000,
             )
         assert await page.evaluate("window.activations") == 1
 

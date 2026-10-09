@@ -162,6 +162,26 @@ async def main():
         assert await page.get_by_role("button", name="Show Scan duration evidence").locator("strong").inner_text() == "175ms"
         await page.evaluate("lastReport.summary.total_scan_duration_ms = 8500; renderReport(lastReport)")
         await page.evaluate("""() => {
+          window.accessOriginalReport = lastReport;
+          const baseline = lastReport.results[0];
+          renderReport({...lastReport, summary:{...lastReport.summary, access_issues:2, auth_issues:1},
+            results:[baseline, ...['ACCESS_RESTRICTED','CHALLENGE_REQUIRED','AUTH_REQUIRED'].map((classification,index) =>
+              ({...baseline, route_id:`access-fixture-${index}`, route_name:classification,
+                classification, passed:false, validation_status:'NOT_TESTED',
+                authentication_status:index===2?'AUTH_REQUIRED':'NOT_TESTED',
+                coverage_detail:'Application coverage is limited; authentication was not established.'}))]});
+        }""")
+        assert await page.get_by_role("button", name="Show Auth issues evidence").locator("strong").inner_text() == "1"
+        assert await page.get_by_role("button", name="Show Access / challenges evidence").locator("strong").inner_text() == "2"
+        await page.get_by_role("button", name="Show Access / challenges evidence").click()
+        assert await page.locator("#result-list .route-row").count() == 2
+        assert await page.locator("#result-list .coverage-limitation").count() == 2
+        await page.get_by_role("button", name="Show Failed evidence").click()
+        assert await page.locator("#result-list .route-row").count() == 0
+        await page.get_by_role("button", name="Show Auth issues evidence").click()
+        assert await page.locator("#result-list .route-name-cell strong").all_text_contents() == ["AUTH_REQUIRED"]
+        await page.evaluate("renderReport(window.accessOriginalReport); delete window.accessOriginalReport")
+        await page.evaluate("""() => {
           window.uiViewOriginalReport = lastReport;
           const baseline = lastReport.results[0];
           renderReport({...lastReport, results:[baseline, ...['Service reports','Recent activity'].map((name,index) =>

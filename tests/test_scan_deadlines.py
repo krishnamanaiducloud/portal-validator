@@ -129,14 +129,18 @@ async def test_total_deadline_preserves_completed_results_and_timeout_counters(p
             completed_before_deadline.append(True)
             # Model an expensive downstream observer after a completed route;
             # even non-navigation work must respect the absolute scan deadline.
-            await asyncio.sleep(20)
+            await asyncio.sleep(30)
 
     report = await execute_scan(
-        scan_request(origin, total_timeout_ms=10000), progress_callback=progress,
+        # This tests the total deadline AFTER discovery/completion, not the
+        # separate 1-second per-route deadline exercised by neighboring tests.
+        scan_request(origin, timeout_ms=10000, total_timeout_ms=20000),
+        progress_callback=progress,
     )
     summary = report["summary"]
     assert completed_before_deadline
     assert len(report["results"]) == 1
+    assert report["results"][0]["page_load_status"] == "LOADED"
     assert summary["termination_reason"] == "SCAN_TIMEOUT"
     assert summary["scan_completeness"] == "PARTIAL"
     assert summary["routes_not_tested"] == 3

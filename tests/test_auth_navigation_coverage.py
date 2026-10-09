@@ -87,6 +87,17 @@ def test_unrelated_non_authentication_destination_is_not_application_pass():
     ) == "NAVIGATION_ERROR"
 
 
+@pytest.mark.parametrize("path", ["/docs/oauth/getting-started", "/reference/saml", "/login-history"])
+def test_public_protocol_documentation_is_not_an_authentication_boundary(path):
+    url = "https://portal.example" + path
+    assert auth_protocol_signal(url)  # Still a conservative SSO navigation hint.
+    assert not auth_protocol_signal(url, boundary_only=True)
+    assert classify_authentication(
+        authentication_mode="none", status=200, final_url=url,
+        target_in_scope=True, error_classification=None,
+    ) == "PASS"
+
+
 class RedirectPage:
     def __init__(self, urls):
         self.urls = list(urls)
@@ -108,6 +119,33 @@ class RedirectPage:
 
 async def no_forms(page):
     return False, False
+
+
+@pytest.mark.asyncio
+async def test_public_documentation_does_not_consume_authentication_timeout():
+    page = RedirectPage(["https://portal.example/docs/oauth/getting-started"])
+    result = await settle_authentication_navigation(
+        page, in_portal_scope=lambda url: True, detect_signals=no_forms, timeout_ms=60000,
+        flow_active=True,
+    )
+    assert result["completed"] and result["stage"] == "APPLICATION"
+    assert page.waits == 0
+
+
+@pytest.mark.asyncio
+async def test_same_scope_protocol_auto_post_bridge_is_not_public_application_content():
+    page = RedirectPage(["https://portal.example/saml/consume", "https://portal.example/dashboard"])
+
+    async def protocol_form(script):
+        return page.url.endswith("/saml/consume")
+
+    page.evaluate = protocol_form
+    result = await settle_authentication_navigation(
+        page, in_portal_scope=lambda url: True, detect_signals=no_forms,
+        timeout_ms=1000, flow_active=True,
+    )
+    assert result["completed"] and result["stage"] == "APPLICATION"
+    assert page.waits == 1
 
 
 @pytest.mark.asyncio
@@ -220,7 +258,7 @@ async def test_unmarked_saml_auto_post_bridge_is_observed_without_submission():
     page = RedirectPage(["https://identity.example/consume", "https://portal.example/dashboard"])
 
     async def protocol_form(script):
-        return True
+        return page.url.startswith("https://identity.example/")
 
     page.evaluate = protocol_form
     result = await settle_authentication_navigation(

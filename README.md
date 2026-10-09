@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.12.2 is an authenticated, read-only browser health validator for public,
+Portal Validator 1.12.3 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -148,6 +148,29 @@ cookies, and mounted Playwright `storage_state`. Reports use generic behavioral
 classifications such as `PASS`, `AUTH_REQUIRED`, `AUTH_FAILED`, `AUTH_TIMEOUT`,
 `MFA_REQUIRED`, `SESSION_EXPIRED`, `ACCESS_RESTRICTED`, `TLS_ERROR`,
 `DNS_ERROR`, `NETWORK_ERROR`, `TIMEOUT`, `HTTP_ERROR`, and `NAVIGATION_ERROR`.
+**No authentication** is the default for public portals. Public documentation
+paths containing protocol words and optional peripheral sign-in widgets do not
+by themselves establish an authentication boundary. Visible primary login/MFA
+forms, HTTP 401 and actual authentication protocol evidence remain enforced.
+
+Access restrictions (HTTP 403), rate limiting (HTTP 429), and visible access
+challenges are separate from **Auth issues** in reports. They limit application
+coverage and do not prove that credentials are required, that application
+content was validated, or that the application itself failed. TLS verification
+still reports the actual HTTPS handshake separately. The validator does not
+bypass access challenges or retry them using alternate browser identities.
+
+Endpoint coverage means requests naturally observed while visiting reachable
+routes and safe UI views within configured limits, not every endpoint that may
+exist on a server. Approved read-only POSTs are executed by the application and
+health-checked from their actual responses; unapproved attempts remain visible
+as blocked/not executed. Do not assume POST safety from its URL or a successful
+HTTP status. Authenticated-only routes, unvisited controls, denied destinations,
+worker-only requests, and calls the application never initiates remain outside
+verified coverage. Supply an owner-approved session, necessary resource/API
+hosts, and exact read-only POST approvals when needed; no endpoint guessing or
+blind request replay is performed.
+
 Bearer input accepts either a raw token or one leading `Bearer` scheme and is
 normalized to exactly one `Authorization: Bearer ...` header. The transient
 secret field is cleared after submission and secret values are never returned.
@@ -245,10 +268,10 @@ runs as UID/GID 10001 while supporting an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.12.2 .
+docker build -t mohankrishna999/portal-validator:1.12.3 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.2 \
-  -t mohankrishna999/portal-validator:1.12.2-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.3 \
+  -t mohankrishna999/portal-validator:1.12.3-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -263,7 +286,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.12.2
+  mohankrishna999/portal-validator:1.12.3
 ```
 
 ## OpenShift
@@ -467,8 +490,11 @@ redacted or excluded at the centralized logging boundary.
   supported mode.
 - `AUTH_FAILED` / `SESSION_EXPIRED`: supplied authentication was rejected or a
   saved browser session returned to login. Rotate or recreate the secret.
-- `ACCESS_RESTRICTED`: the server returned 403 or an equivalent restricted
-  result. Confirm authorization and network policy.
+- `ACCESS_RESTRICTED`: the server returned HTTP 403, HTTP 429, or an equivalent
+  restricted result. This does not establish a login requirement. Confirm
+  owner-approved access and rate limits; application coverage is incomplete.
+- `CHALLENGE_REQUIRED`: an access challenge was observed. It is not bypassed,
+  not counted as an authentication failure, and does not prove portal health.
 - `DNS_ERROR`: a destination did not resolve. Check cluster DNS and the exact
   hostname.
 - `NETWORK_ERROR`: connection or SSRF policy blocked the destination. Private

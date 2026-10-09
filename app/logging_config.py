@@ -18,11 +18,15 @@ class RedactingFilter(logging.Filter):
         try:
             payload = json.loads(record.getMessage())
         except (json.JSONDecodeError, RecursionError):
-            record.msg = sanitize_text(record.msg)
+            # Redact the actual formatted message: a sensitive key and its value
+            # can be split across the format string and arguments (access logs).
+            # Preserve recursive metadata redaction before formatting, too.
             if isinstance(record.args, dict):
                 record.args = sanitize_data(record.args)
             elif isinstance(record.args, tuple):
                 record.args = tuple(sanitize_data(item) for item in record.args)
+            record.msg = sanitize_text(record.getMessage())
+            record.args = ()
         else:
             # Redact values, not serialized JSON syntax. Regex redaction of an
             # OAuth URL could consume a closing quote; whole-message truncation

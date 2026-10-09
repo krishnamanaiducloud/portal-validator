@@ -121,7 +121,9 @@ function toggleRouteResultsFullscreen() {
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
 const splitList = (value) => value.split(',').map((item) => item.trim()).filter(Boolean);
 const statusClass = (value) => String(value || 'NOT_TESTED').toLowerCase().replaceAll('_', '-');
-const authOutcomes = new Set(['ACCESS_RESTRICTED','AUTH_REQUIRED','AUTH_FAILED','AUTH_TIMEOUT','MFA_REQUIRED','SESSION_EXPIRED']);
+const authOutcomes = new Set(['AUTH_REQUIRED','AUTH_FAILED','AUTH_TIMEOUT','MFA_REQUIRED','SESSION_EXPIRED']);
+const accessOutcomes = new Set(['ACCESS_RESTRICTED','CHALLENGE_REQUIRED']);
+const failureOutcomes = new Set(['TLS_ERROR','DNS_ERROR','NETWORK_ERROR','HTTP_ERROR','TIMEOUT','NAVIGATION_ERROR','VALIDATION_FAILED','PAGE_RENDER_ERROR','FAIL']);
 const passOutcomes = new Set(['PASS','PASS_WITH_WARNINGS']);
 const terminalStates = new Set(['COMPLETED','PARTIAL','FAILED','CANCELLED']);
 const numericRouteKeys = new Set(['status','load_ms','api_failures','resource_failure_count','console_count','warning_findings']);
@@ -431,8 +433,9 @@ function updateAriaSort(selector, state, attribute) {
 
 function matchesOutcome(item, filter) {
   if (filter === 'all') return true;
-  if (filter === 'failure') return !passOutcomes.has(item.classification) && !authOutcomes.has(item.classification);
+  if (filter === 'failure') return failureOutcomes.has(item.classification) || item.page_load_status === 'FAILED_TO_LOAD';
   if (filter === 'auth') return authOutcomes.has(item.classification);
+  if (filter === 'access') return accessOutcomes.has(item.classification);
   return item.classification === filter;
 }
 
@@ -440,8 +443,9 @@ function matchesDrilldown(item) {
   if (['all','discovered','validated'].includes(activeDrilldown)) return true;
   if (activeDrilldown === 'healthy') return passOutcomes.has(item.classification);
   if (activeDrilldown === 'warnings') return item.classification === 'PASS_WITH_WARNINGS';
-  if (activeDrilldown === 'failed') return !passOutcomes.has(item.classification) && !authOutcomes.has(item.classification) && item.page_load_status !== 'NOT_TESTED';
+  if (activeDrilldown === 'failed') return matchesOutcome(item, 'failure');
   if (activeDrilldown === 'auth') return authOutcomes.has(item.classification);
+  if (activeDrilldown === 'access') return accessOutcomes.has(item.classification);
   if (activeDrilldown === 'not-tested') return item.page_load_status === 'NOT_TESTED';
   if (activeDrilldown === 'api-failures') return Number(item.api_failures || 0) > 0;
   if (activeDrilldown === 'resource-failures') return Number(item.resource_failure_count || 0) > 0;
@@ -466,7 +470,7 @@ function detailSection(title, value) {
 // credential form inputs, browser storage, or an arbitrary full route object.
 function routeDiagnostics(item) {
   return {
-    overview: {route_name:item.route_name || item.route_label,classification:item.classification,validation_status:item.validation_status,warning_reasons:routeWarnings(item),finding_details:item.finding_details},
+    overview: {route_name:item.route_name || item.route_label,classification:item.classification,validation_status:item.validation_status,access_status:item.access_status,coverage_detail:item.coverage_detail,warning_reasons:routeWarnings(item),finding_details:item.finding_details},
     page_load: {status:item.page_load_status,http_status:item.http_status_display ?? item.status ?? null,render_status:item.render_status,failure_dimension:item.failure_dimension,failure_reason:item.failure_reason},
     navigation: {requested_url:item.requested_url,discovered_url:item.discovered_url,final_url:item.final_url,redirects:item.redirects,type:item.navigation_type,status:item.navigation_status,identity:{route_id:item.route_id,view_type:item.view_type,canonical_route:item.canonical_route,display_path:item.display_path,origin:item.origin,host:item.host,pathname:item.pathname,query_sanitized:item.query_sanitized,fragment:item.fragment,spa_route:item.spa_route,route_name:item.route_name,route_name_source:item.route_name_source,route_name_confidence:item.route_name_confidence,discovery_sources:item.discovery_sources,duplicate_discovery_count:item.duplicate_discovery_count,depth:item.depth}},
     authentication: {status:item.authentication_status,stage:item.authentication_stage},
@@ -600,6 +604,12 @@ function renderRows() {
   }).join('') || '<tr><td colspan="13" class="empty-table">No routes match this filter.</td></tr>';
   byId('result-list').querySelectorAll('.route-row').forEach((row, index) => {
     const item = rows[index];
+    if (accessOutcomes.has(item.classification)) {
+      const explanation = document.createElement('small');
+      explanation.className = 'warning-summary coverage-limitation';
+      explanation.textContent = item.coverage_detail || 'Application coverage is limited by an access restriction or challenge; its cause was not established.';
+      row.firstElementChild.append(explanation);
+    }
     const inspect = row.querySelector('.route-inspect');
     inspect.addEventListener('click', () => showRouteInspector(item, inspect));
     const warnings = routeWarnings(item);
@@ -819,7 +829,7 @@ function terminationMessage(coverage) {
   const validated = Number(coverage.routes_validated || 0);
   const discovered = Number(coverage.routes_discovered || validated);
   const notTested = Number(coverage.routes_not_tested ?? coverage.routes_remaining ?? 0);
-  const reasons = {MAX_ROUTES_REACHED:'Maximum route limit reached.',SCAN_TIMEOUT:'Total scan time budget was exhausted.',USER_CANCELLED:'The scan was cancelled.',MAX_DEPTH_REACHED:'Maximum discovery depth was reached.',DISCOVERY_EXHAUSTED:'All eligible discovered routes were processed.',AUTHENTICATION_INCOMPLETE:'Authentication did not reach an authorized application page.',AUTH_REQUIRED:'Authentication is required before application coverage can be evaluated.',SESSION_EXPIRED:'The authenticated session expired.',ACCESS_RESTRICTED:'The target restricted browser access; application coverage is limited.',NAVIGATION_BLOCKED:'Navigation was blocked by policy.'};
+  const reasons = {MAX_ROUTES_REACHED:'Maximum route limit reached.',SCAN_TIMEOUT:'Total scan time budget was exhausted.',USER_CANCELLED:'The scan was cancelled.',MAX_DEPTH_REACHED:'Maximum discovery depth was reached.',DISCOVERY_EXHAUSTED:'All eligible discovered routes were processed.',AUTHENTICATION_INCOMPLETE:'Authentication did not reach an authorized application page.',AUTH_REQUIRED:'Authentication is required before application coverage can be evaluated.',SESSION_EXPIRED:'The authenticated session expired.',ACCESS_RESTRICTED:'The target restricted browser access; application coverage is limited.',CHALLENGE_REQUIRED:'An access challenge limited application coverage; its cause was not established.',NAVIGATION_BLOCKED:'Navigation was blocked by policy.'};
   return `${reasons[coverage.termination_reason] || coverage.termination_reason || 'Scan finished.'} ${validated} of ${discovered} discovered routes were validated. ${notTested} routes were not tested.`;
 }
 
@@ -831,15 +841,19 @@ function renderReport(report) {
   const scanDuration = report.summary.total_scan_duration_ms ?? report.scan_timing?.total_scan_ms ?? report.summary.duration_ms;
   const duration = scanDuration > 1000 ? `${(scanDuration / 1000).toFixed(1)}s` : `${scanDuration}ms`;
   const notTested = report.summary.routes_not_tested ?? report.summary.not_tested ?? 0;
+  const authIssues = Array.isArray(report.results) ? report.results.filter((item) => authOutcomes.has(item.classification)).length : report.summary.auth_issues || 0;
+  const accessIssues = report.summary.access_issues ?? (report.results || []).filter((item) => accessOutcomes.has(item.classification)).length;
   const summaryMetrics = [
-    ['Discovered routes', report.summary.routes_discovered, '', 'discovered'], ['Validated routes', report.summary.routes_validated, '', 'validated'], ['Healthy', report.summary.healthy_routes, 'good', 'healthy'], ['Passed with warnings', report.summary.routes_with_warnings, report.summary.routes_with_warnings ? 'warn' : '', 'warnings'], ['Failed', report.summary.failed_pages, report.summary.failed_pages ? 'bad' : 'good', 'failed'], ['Auth issues', report.summary.auth_issues, report.summary.auth_issues ? 'auth' : '', 'auth'], ['Not tested', notTested, notTested ? 'warn' : 'good', 'not-tested'], ['Unique APIs observed', report.summary.unique_apis || 0, '', 'apis'], ['API failures', report.summary.api_failures, report.summary.api_failures ? 'bad' : 'good', 'api-failures'], ['Resources observed', report.summary.unique_resources || 0, '', 'resources'], ['Resource failures', report.summary.resource_failures, report.summary.resource_failures ? 'warn' : 'good', 'resource-failures'], ['Console issues', report.summary.console_failures || 0, report.summary.console_failures ? 'warn' : 'good', 'console'], ['Slow routes', report.summary.slow_pages, report.summary.slow_pages ? 'warn' : 'good', 'slow'], ['Read-only blocks', report.summary.read_only_blocks, report.summary.read_only_blocks ? 'warn' : 'good', 'read-only'], ['Security recommendations', report.summary.security_recommendations || 0, report.summary.security_recommendations ? 'warn' : 'good', 'security'], ['Scan duration', duration, '', 'validated'],
+    ['Discovered routes', report.summary.routes_discovered, '', 'discovered'], ['Validated routes', report.summary.routes_validated, '', 'validated'], ['Healthy', report.summary.healthy_routes, 'good', 'healthy'], ['Passed with warnings', report.summary.routes_with_warnings, report.summary.routes_with_warnings ? 'warn' : '', 'warnings'], ['Failed', report.summary.failed_pages, report.summary.failed_pages ? 'bad' : 'good', 'failed'], ['Auth issues', authIssues, authIssues ? 'auth' : '', 'auth'], ['Access / challenges', accessIssues, accessIssues ? 'warn' : '', 'access'], ['Not tested', notTested, notTested ? 'warn' : 'good', 'not-tested'], ['Unique APIs observed', report.summary.unique_apis || 0, '', 'apis'], ['API failures', report.summary.api_failures, report.summary.api_failures ? 'bad' : 'good', 'api-failures'], ['Resources observed', report.summary.unique_resources || 0, '', 'resources'], ['Resource failures', report.summary.resource_failures, report.summary.resource_failures ? 'warn' : 'good', 'resource-failures'], ['Console issues', report.summary.console_failures || 0, report.summary.console_failures ? 'warn' : 'good', 'console'], ['Slow routes', report.summary.slow_pages, report.summary.slow_pages ? 'warn' : 'good', 'slow'], ['Read-only blocks', report.summary.read_only_blocks, report.summary.read_only_blocks ? 'warn' : 'good', 'read-only'], ['Security recommendations', report.summary.security_recommendations || 0, report.summary.security_recommendations ? 'warn' : 'good', 'security'], ['Scan duration', duration, '', 'validated'],
   ];
   byId('summary').innerHTML = summaryMetrics.map(([label, value, kind, action]) => `<button type="button" class="metric ${kind}" data-summary-action="${action}" aria-label="Show ${escapeHtml(label)} evidence"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></button>`).join('');
   byId('summary').querySelectorAll('[data-summary-action]').forEach((button) => button.addEventListener('click', () => activateSummary(button.dataset.summaryAction, button.querySelector('strong').textContent, button)));
+  byId('summary').querySelector('[data-summary-action="access"]').title = 'Access restrictions and challenges limit application coverage. They do not establish that credentials are required or that the application failed.';
   const coverage = report.coverage || {};
   const coverageStatus = coverage.coverage_status || coverage.scan_completeness || 'UNKNOWN';
   const executionStatus = coverage.execution_status || 'FINISHED';
-  byId('coverage').innerHTML = `<strong>Coverage: ${escapeHtml(coverageStatus)}</strong><span>Execution: ${escapeHtml(executionStatus)}. ${escapeHtml(terminationMessage(coverage))}</span>`;
+  const accessExplanation = accessIssues ? ` Access restrictions/challenges limited application coverage for ${accessIssues} route${accessIssues === 1 ? '' : 's'}. These responses do not establish an authentication requirement or application failure.` : '';
+  byId('coverage').innerHTML = `<strong>Coverage: ${escapeHtml(coverageStatus)}</strong><span>Execution: ${escapeHtml(executionStatus)}. ${escapeHtml(terminationMessage(coverage))}${escapeHtml(accessExplanation)}</span>`;
   byId('scan-diagnostics-content').innerHTML = `${detailSection('Effective scan configuration', report.scan_configuration || report.scan_config || {})}${detailSection('Scan timing breakdown', report.scan_timing || report.scan_timings || {})}`;
   byId('raw-report').textContent = JSON.stringify(report, null, 2);
   activeDrilldown = 'all';
@@ -930,6 +944,13 @@ function setupScrollSync() {
 
 function refreshScrollSync() {
   window.requestAnimationFrame(() => scrollSynchronizers.forEach((item) => item.update()));
+}
+
+if (!byId('result-filter').querySelector('option[value="access"]')) {
+  const option = document.createElement('option');
+  option.value = 'access';
+  option.textContent = 'Access / challenges';
+  byId('result-filter').append(option);
 }
 
 if (!byId('api-route-filter')) {

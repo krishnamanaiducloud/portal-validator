@@ -108,7 +108,7 @@ class NavigationTracker:
         return redirects
 
 
-def auth_protocol_signal(url: str) -> bool:
+def auth_protocol_signal(url: str, *, boundary_only: bool = False) -> bool:
     parsed = urlparse(url)
 
     def populated_keys(query: str) -> set[str]:
@@ -128,8 +128,18 @@ def auth_protocol_signal(url: str) -> bool:
     }
     callback = bool({"code", "id_token", "error"} & keys and "state" in keys)
     authorization = "client_id" in keys and bool({"redirect_uri", "response_type"} & keys)
+    path_signal = bool(path_tokens & AUTH_PATH_MARKERS)
+    if boundary_only:
+        # Protocol words inside a public documentation/audit route are weak
+        # navigation hints, not evidence that the application requires login.
+        # Keep explicit login endpoints and populated protocol parameters.
+        login_endpoints = {"login", "signin", "sign-in", "log-in"}
+        path_signal = any(
+            path.rstrip("/").rsplit("/", 1)[-1].lower() in login_endpoints
+            for path in (parsed.path, fragment_path)
+        )
     return bool(
-        {"samlrequest", "samlresponse"} & keys or path_tokens & AUTH_PATH_MARKERS
+        {"samlrequest", "samlresponse"} & keys or path_signal
         or authorization or callback
     )
 
@@ -243,14 +253,12 @@ async def settle_authentication_navigation(
             not portal_scoped and is_approved_authentication_host is not None
             and is_approved_authentication_host(normalized_host(urlparse(current_url).hostname or ""))
         )
-        auth_surface = auth_protocol_signal(current_url) or approved_external_identity
+        auth_surface = auth_protocol_signal(current_url, boundary_only=portal_scoped) or approved_external_identity
         active = active or auth_surface
-        if portal_scoped and not auth_surface:
-            return result("APPLICATION", completed=True)
-        if not auth_surface and not portal_scoped:
-            # An active chain is not permission to treat every unrelated page as
-            # authentication. A protocol auto-post form is concrete bridge evidence.
-            protocol_form = active and await page.evaluate("""() => Array.from(document.forms).some(form => {
+        if active and not auth_surface:
+            # A protocol auto-post form is concrete bridge evidence both inside
+            # and outside portal scope. Observe it; never submit it ourselves.
+            auth_surface = await page.evaluate("""() => Array.from(document.forms).some(form => {
                 if (form.method.toUpperCase() !== 'POST') return false;
                 const fields = new Map(Array.from(form.elements)
                     .filter(field => field.name && typeof field.value === 'string' && field.value.trim())
@@ -258,8 +266,11 @@ async def settle_authentication_navigation(
                 return fields.has('samlrequest') || fields.has('samlresponse') ||
                     (fields.has('state') && (fields.has('code') || fields.has('id_token')));
             })""")
-            if not protocol_form:
-                return result("OUTSIDE_PORTAL")
+        if portal_scoped and not auth_surface:
+            return result("APPLICATION", completed=True)
+        if not auth_surface and not portal_scoped:
+            # An active chain alone does not authorize an unrelated destination.
+            return result("OUTSIDE_PORTAL")
         if not active:
             return result("OUTSIDE_PORTAL")
         remaining_ms = (deadline - time.perf_counter()) * 1000
@@ -287,14 +298,14 @@ def classify_authentication(
     mfa_form: bool = False,
     access_restricted: bool = False,
 ) -> str:
-    auth_surface = password_form or auth_protocol_signal(final_url)
+    auth_surface = password_form or auth_protocol_signal(final_url, boundary_only=target_in_scope)
     if error_classification:
         if error_classification == "TIMEOUT" and auth_surface:
             return "AUTH_TIMEOUT"
         return error_classification
     if status == 401:
         return "AUTH_REQUIRED" if authentication_mode == "none" else "AUTH_FAILED"
-    if status == 403 or access_restricted:
+    if status in {403, 429} or access_restricted:
         return "ACCESS_RESTRICTED"
     if mfa_form:
         return "MFA_REQUIRED"

@@ -126,7 +126,7 @@ SECURITY_HEADERS = (
 COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
     "ac", "co", "com", "edu", "gov", "net", "org",
 })
-VALIDATOR_VERSION = "1.12.2"
+VALIDATOR_VERSION = "1.12.3"
 REPORT_SCHEMA_VERSION = "2.3"
 
 
@@ -582,17 +582,28 @@ async def detect_auth_signals(page) -> tuple[bool, bool]:
             const style = getComputedStyle(input);
             const rect = input.getBoundingClientRect();
             return !input.disabled && input.type !== 'hidden' &&
+              !input.closest('[hidden], [inert], [aria-hidden="true"]') &&
               style.visibility !== 'hidden' && style.display !== 'none' &&
               rect.width > 0 && rect.height > 0;
           };
           const inputs = Array.from(document.querySelectorAll('input')).filter(visible);
+          // An optional header/sidebar sign-in widget must not hide an already
+          // available public main surface. Be conservative: require visible
+          // content with multiple main-area navigation links, outside the form.
+          const publicMain = Array.from(document.querySelectorAll('main, [role="main"]'))
+            .filter(main => visible(main) && (main.innerText || '').trim().length >= 40 &&
+              Array.from(main.querySelectorAll('a[href]')).filter(visible).length >= 2);
+          const optionalWidget = input => input.closest('header, nav, aside, footer') &&
+            !input.closest('dialog, [role="dialog"], [aria-modal="true"]') &&
+            !document.querySelector('dialog[open], [aria-modal="true"]') &&
+            publicMain.some(main => !main.contains(input));
           const codeLabel = input => [input.name, input.id, input.getAttribute('aria-label'),
             ...Array.from(input.labels || [], label => label.textContent),
             ...(input.getAttribute('aria-labelledby') || '').split(/\\s+/)
               .map(id => document.getElementById(id)?.textContent || '')
           ].filter(Boolean).join(' ');
           return {
-            password: inputs.some(input => input.type === 'password'),
+            password: inputs.some(input => input.type === 'password' && !optionalWidget(input)),
             mfa: inputs.some(input => input.autocomplete === 'one-time-code' || (
               /(?:^|[^a-z])(?:otp|mfa|totp|one[ -]?time[ -]?(?:code|password)|verification[ -]?code|authentication[ -]?code)(?:$|[^a-z])/i
                 .test(codeLabel(input))
@@ -857,7 +868,10 @@ async def execute_scan(
             raise HTTPException(400, exc.public_message) from exc
         credential_hosts.add(host)
 
-    await publish_progress("AUTHENTICATING")
+    # Anonymous validation does not imply that the destination needs credentials.
+    # Actual login/SSO evidence is still evaluated after browser navigation.
+    if req.authentication.mode != "none":
+        await publish_progress("AUTHENTICATING")
     try:
         authentication_manager = build_authentication_manager(
             mode=req.authentication.mode,

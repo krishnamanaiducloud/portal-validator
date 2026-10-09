@@ -19,13 +19,14 @@ from app.security import sanitize_text, sanitize_url
 
 PASS_OUTCOMES = frozenset({"PASS", "PASS_WITH_WARNINGS"})
 AUTH_OUTCOMES = frozenset({
-    "ACCESS_RESTRICTED", "AUTH_FAILED", "AUTH_REQUIRED", "AUTH_TIMEOUT",
+    "AUTH_FAILED", "AUTH_REQUIRED", "AUTH_TIMEOUT",
     "MFA_REQUIRED", "SESSION_EXPIRED",
 })
+ACCESS_OUTCOMES = frozenset({"ACCESS_RESTRICTED", "CHALLENGE_REQUIRED"})
 LIMITED_OUTCOMES = frozenset({
-    "CHALLENGE_REQUIRED", "DISCOVERED_BUT_NOT_SAFELY_ACTIVATABLE",
+    "DISCOVERED_BUT_NOT_SAFELY_ACTIVATABLE",
     "DISCOVERY_LIMITATION", "DOWNLOAD_OBSERVED",
-})
+}) | ACCESS_OUTCOMES
 FAILURE_OUTCOMES = frozenset({
     "TLS_ERROR",
     "DNS_ERROR",
@@ -165,7 +166,19 @@ def build_findings(
                 resource_failure.get("error") or "A page resource failed to load.",
                 resource=resource,
             ))
-    if status is not None and status >= 400:
+    if status in {403, 429}:
+        items.append(finding(
+            "HTTP_ACCESS_RESTRICTED" if status == 403 else "HTTP_RATE_LIMITED",
+            "INFO",
+            (
+                "Main document returned HTTP 403 and denied access. The reason for the restriction "
+                "was not established; application coverage is limited."
+                if status == 403 else
+                "Main document returned HTTP 429 and rate-limited access. Application coverage "
+                "is limited; this response does not establish an authentication requirement."
+            ),
+        ))
+    elif status is not None and status >= 400:
         if classification in AUTH_OUTCOMES:
             items.append(finding(
                 "AUTHENTICATION_REQUIRED",
@@ -179,6 +192,20 @@ def build_findings(
                 f"Main document returned HTTP {status}.",
                 blocking=True,
             ))
+    if classification == "CHALLENGE_REQUIRED":
+        items.append(finding(
+            "ACCESS_CHALLENGE",
+            "INFO",
+            "An access challenge was observed instead of validated application content. "
+            "Application coverage is limited; the challenge's cause was not established.",
+        ))
+    elif classification == "ACCESS_RESTRICTED" and status not in {403, 429}:
+        items.append(finding(
+            "ACCESS_RESTRICTED",
+            "INFO",
+            "The target restricted browser access. Application coverage is limited; "
+            "the reason for the restriction was not established.",
+        ))
     if error and not any(item["type"] == "MAIN_DOCUMENT_FAILED" for item in items):
         items.append(finding(
             "NAVIGATION_FAILURE",
@@ -335,13 +362,15 @@ def classify_page_result(
             base_classification = classify_navigation_error(error)
         elif status == 401:
             base_classification = "AUTH_REQUIRED"
-        elif status == 403:
+        elif status in {403, 429}:
             base_classification = "ACCESS_RESTRICTED"
         elif status is not None and status >= 400:
             base_classification = "HTTP_ERROR"
         else:
             base_classification = "PASS"
 
+    if base_classification == "PASS" and render_classification:
+        base_classification = render_classification
     structured_findings = build_findings(
         classification=base_classification,
         status=status,
@@ -354,8 +383,6 @@ def classify_page_result(
         failed_resources=failed_resources,
         additional_findings=additional_findings,
     )
-    if base_classification == "PASS" and render_classification:
-        base_classification = render_classification
     classification = determine_page_outcome(base_classification, structured_findings)
     warning_reasons = structured_warning_reasons(classification, structured_findings)
     page_load_status = (
@@ -412,7 +439,10 @@ def classify_page_result(
         )
     )
     finding_types = {item["type"] for item in structured_findings}
-    api_status = _api_validation_status(structured_findings, loaded=loaded)
+    api_status = (
+        "NOT_TESTED" if classification in ACCESS_OUTCOMES else
+        _api_validation_status(structured_findings, loaded=loaded)
+    )
     resource_status = (
         "WARNING" if finding_types & {"RESOURCE_FAILED", "RESOURCE_SKIPPED"} else
         "PASS" if loaded else "NOT_TESTED"
@@ -428,7 +458,7 @@ def classify_page_result(
     )
     authentication_status = (
         classification if classification in AUTH_OUTCOMES else
-        "CHALLENGE_REQUIRED" if classification == "CHALLENGE_REQUIRED" else
+        "NOT_TESTED" if classification in ACCESS_OUTCOMES else
         "PASS" if loaded else "NOT_TESTED"
     )
     failure_reason, failure_dimension, failure_details = failure_metadata(
@@ -471,6 +501,19 @@ def classify_page_result(
         ),
         "render_status": render_status,
         "authentication_status": authentication_status,
+        "access_status": (
+            classification if classification in ACCESS_OUTCOMES else
+            "NO_RESTRICTION_OBSERVED" if loaded and classification in PASS_OUTCOMES else
+            "NOT_TESTED"
+        ),
+        "coverage_detail": (
+            "An access challenge was observed instead of validated application content. "
+            "Application coverage is limited; the challenge's cause was not established."
+            if classification == "CHALLENGE_REQUIRED" else
+            "The target restricted browser access. Application coverage is limited; "
+            "an authentication requirement was not established."
+            if classification == "ACCESS_RESTRICTED" else None
+        ),
         "api_status": api_status,
         "resource_status": resource_status,
         "console_status": console_status,
@@ -570,7 +613,10 @@ def refresh_route_api_health(
         "failure_dimension": failure_dimension,
         "failure_details": failure_details,
         "api_requests": list(events),
-        "api_status": _api_validation_status(items, loaded=loaded),
+        "api_status": (
+            "NOT_TESTED" if classification in ACCESS_OUTCOMES else
+            _api_validation_status(items, loaded=loaded)
+        ),
         "api_failures": len(failed_events),
         "failed_api_count": len(failed_events),
         "failed_required_api_count": required_failures,
@@ -631,12 +677,9 @@ def aggregate_report(
     for result in results:
         classification = result["classification"]
         if classification in AUTH_OUTCOMES:
-            coverage_reasons[
-                "ACCESS_RESTRICTED" if classification == "ACCESS_RESTRICTED"
-                else "AUTHENTICATION_INCOMPLETE"
-            ] += 1
-        elif classification == "CHALLENGE_REQUIRED":
-            coverage_reasons["CHALLENGE_REQUIRED"] += 1
+            coverage_reasons["AUTHENTICATION_INCOMPLETE"] += 1
+        elif classification in ACCESS_OUTCOMES:
+            coverage_reasons[classification] += 1
         elif classification in LIMITED_OUTCOMES:
             coverage_reasons["DISCOVERY_LIMITATION"] += 1
         elif result["page_load_status"] != "LOADED" or classification in {
@@ -733,6 +776,9 @@ def aggregate_report(
         "healthy_routes": passed_pages,
         "routes_with_warnings": classification_counts["PASS_WITH_WARNINGS"],
         "auth_issues": sum(classification_counts[item] for item in AUTH_OUTCOMES),
+        "access_issues": sum(classification_counts[item] for item in ACCESS_OUTCOMES),
+        "access_restricted_pages": classification_counts["ACCESS_RESTRICTED"],
+        "challenge_required_pages": classification_counts["CHALLENGE_REQUIRED"],
         "api_failures": sum(int(result.get("api_failures", 0)) for result in results),
         "post_summary": summarize_post_observation(list(observed_api_requests.values())),
         "post_diagnostics": summarize_post_diagnostics(list(observed_api_requests.values())),

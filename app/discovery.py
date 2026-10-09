@@ -55,6 +55,7 @@ SENSITIVE_QUERY_KEYS = frozenset({
     "authorization_code", "client_secret", "code", "code_challenge", "code_verifier",
     "id_token", "key", "password", "passwd", "refresh_token", "relaystate",
     "samlrequest", "samlresponse", "secret", "session", "session_id", "state", "token",
+    "__cf_chl_rt_tk", "__cf_chl_tk", "challenge_token", "captcha_token",
 })
 DANGEROUS_CONTROL_WORDS = frozenset({
     "add", "approve", "buy", "cancel", "checkout", "confirm", "create", "delete",

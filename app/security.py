@@ -46,6 +46,10 @@ SENSITIVE_KEYS = frozenset({
     "storage_state",
     "localstorage",
     "sessionstorage",
+    "__cf_chl_rt_tk",
+    "__cf_chl_tk",
+    "challenge_token",
+    "captcha_token",
 })
 URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{4,})?\b")
@@ -57,7 +61,8 @@ HEADER_LINE_RE = re.compile(
 SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(token|access_token|refresh_token|id_token|code|authorization_code|"
     r"client_secret|api_key|apikey|password|passwd|secret|assertion|SAMLResponse|"
-    r"SAMLRequest|session|session_id|code_verifier|code_challenge|state)"
+    r"SAMLRequest|session|session_id|code_verifier|code_challenge|state|"
+    r"__cf_chl_rt_tk|__cf_chl_tk|challenge_token|captcha_token)"
     r"(\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^,;\s&}\]]+)"
 )
 PRIVATE_KEY_RE = re.compile(
