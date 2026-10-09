@@ -11,6 +11,12 @@ def test_route_limit_has_one_request_scoped_default():
     assert ScanRequest(target="https://portal.example.com").max_pages == 50
 
 
+def test_route_limit_allows_1500_but_rejects_unbounded_values():
+    assert ScanRequest(target="https://portal.example.com", max_pages=1500).max_pages == 1500
+    with pytest.raises(ValueError):
+        ScanRequest(target="https://portal.example.com", max_pages=1501)
+
+
 def test_bearer_provider_normalizes_scheme_and_uses_exact_credential_scope():
     manager = build_authentication_manager(
         mode="bearer",

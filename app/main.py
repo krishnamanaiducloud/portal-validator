@@ -126,7 +126,7 @@ SECURITY_HEADERS = (
 COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
     "ac", "co", "com", "edu", "gov", "net", "org",
 })
-VALIDATOR_VERSION = "1.12.3"
+VALIDATOR_VERSION = "1.12.4"
 REPORT_SCHEMA_VERSION = "2.3"
 
 
@@ -222,7 +222,9 @@ class ApprovedReadPostOperation(BaseModel):
 class ScanRequest(BaseModel):
     model_config = {"frozen": True}
     target: str = Field(min_length=1, max_length=4096)
-    max_pages: int = Field(50, ge=1, le=250)
+    # Keep the safe default conservative while allowing large portals to opt in
+    # to the full bounded discovery budget from the UI/API.
+    max_pages: int = Field(50, ge=1, le=1500)
     max_depth: int = Field(3, ge=0, le=10)
     max_redirects: int = Field(10, ge=0, le=30)
     timeout_ms: int = Field(15000, ge=1000, le=120000)

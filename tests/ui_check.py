@@ -33,6 +33,7 @@ async def main():
         assert await page.locator("#auth-mode option").count() == 6
         assert await page.locator("#redirects").input_value() == "10"
         assert await page.locator("#pages").input_value() == "50"
+        assert await page.locator("#pages").get_attribute("max") == "1500"
         assert "Maximum time / route" in await page.locator("#timeout").evaluate("element => element.closest('label').textContent")
         assert await page.locator("#min-observation").input_value() == "500"
         assert await page.locator("#network-quiet").input_value() == "300"

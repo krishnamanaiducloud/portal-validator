@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.12.3 is a read-only browser health validator with optional authentication for public,
+Portal Validator 1.12.4 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -268,10 +268,10 @@ runs as UID/GID 10001 while supporting an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.12.3 .
+docker build -t mohankrishna999/portal-validator:1.12.4 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.3 \
-  -t mohankrishna999/portal-validator:1.12.3-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.4 \
+  -t mohankrishna999/portal-validator:1.12.4-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -286,7 +286,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.12.3
+  mohankrishna999/portal-validator:1.12.4
 ```
 
 ## OpenShift
@@ -387,9 +387,10 @@ HTTP status as independent evidence. Client-only transitions display
 The portal-health summary also reports discovered, eligible, queued, validated,
 skipped, and not-tested routes with `COMPLETE`, `PARTIAL`, `FAILED`, or
 `CANCELLED` coverage
-and an explicit termination reason. The default maximum is 50 routes and the
-request-scoped `max_pages` value limits routes actually validated rather than
-routes discovered. Terminal counters follow `discovered = validated +
+and an explicit termination reason. The default maximum is 50 routes; the
+request-scoped `max_pages` value may be raised to a bounded maximum of 1,500
+routes and limits routes actually validated rather than routes discovered.
+Terminal counters follow `discovered = validated +
 not_tested + skipped`; unexecuted routes carry an explicit reason. Summary cards
 drill into route, API, resource, security, and coverage evidence.
 
@@ -493,6 +494,11 @@ redacted or excluded at the centralized logging boundary.
 - `ACCESS_RESTRICTED`: the server returned HTTP 403, HTTP 429, or an equivalent
   restricted result. This does not establish a login requirement. Confirm
   owner-approved access and rate limits; application coverage is incomplete.
+  A personal browser may succeed because it has a solved challenge, cookies,
+  account state, browser reputation, or a different egress IP. Use an
+  owner-approved mounted Playwright storage profile when the portal requires
+  that session; the validator does not bypass access controls or replay a
+  workstation browser session automatically.
 - `CHALLENGE_REQUIRED`: an access challenge was observed. It is not bypassed,
   not counted as an authentication failure, and does not prove portal health.
 - `DNS_ERROR`: a destination did not resolve. Check cluster DNS and the exact
