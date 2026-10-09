@@ -7,8 +7,10 @@ from urllib.parse import urlparse
 
 from app.navigation import classify_navigation_error
 from app.network import (
+    classify_post_observation,
     public_policy_classification,
     safe_api_identity,
+    summarize_post_diagnostics,
     summarize_post_observation,
     summarize_route_api_coverage,
 )
@@ -733,6 +735,7 @@ def aggregate_report(
         "auth_issues": sum(classification_counts[item] for item in AUTH_OUTCOMES),
         "api_failures": sum(int(result.get("api_failures", 0)) for result in results),
         "post_summary": summarize_post_observation(list(observed_api_requests.values())),
+        "post_diagnostics": summarize_post_diagnostics(list(observed_api_requests.values())),
         "resource_failures": sum(int(result.get("resource_failure_count", 0)) for result in results),
         "console_failures": sum(
             len(result.get("console_errors", [])) + len(result.get("page_errors", []))
@@ -846,6 +849,7 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 "approved_read_only_calls": 0,
                 "executed_approved_calls": 0,
                 "failed_calls": 0,
+                "failure_count": 0,
                 "canceled_calls": 0,
                 "incomplete_calls": 0,
                 "business_success_calls": 0,
@@ -873,12 +877,25 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 "importance": Counter(),
                 "traffic_categories": Counter(),
                 "traffic_roles": Counter(),
+                "post_classifications": Counter(),
+                "response_statuses": Counter(),
+                "authentication_classifications": Counter(),
             })
             item["calls"] += 1
             item["observed_calls"] += 1
             post_summary = summarize_post_observation([event])
             item["approved_read_only_calls"] += post_summary["approved_read_only_calls"]
             item["executed_approved_calls"] += post_summary["executed_approved_calls"]
+            item["post_classifications"].update(classify_post_observation(event))
+            request_classification = str(event.get("request_classification") or "")
+            authentication_classification = (
+                "AUTH_BOOTSTRAP" if request_classification == "AUTH_FLOW" else
+                "SESSION_REFRESH" if request_classification == "SESSION_REFRESH" else
+                "AUTHENTICATION_ATTEMPT"
+                if str(event.get("phase") or "").upper() == "AUTHENTICATION" else
+                "NOT_AUTHENTICATION"
+            )
+            item["authentication_classifications"][authentication_classification] += 1
             role = str(event.get("traffic_role") or event.get("traffic_category") or "UNCLASSIFIED_API")
             item["traffic_roles"][role] += 1
             canceled = bool(event.get("request_canceled"))
@@ -924,8 +941,13 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 else event.get("allowed_by_policy", True)
             )
             status = event.get("status")
+            item["failure_count"] += not canceled and bool(
+                (isinstance(status, int) and 400 <= status < 600)
+                or event.get("error") or event.get("request_failed")
+            )
             if isinstance(status, int) and 200 <= status < 600:
                 item[f"status_{status // 100}xx"] += 1
+                item["response_statuses"][str(status)] += 1
             if canceled:
                 item["failure_classifications"]["REQUEST_CANCELED"] += 1
             elif event.get("error") and not isinstance(status, int):
@@ -959,6 +981,9 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
         importance = dict(item.pop("importance"))
         traffic_categories = dict(item.pop("traffic_categories"))
         traffic_roles = dict(item.pop("traffic_roles"))
+        post_classifications = dict(item.pop("post_classifications"))
+        response_statuses = dict(item.pop("response_statuses"))
+        authentication_classifications = dict(item.pop("authentication_classifications"))
         target_failures = item["status_4xx"] + item["status_5xx"] + item["network_failures"] + item["response_body_failures"]
         status_counts = {
             "2xx": item["status_2xx"],
@@ -995,6 +1020,11 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 public_policy_classification(name) for name in classifications
             }),
             "classification_counts": classifications,
+            "post_classifications": sorted(post_classifications),
+            "post_classification_counts": post_classifications,
+            "response_status_counts": response_statuses,
+            "authentication_classifications": sorted(authentication_classifications),
+            "authentication_classification_counts": authentication_classifications,
             "block_reasons": block_reasons,
             "importance_counts": importance,
             "traffic_categories": traffic_categories,
@@ -1008,6 +1038,10 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             "status_counts": status_counts,
             "target_failure_count": target_failures,
             "observation_outcome": observation_outcome,
+            "observation_status": (
+                "BLOCKED_BY_POLICY" if observation_outcome == "BLOCKED_BY_VALIDATOR"
+                else observation_outcome
+            ),
             "health": (
                 "FAILED" if item["status_5xx"] or item["network_failures"] else
                 "DEGRADED" if item["status_4xx"] or item["response_body_failures"] else

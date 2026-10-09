@@ -125,8 +125,18 @@ const authOutcomes = new Set(['ACCESS_RESTRICTED','AUTH_REQUIRED','AUTH_FAILED',
 const passOutcomes = new Set(['PASS','PASS_WITH_WARNINGS']);
 const terminalStates = new Set(['COMPLETED','PARTIAL','FAILED','CANCELLED']);
 const numericRouteKeys = new Set(['status','load_ms','api_failures','resource_failure_count','console_count','warning_findings']);
-const numericApiKeys = new Set(['calls','status_2xx','status_3xx','status_4xx','status_5xx','network_failures','route_count','allowed_calls','blocked_count','application_bootstrap_phase_count','authentication_phase_count','route_validation_phase_count','session_refresh_phase_count','average_duration_ms','worst_duration_ms']);
+const numericApiKeys = new Set(['calls','status_2xx','status_3xx','status_4xx','status_5xx','network_failures','route_count','allowed_calls','blocked_count','application_bootstrap_phase_count','authentication_phase_count','route_validation_phase_count','session_refresh_phase_count','average_duration_ms','worst_duration_ms','failure_count']);
 const numericResourceKeys = new Set(['transfer_size_bytes','encoded_body_size_bytes','decoded_body_size_bytes','duration_ms','status']);
+const postDiagnosticFields = [
+  ['total_http_requests_observed','Total HTTP requests observed'],
+  ['post_requests_observed','POST requests observed'],
+  ['post_requests_allowed','POST requests allowed'],
+  ['post_requests_blocked','POST requests blocked'],
+  ['approved_read_only_post_endpoints','Approved read-only POST endpoints'],
+  ['unverified_post_endpoints','Unverified POST endpoints'],
+  ['post_requests_without_completed_responses','POST requests without completed responses'],
+  ['unique_post_endpoints_reported','Unique POST endpoints reported'],
+];
 
 // Preferences contain column names only, never scan data or credentials. Unknown
 // keys default to visible, so a newly introduced column is not silently hidden.
@@ -150,9 +160,14 @@ const tableColumns = {
     ['session_refresh_phase_count','Refresh Calls','Recognized authentication/session/token-refresh calls; ordinary route calls are not refresh traffic.'],
     ['average_duration_ms','Average Time (ms)','Mean actual completed API response duration in milliseconds; excludes blocked and no-response calls.'],
     ['worst_duration_ms','Worst Time (ms)','Maximum actual completed API response duration in milliseconds.'],
-    ['observation_outcome','Health','Aggregated API health; policy-blocked-only calls are NOT_EXECUTED.'],
+    ['observation_outcome','Health','Observed lifecycle/health; blocked attempts remain visible as BLOCKED_BY_POLICY, not target failures.'],
     ['traffic_role','Traffic role','Evidence-based authentication, challenge, configuration, business, or unclassified traffic; independent of request authorization.'],
     ['policies','Policy','Observed read-only approval/block decisions. No bodies are retained; explicit GraphQL query rules inspect operation types in memory.'],
+    ['response_status_counts','Response status','Actual observed HTTP response codes and their call counts. N/A means no HTTP response was observed.'],
+    ['failure_count','Failures','Observed target HTTP, network, and response-body failures; excludes validator blocks and canceled requests.'],
+    ['routes_using_endpoint','Associated routes','Logical portal routes or UI views on which this endpoint was naturally observed.'],
+    ['authentication_classifications','Auth classification','Observed authentication-bootstrap/session-refresh purpose; independent of read-only approval and target health.'],
+    ['post_classifications','POST classification','Evidence-based POST observation, approval, blocking, authentication, and network-failure labels. Multiple labels can apply to one call.'],
   ],
   route: [
     ['classification','Status','PASS and PASS_WITH_WARNINGS both count as healthy routes.'],
@@ -627,7 +642,7 @@ function updateApiRouteFilter(inventory) {
 function updateApiMethodFilter(inventory) {
   const select = byId('api-method-filter');
   const current = select.value;
-  const methods = [...new Set(['GET','POST',...inventory.map((item) => item.method).filter(Boolean)])].sort();
+  const methods = [...new Set(['GET','HEAD','POST','PUT','PATCH','DELETE','OPTIONS',...inventory.map((item) => item.method).filter(Boolean)])].sort();
   select.innerHTML = `<option value="all">All methods</option>${methods.map((method) => `<option value="${escapeHtml(method)}">${escapeHtml(method)}</option>`).join('')}`;
   if (methods.includes(current)) select.value = current;
 }
@@ -647,6 +662,12 @@ function renderApiInventory() {
     const value = Number.isFinite(posts[key]) ? posts[key] : 'Not recorded';
     byId(`post-summary-${key}`).textContent = String(value);
     byId(`post-summary-${key}`).setAttribute('aria-label', `${label}: ${value}`);
+  });
+  const diagnostics = lastReport?.summary?.post_diagnostics || {};
+  postDiagnosticFields.forEach(([key,label]) => {
+    const value = Number.isFinite(diagnostics[key]) ? diagnostics[key] : 'Not recorded';
+    byId(`post-diagnostic-${key}`).textContent = String(value);
+    byId(`post-diagnostic-${key}`).setAttribute('aria-label', `${label}: ${value}`);
   });
   const roleFilter = byId('api-role-filter');
   const previousRole = roleFilter.value;
@@ -681,15 +702,21 @@ function renderApiInventory() {
     // The observation outcome distinguishes a blocked attempt from a sent
     // request that was canceled or remained incomplete. Legacy aggregate
     // health must not erase that execution evidence.
-    const healthLabel = outcome;
+    const healthLabel = item.observation_status || outcome;
     const numbers = [item.calls,item.status_2xx,item.status_3xx,item.status_4xx,item.status_5xx,item.network_failures,item.route_count,item.allowed_calls ?? Math.max(0, Number(item.calls || 0) - Number(item.blocked_count || 0)),item.blocked_count || 0,item.application_bootstrap_phase_count || 0,item.authentication_phase_count || 0,item.route_validation_phase_count ?? item.validation_phase_count ?? 0,item.session_refresh_phase_count || 0,item.average_duration_ms ?? 'N/A',item.worst_duration_ms ?? 'N/A'];
     const policies = apiDisplayPolicies(item);
-    return `<tr><td><strong>${escapeHtml(item.method)}</strong></td><td>${escapeHtml(item.host)}</td><td><button class="api-endpoint" type="button" data-api-index="${index}" title="${escapeHtml(item.endpoint)}">${escapeHtml(item.endpoint)}</button></td>${numbers.map((value) => `<td>${escapeHtml(value)}</td>`).join('')}<td><span class="dimension-state ${statusClass(healthLabel)}">${escapeHtml(healthLabel)}</span></td><td class="api-role-cell">${escapeHtml(item.traffic_role || 'UNCLASSIFIED')}</td><td class="api-policy-cell">${escapeHtml(policies.join(', ') || 'N/A')}</td></tr>`;
-  }).join('') || `<tr><td colspan="21" class="empty-table">${method === 'POST' && !inventory.some((item) => item.method === 'POST') ? 'No POST requests were observed for this scan.' : failedOnly || policy === 'target-failures' ? 'No target API failures match these filters.' : 'No API requests match these filters.'}</td></tr>`;
+    const statusCodes = Object.entries(item.response_status_counts || {}).map(([status,count]) => `${status} (${count})`).join(', ') || 'N/A';
+    const failureCount = item.failure_count ?? item.target_failure_count ?? (Number(item.status_4xx || 0) + Number(item.status_5xx || 0) + Number(item.network_failures || 0) + Number(item.response_body_failures || 0));
+    const routeNames = (item.routes_using_endpoint || []).map((identity) => {
+      const matched = (lastReport?.results || []).find((result) => [result.route_id,result.normalized_route_identity,result.canonical_route,result.url].includes(identity));
+      return matched?.route_name || matched?.route_label || identity;
+    }).join(', ') || 'Not attributed';
+    return `<tr><td><strong>${escapeHtml(item.method)}</strong></td><td>${escapeHtml(item.host)}</td><td><button class="api-endpoint" type="button" data-api-index="${index}" title="${escapeHtml(item.endpoint)}">${escapeHtml(item.endpoint)}</button></td>${numbers.map((value) => `<td>${escapeHtml(value)}</td>`).join('')}<td><span class="dimension-state ${statusClass(outcome)}">${escapeHtml(healthLabel)}</span></td><td class="api-role-cell">${escapeHtml(item.traffic_role || 'UNCLASSIFIED')}</td><td class="api-policy-cell">${escapeHtml(policies.join(', ') || 'N/A')}</td><td class="api-response-status-cell">${escapeHtml(statusCodes)}</td><td class="api-failure-count-cell">${escapeHtml(failureCount)}</td><td class="api-associated-routes-cell">${escapeHtml(routeNames)}</td><td class="api-auth-class-cell">${escapeHtml((item.authentication_classifications || []).join(', ') || 'Not recorded')}</td><td class="api-post-class-cell">${escapeHtml((item.post_classifications || []).join(', ') || (item.method === 'POST' ? 'Not recorded' : 'N/A'))}</td></tr>`;
+  }).join('') || `<tr><td colspan="26" class="empty-table">${method === 'POST' && !inventory.some((item) => item.method === 'POST') ? 'No POST requests were observed for this scan.' : failedOnly || policy === 'target-failures' ? 'No target API failures match these filters.' : 'No API requests match these filters.'}</td></tr>`;
   byId('api-list').querySelectorAll('[data-api-index]').forEach((button) => button.addEventListener('click', () => {
     const item = visible[Number(button.dataset.apiIndex)];
     showEvidence(`${item.method} ${item.host}${item.endpoint}`, item);
-    byId('evidence-content').insertAdjacentHTML('afterbegin', inspectSection('Request lifecycle', {traffic_role:item.traffic_role || 'UNCLASSIFIED',traffic_roles:item.traffic_roles,observed:item.observed_calls ?? item.calls ?? null,allowed:item.allowed_calls ?? null,blocked:item.blocked_calls ?? item.blocked_count ?? null,sent:item.sent_calls ?? null,responded:item.responded_calls ?? null,completed:item.completed_calls ?? null,failed:item.failed_calls ?? null,canceled:item.canceled_calls ?? null,incomplete:item.incomplete_calls ?? null}));
+    byId('evidence-content').insertAdjacentHTML('afterbegin', inspectSection('Request lifecycle', {traffic_role:item.traffic_role || 'UNCLASSIFIED',traffic_roles:item.traffic_roles,observed:item.observed_calls ?? item.calls ?? null,allowed:item.allowed_calls ?? null,blocked:item.blocked_calls ?? item.blocked_count ?? null,sent:item.sent_calls ?? null,responded:item.responded_calls ?? null,completed:item.completed_calls ?? null,failed:item.failed_calls ?? null,canceled:item.canceled_calls ?? null,incomplete:item.incomplete_calls ?? null,observation_status:item.observation_status || item.observation_outcome,post_classifications:item.post_classifications,authentication_classifications:item.authentication_classifications,response_status_counts:item.response_status_counts,block_reasons:item.block_reasons}));
   }));
   refreshScrollSync();
 }
@@ -918,6 +945,14 @@ const apiRoleHeader = document.createElement('th');
 apiRoleHeader.textContent = 'Traffic role';
 document.querySelector('#api-table-wrap thead tr').append(apiRoleHeader);
 document.querySelector('#api-table-wrap thead tr').append(apiPolicyHeader);
+for (const [key,label] of tableColumns.api.slice(-5)) {
+  const header = document.createElement('th');
+  if (key === 'failure_count') {
+    header.setAttribute('aria-sort', 'none');
+    header.innerHTML = `<button type="button" data-api-sort="${key}">${label}</button>`;
+  } else header.textContent = label;
+  document.querySelector('#api-table-wrap thead tr').append(header);
+}
 const apiRoleLabel = document.createElement('label');
 apiRoleLabel.className = 'field';
 apiRoleLabel.innerHTML = '<span>Traffic role</span><select id="api-role-filter"><option value="all">All traffic</option></select>';
@@ -927,6 +962,11 @@ postSummary.className = 'api-post-summary';
 postSummary.setAttribute('aria-label', 'Observed POST request counts across the complete scan');
 postSummary.innerHTML = [['observed_calls','Observed POST'],['approved_read_only_calls','Approved read-only POST'],['executed_approved_calls','Executed approved POST']].map(([key,label]) => `<div><dt>${label}</dt><dd id="post-summary-${key}">Not recorded</dd></div>`).join('');
 document.querySelector('.api-tools').before(postSummary);
+const postDiagnostics = document.createElement('dl');
+postDiagnostics.className = 'api-post-summary';
+postDiagnostics.setAttribute('aria-label', 'HTTP and POST observation diagnostics across the complete scan');
+postDiagnostics.innerHTML = postDiagnosticFields.map(([key,label]) => `<div><dt>${label}</dt><dd id="post-diagnostic-${key}">Not recorded</dd></div>`).join('');
+postSummary.after(postDiagnostics);
 byId('api-policy-filter').insertAdjacentHTML('beforeend', '<option value="approved-post">Approved read-only POST</option><option value="target-failures">Target failures</option>');
 setupTableControls('route');
 setupTableControls('api');

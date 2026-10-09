@@ -16,6 +16,20 @@ from playwright.async_api import Error as PlaywrightError
 from app.security import DestinationError
 
 
+def _interception_is_gone(error: Exception, command: str) -> bool:
+    """Recognize only Chromium's exact already-disposed Fetch job response.
+
+    Chromium returns this protocol error when its interception job no longer
+    exists, for example after navigation canceled a paused response. Match at
+    the corresponding send call only: validator errors must never be ignored.
+    """
+    return (
+        isinstance(error, PlaywrightError)
+        and command in {"Fetch.continueRequest", "Fetch.failRequest"}
+        and str(error) == f"CDPSession.send: Protocol error ({command}): Invalid InterceptionId."
+    )
+
+
 class _BrowserTarget:
     def __init__(self, browser: Any) -> None:
         self.browser = browser
@@ -158,7 +172,14 @@ class RedirectResponseGuard:
                         await self.validate_destination(
                             destination, event["request"]["url"], self._metadata(event),
                         )
-            await self.session.send("Fetch.continueRequest", {"requestId": request_id})
+            try:
+                await self.session.send("Fetch.continueRequest", {"requestId": request_id})
+            except PlaywrightError as exc:
+                if _interception_is_gone(exc, "Fetch.continueRequest"):
+                    # Validation has already succeeded. Chromium disposed the
+                    # pause, so there is no unchecked request left to release.
+                    return
+                raise
         except asyncio.CancelledError:
             # Closing the page aborts paused requests; never release one unchecked.
             raise
@@ -173,9 +194,11 @@ class RedirectResponseGuard:
                     await self.session.send("Fetch.failRequest", {
                         "requestId": request_id, "errorReason": "BlockedByClient",
                     })
-                except PlaywrightError:
-                    if not self.page.is_closed():
+                except PlaywrightError as exc:
+                    if not _interception_is_gone(exc, "Fetch.failRequest") and not self.page.is_closed():
                         # An open page with a failed security command cannot continue.
+                        # An already-disposed job needs no abort; its policy
+                        # denial above remains reported without closing siblings.
                         await self.page.close()
 
     async def close(self) -> None:

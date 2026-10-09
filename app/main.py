@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 import weakref
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -73,6 +73,7 @@ from app.network import (
     load_read_only_policy,
     request_identity,
     safe_api_identity,
+    summarize_post_diagnostics,
     summarize_route_api_coverage,
     api_timeout_init_script,
     drain_pending_api_observations,
@@ -125,7 +126,7 @@ SECURITY_HEADERS = (
 COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
     "ac", "co", "com", "edu", "gov", "net", "org",
 })
-VALIDATOR_VERSION = "1.12.1"
+VALIDATOR_VERSION = "1.12.2"
 REPORT_SCHEMA_VERSION = "2.3"
 
 
@@ -1046,6 +1047,7 @@ async def execute_scan(
     cancellation_requested = False
     document_evidence: dict[tuple[str, str, int | None], dict[str, object]] = {}
     scan_api_events: list[dict] = []
+    scan_http_method_counts: Counter[str] = Counter()
     scan_resource_events: list[dict] = []
     network_drain: dict[str, object] | None = None
     session_expired = False
@@ -1123,6 +1125,7 @@ async def execute_scan(
                 frame_events: list[dict] = []
                 popup_routes: list[DiscoveredRoute] = []
                 request_started = weakref.WeakKeyDictionary()
+                observed_http_requests = weakref.WeakSet()
                 request_routes = weakref.WeakKeyDictionary()
                 request_observation = weakref.WeakKeyDictionary()
                 request_owners = weakref.WeakKeyDictionary()
@@ -1247,6 +1250,16 @@ async def execute_scan(
 
                 def record_request(request):
                     key = request_identity(request)
+                    # API inventory intentionally excludes ordinary documents/assets.
+                    # Count all HTTP activity separately, once per live browser request,
+                    # including requests intercepted before their request event arrives.
+                    if (
+                        not network_observer.finalized
+                        and key not in observed_http_requests
+                        and urlparse(request.url).scheme in {"http", "https"}
+                    ):
+                        observed_http_requests.add(key)
+                        scan_http_method_counts[request.method.upper()] += 1
                     if key in request_started:
                         ensure_api_observed(request)
                         return
@@ -2853,6 +2866,10 @@ async def execute_scan(
     )
     network_observation = {
         "final_drain": network_drain,
+        "total_http_requests_observed": sum(scan_http_method_counts.values()),
+        "http_methods_observed": dict(sorted(scan_http_method_counts.items())),
+        "api_requests_observed": len(scan_api_events),
+        # Backward-compatible API-only count, not a total HTTP traffic count.
         "observed_requests": len(scan_api_events),
         "observed_methods": sorted({event["method"] for event in scan_api_events}),
         "policy_evaluated": sum(bool(event.get("policy_evaluated")) for event in scan_api_events),
@@ -2874,6 +2891,14 @@ async def execute_scan(
     }
     if network_observation["observed_requests"] != network_observation["aggregated_requests"]:
         raise RuntimeError("Observed API request count does not reconcile with report inventory")
+    summary["post_diagnostics"] = summarize_post_diagnostics(
+        scan_api_events,
+        total_http_requests=network_observation["total_http_requests_observed"],
+    )
+    if summary["post_diagnostics"]["post_requests_observed"] != sum(
+        item["calls"] for item in api_inventory if item["method"] == "POST"
+    ):
+        raise RuntimeError("Observed POST request count does not reconcile with report inventory")
     for event in scan_api_events:
         event["serialized_to_report"] = True
     log_event(logging.INFO, "NETWORK_OBSERVATION_COMPLETED", scan_id=scan_id, **network_observation)
@@ -3035,6 +3060,11 @@ async def execute_scan(
             "read_only_enforced": True,
             "mutations_enabled": False,
             "service_worker_policy": "BLOCKED_TO_PRESERVE_NETWORK_MUTATION_GUARD",
+            "network_observation_limitations": [
+                "Service workers are blocked so requests cannot bypass read-only interception. "
+                "Worker-only application behavior is not exercised; calls never initiated by "
+                "the browser cannot be discovered or declared healthy."
+            ],
             "approved_portal_hosts": sorted(approved_portal_hosts),
             "query_parameter_policy": req.query_parameter_policy,
             "max_discovery_scrolls": req.max_discovery_scrolls,

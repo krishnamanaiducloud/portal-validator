@@ -1,8 +1,9 @@
 import asyncio
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 
-from app.navigation_guard import RedirectResponseGuard
+from app.navigation_guard import RedirectResponseGuard, _interception_is_gone
 from app.security import DestinationError
 
 
@@ -34,6 +35,21 @@ class Session:
         self.commands.append(("detach", {}))
 
 
+class FailingSession(Session):
+    def __init__(self, failures):
+        super().__init__()
+        self.failures = failures
+
+    async def send(self, method, params):
+        await super().send(method, params)
+        if method in self.failures:
+            raise self.failures[method]
+
+
+def disposed_interception(command):
+    return PlaywrightError(f"CDPSession.send: Protocol error ({command}): Invalid InterceptionId.")
+
+
 def redirect(*, location="/next", status=302):
     return {
         "requestId": "request-1", "request": {"url": "https://portal.example/start"},
@@ -42,8 +58,8 @@ def redirect(*, location="/next", status=302):
     }
 
 
-def guard_with(validator):
-    page, session, errors = Page(), Session(), []
+def guard_with(validator, *, session=None):
+    page, session, errors = Page(), session if session is not None else Session(), []
     return RedirectResponseGuard(
         page, session, validate_destination=validator,
         on_policy_error=lambda error, metadata: errors.append(error), validation_timeout_ms=20,
@@ -129,3 +145,104 @@ async def test_guard_cannot_detach_and_release_paused_requests_while_page_is_ope
     await guard.page.close()
     await guard.close()
     assert guard.closed and guard.session.commands == [("detach", {})]
+
+
+@pytest.mark.parametrize("command", ["Fetch.continueRequest", "Fetch.failRequest"])
+def test_disposed_interception_match_requires_exact_known_protocol_error(command):
+    assert _interception_is_gone(disposed_interception(command), command)
+
+
+@pytest.mark.parametrize("error, command", [
+    (RuntimeError("CDPSession.send: Protocol error (Fetch.continueRequest): Invalid InterceptionId."), "Fetch.continueRequest"),
+    (PlaywrightError("CDPSession.send: Protocol error (Fetch.continueRequest): Invalid InterceptionId. extra text"), "Fetch.continueRequest"),
+    (PlaywrightError("CDPSession.send: Protocol error (Fetch.continueRequest): Invalid InterceptionId"), "Fetch.continueRequest"),
+    (PlaywrightError("CDPSession.send: Protocol error (Fetch.continueRequest): Invalid interceptionId."), "Fetch.continueRequest"),
+    (PlaywrightError("Protocol error (Fetch.continueRequest): Invalid InterceptionId."), "Fetch.continueRequest"),
+    (PlaywrightError("Validation failed: CDPSession.send: Protocol error (Fetch.continueRequest): Invalid InterceptionId."), "Fetch.continueRequest"),
+    (disposed_interception("Fetch.failRequest"), "Fetch.continueRequest"),
+    (disposed_interception("Fetch.continueRequest"), "Fetch.failRequest"),
+    (disposed_interception("Fetch.fulfillRequest"), "Fetch.fulfillRequest"),
+    (PlaywrightError("CDPSession.send: Target page, context or browser has been closed"), "Fetch.continueRequest"),
+])
+def test_disposed_interception_match_rejects_lookalikes(error, command):
+    assert not _interception_is_gone(error, command)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [200, 302, 307])
+async def test_disposed_continue_after_validation_does_not_close_other_requests(status):
+    validated = []
+
+    async def validate(destination, source, metadata):
+        validated.append(destination)
+
+    session = FailingSession({"Fetch.continueRequest": disposed_interception("Fetch.continueRequest")})
+    guard, errors = guard_with(validate, session=session)
+    await guard._handle(redirect(status=status))
+    assert validated == (["https://portal.example/next"] if status != 200 else [])
+    assert session.commands == [("Fetch.continueRequest", {"requestId": "request-1"})]
+    assert not errors and not guard.errors and not guard.page.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_policy_denial_remains_reported_when_abort_job_was_already_disposed():
+    denial = DestinationError("NETWORK_ERROR", "Destination blocked by policy")
+
+    async def validate(destination, source, metadata):
+        raise denial
+
+    session = FailingSession({"Fetch.failRequest": disposed_interception("Fetch.failRequest")})
+    guard, errors = guard_with(validate, session=session)
+    await guard._handle(redirect(location="http://169.254.169.254/"))
+    assert errors == guard.errors == [denial]
+    assert session.commands == [("Fetch.failRequest", {"requestId": "request-1", "errorReason": "BlockedByClient"})]
+    assert not guard.page.is_closed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abort_disposed", [False, True])
+async def test_validator_raised_protocol_lookalike_is_not_ignored(abort_disposed):
+    async def validate(destination, source, metadata):
+        raise disposed_interception("Fetch.continueRequest")
+
+    session = FailingSession(
+        {"Fetch.failRequest": disposed_interception("Fetch.failRequest")} if abort_disposed else {},
+    )
+    guard, errors = guard_with(validate, session=session)
+    await guard._handle(redirect())
+    assert len(errors) == 1 and errors[0].classification == "NETWORK_ERROR"
+    assert session.commands == [("Fetch.failRequest", {"requestId": "request-1", "errorReason": "BlockedByClient"})]
+    assert not guard.page.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_unknown_continuation_error_with_failed_abort_still_closes_guarded_browser():
+    async def validate(destination, source, metadata):
+        return None
+
+    session = FailingSession({
+        "Fetch.continueRequest": PlaywrightError("CDPSession.send: private-token-unexpected-error"),
+        "Fetch.failRequest": PlaywrightError("CDPSession.send: unexpected-abort-failure"),
+    })
+    guard, errors = guard_with(validate, session=session)
+    await guard._handle(redirect())
+    assert [command for command, _ in session.commands] == ["Fetch.continueRequest", "Fetch.failRequest"]
+    assert len(errors) == 1 and errors[0].classification == "NETWORK_ERROR"
+    assert "private-token" not in str(errors)
+    assert guard.page.is_closed()
+
+
+@pytest.mark.asyncio
+async def test_unknown_continuation_error_remains_reported_even_if_abort_job_is_disposed():
+    async def validate(destination, source, metadata):
+        return None
+
+    session = FailingSession({
+        "Fetch.continueRequest": PlaywrightError("CDPSession.send: unexpected-continuation-failure"),
+        "Fetch.failRequest": disposed_interception("Fetch.failRequest"),
+    })
+    guard, errors = guard_with(validate, session=session)
+    await guard._handle(redirect())
+    assert len(errors) == 1 and errors[0].classification == "NETWORK_ERROR"
+    assert [command for command, _ in session.commands] == ["Fetch.continueRequest", "Fetch.failRequest"]
+    assert not guard.page.is_closed()

@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.12.1 is an authenticated, read-only browser health validator for public,
+Portal Validator 1.12.2 is an authenticated, read-only browser health validator for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -117,12 +117,31 @@ is `approved_read_post_operations`, for example:
 ```
 
 The portal must naturally generate the call; the validator never creates or
-replays its body. Blocked calls remain in the inventory with `NOT_EXECUTED`, no
-HTTP response, and a read-only block count. `network_observation` reconciles the
+replays its body. Blocked calls remain visible in the inventory as
+`BLOCKED_BY_POLICY`, with an explicit reason and no fabricated HTTP response.
+`network_observation` reconciles the
 scan-wide observed methods and request count with the serialized API inventory,
 including calls made during discovery or outside a route snapshot. Request
 correlation follows the live underlying Playwright request rather than a reused
 Python object address.
+
+The inventory includes approved, unverified, policy-blocked, failed, canceled,
+and incomplete POST observations. Its seven `POST_*` classifications describe
+independent evidence: observing a POST never establishes read-only approval, and
+authentication bootstrap is not an approved business read. The eight POST
+diagnostics distinguish calls from unique endpoints. Endpoint counters can
+overlap when an endpoint has calls with different decisions. "Without completed
+responses" includes blocked calls, failures, cancellations, and unfinished
+responses; it does not assert that every such call reached the server.
+
+`network_observation.total_http_requests_observed` counts all observed HTTP/S
+requests, including documents and assets. The legacy `observed_requests` field
+remains the API-only count, reconciled with inventory calls. Responses never
+establish approval by themselves. Browser-context listeners cover fetch, XHR,
+frames, SPA transitions, and authentication navigation before initial navigation.
+Service workers remain blocked to prevent bypassing request interception;
+worker-only behavior and requests the application never initiates are not
+exercised or reported as healthy. No endpoint is probed or replayed to fill a gap.
 
 Authentication modes are anonymous, HTTP Basic, bearer/token, custom headers,
 cookies, and mounted Playwright `storage_state`. Reports use generic behavioral
@@ -226,10 +245,10 @@ runs as UID/GID 10001 while supporting an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.12.1 .
+docker build -t mohankrishna999/portal-validator:1.12.2 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.1 \
-  -t mohankrishna999/portal-validator:1.12.1-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.2 \
+  -t mohankrishna999/portal-validator:1.12.2-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -244,7 +263,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.12.1
+  mohankrishna999/portal-validator:1.12.2
 ```
 
 ## OpenShift

@@ -260,6 +260,124 @@ def summarize_post_observation(events: list[dict[str, Any]]) -> dict[str, int]:
     return summary
 
 
+def classify_post_observation(event: dict[str, Any]) -> list[str]:
+    """Describe POST observation, policy and transport as independent evidence.
+
+    These labels never grant execution permission. A URL name, authentication
+    phase or successful HTTP response cannot establish read-only approval.
+    Cancellation and policy aborts are not target-side network failures.
+    """
+    if str(event.get("method") or "GET").upper() != "POST":
+        return []
+    labels = ["POST_OBSERVED"]
+    blocked = bool(event.get("blocked_by_validator"))
+    classification = str(
+        event.get("policy_classification") or event.get("request_classification") or ""
+    )
+    approved = bool(summarize_post_observation([event])["approved_read_only_calls"])
+    authentication = (
+        classification in {"AUTH_FLOW", "SESSION_REFRESH"}
+        and not blocked
+        and event.get("policy_decision") not in {"BLOCK", "PENDING"}
+    )
+    if approved:
+        labels.append("POST_READ_ONLY_APPROVED")
+    elif authentication:
+        labels.append("POST_AUTH_BOOTSTRAP")
+    else:
+        labels.append("POST_READ_ONLY_UNVERIFIED")
+    if blocked:
+        labels.append("POST_BLOCKED_BY_POLICY")
+        if classification in {"BLOCKED_MUTATION", "READ_ONLY_BLOCK", "READ_ONLY_BLOCKED"} or event.get("block_reason") == "READ_ONLY_MUTATION_BLOCKED":
+            labels.append("POST_MUTATION_RESTRICTED")
+    canceled = (
+        bool(event.get("request_canceled")) or event.get("lifecycle_status") == "CANCELED"
+        or any(marker in str(event.get("error") or "").upper() for marker in (
+            "ERR_ABORTED", "ABORTERROR", "NS_BINDING_ABORTED", "CANCELLED", "CANCELED",
+        ))
+    )
+    if (
+        not blocked and not canceled
+        and not event.get("response_seen")
+        and not isinstance(event.get("status"), int)
+        and bool(event.get("request_failed") or event.get("error"))
+        and event.get("failure_category") in {None, "NETWORK_FAILURE"}
+    ):
+        labels.append("POST_NETWORK_FAILED")
+    return labels
+
+
+def summarize_post_diagnostics(
+    events: list[dict[str, Any]], *, total_http_requests: int | None = None,
+) -> dict[str, int | None]:
+    """Reconcile calls and unique sanitized POST endpoints without replay.
+
+    API events are a subset of HTTP traffic, so a full HTTP total must be
+    supplied by the browser-context observer or remain unknown. Endpoint
+    groups match the inventory's (method, host, normalized endpoint) key.
+    Endpoint categories can overlap across calls. Without-completed-response
+    counts include blocked, canceled, failed and unfinished POST attempts.
+    """
+    if total_http_requests is not None and (
+        isinstance(total_http_requests, bool)
+        or not isinstance(total_http_requests, int) or total_http_requests < 0
+    ):
+        raise ValueError("Total observed HTTP requests must be a non-negative integer")
+    summary: dict[str, int | None] = {
+        "total_http_requests_observed": total_http_requests,
+        "post_requests_observed": 0,
+        "post_requests_allowed": 0,
+        "post_requests_blocked": 0,
+        "approved_read_only_post_endpoints": 0,
+        "unverified_post_endpoints": 0,
+        "post_requests_without_completed_responses": 0,
+        "unique_post_endpoints_reported": 0,
+    }
+    endpoints: set[tuple[str, str, str]] = set()
+    approved_endpoints: set[tuple[str, str, str]] = set()
+    unverified_endpoints: set[tuple[str, str, str]] = set()
+    observed = allowed = blocked = without_completed = 0
+    for event in events:
+        labels = classify_post_observation(event)
+        if not labels:
+            continue
+        observed += 1
+        policy_blocked = bool(event.get("blocked_by_validator"))
+        blocked += policy_blocked
+        decision = event.get("policy_decision")
+        allowed += not policy_blocked and (
+            decision == "ALLOW"
+            or decision is None and (
+                event.get("allowed_by_policy") is True
+                or "POST_READ_ONLY_APPROVED" in labels or "POST_AUTH_BOOTSTRAP" in labels
+            )
+        )
+        without_completed += not bool(event.get(
+            "response_completed", isinstance(event.get("status"), int) and not event.get("error"),
+        ))
+        _, safe_host, safe_endpoint = safe_api_identity(str(event.get("url") or ""))
+        host = str(event.get("host") or safe_host).lower()
+        endpoint = str(event.get("endpoint") or safe_endpoint)
+        if not host or not endpoint.startswith("/"):
+            continue
+        identity = ("POST", host, endpoint)
+        endpoints.add(identity)
+        if "POST_READ_ONLY_APPROVED" in labels:
+            approved_endpoints.add(identity)
+        if "POST_READ_ONLY_UNVERIFIED" in labels:
+            unverified_endpoints.add(identity)
+    summary.update(
+        post_requests_observed=observed,
+        post_requests_allowed=allowed,
+        post_requests_blocked=blocked,
+        approved_read_only_post_endpoints=len(approved_endpoints),
+        unverified_post_endpoints=len(unverified_endpoints),
+        post_requests_without_completed_responses=without_completed,
+        unique_post_endpoints_reported=len(endpoints),
+    )
+    return summary
+
+
 def normalize_api_endpoint(path: str) -> str:
     """Return a query-free, conservatively normalized and redacted API path."""
     if not path:
@@ -612,6 +730,7 @@ class PassiveNetworkObserver:
             "_started_at": time.perf_counter(),
         }
         event["traffic_role"] = event["traffic_category"]
+        event["post_classifications"] = classify_post_observation(event)
         self._events_by_request[key] = event
         self.events.append(event)
         return event
@@ -647,6 +766,7 @@ class PassiveNetworkObserver:
             classification=classification,
         )
         event["traffic_role"] = event["traffic_category"]
+        event["post_classifications"] = classify_post_observation(event)
         return event
 
     def mark_blocked(
@@ -678,6 +798,7 @@ class PassiveNetworkObserver:
             "failure_category": reason,
         })
         event["traffic_category"] = "VALIDATOR_BLOCKED"
+        event["post_classifications"] = classify_post_observation(event)
         return event
 
     def record_response(self, request: Any, status: int) -> dict[str, Any] | None:
@@ -703,6 +824,7 @@ class PassiveNetworkObserver:
             "response_seen": True,
             "response_status": int(status),
         })
+        event["post_classifications"] = classify_post_observation(event)
         return event
 
     def record_failure(self, request: Any, error: str) -> dict[str, Any] | None:
@@ -734,6 +856,7 @@ class PassiveNetworkObserver:
             ),
             "response_completed": False,
         })
+        event["post_classifications"] = classify_post_observation(event)
         return event
 
     def mark_route_handler(self, request: Any) -> None:
@@ -790,6 +913,7 @@ class PassiveNetworkObserver:
                     "NO_RESPONSE_BEFORE_SCAN_END" if event.get("request_dispatched") else
                     "NOT_DISPATCHED_BEFORE_SCAN_END"
                 )
+            event["post_classifications"] = classify_post_observation(event)
             event.pop("_started_at", None)
 
     @staticmethod

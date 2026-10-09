@@ -105,6 +105,9 @@ async def main():
               failed_pages:0,auth_issues:0,api_failures:0,resource_failures:0,slow_pages:0,
               read_only_blocks:5,duration_ms:125,total_scan_duration_ms:8500,routes_not_tested:2,console_failures:0,
               post_summary:{observed_calls:11,approved_read_only_calls:9,executed_approved_calls:8},
+              post_diagnostics:{total_http_requests_observed:24,post_requests_observed:11,post_requests_allowed:9,
+                post_requests_blocked:2,approved_read_only_post_endpoints:1,unverified_post_endpoints:2,
+                post_requests_without_completed_responses:3,unique_post_endpoints_reported:2},
               unique_apis:6,security_recommendations:1},
             coverage:{scan_completeness:'PARTIAL',termination_reason:'MAX_ROUTES_REACHED',routes_discovered:3,routes_validated:1,routes_not_tested:2,routes_remaining:2},
             api_inventory:[{method:'GET',host:'api.example.net',endpoint:'/health',calls:1,status_2xx:1,
@@ -114,11 +117,15 @@ async def main():
               {method:'POST',host:'api.example.net',endpoint:'/query',calls:10,status_2xx:8,
               status_3xx:0,status_4xx:1,status_5xx:0,network_failures:0,route_count:1,
               allowed_calls:9,blocked_count:1,application_bootstrap_phase_count:2,authentication_phase_count:0,route_validation_phase_count:8,session_refresh_phase_count:0,
-              average_duration_ms:25,worst_duration_ms:40,health:'DEGRADED',observation_outcome:'WARNING',policies:['APPROVED_READ_POST'],policy_classifications:['APPROVED_READ_ONLY'],classification_counts:{APPROVED_READ_POST:9,BLOCKED_MUTATION:1},routes_using_endpoint:['/health']},
+              average_duration_ms:25,worst_duration_ms:40,health:'DEGRADED',observation_outcome:'WARNING',policies:['APPROVED_READ_POST'],policy_classifications:['APPROVED_READ_ONLY'],classification_counts:{APPROVED_READ_POST:9,BLOCKED_MUTATION:1},routes_using_endpoint:['/health'],
+              response_status_counts:{200:8,401:1},failure_count:1,authentication_classifications:['NOT_AUTHENTICATION'],
+              post_classifications:['POST_OBSERVED','POST_READ_ONLY_APPROVED','POST_READ_ONLY_UNVERIFIED','POST_BLOCKED_BY_POLICY','POST_MUTATION_RESTRICTED']},
               ...['POST','PUT','PATCH','DELETE'].map((method, index) => ({method,host:'api.example.net',endpoint:`/blocked/${index}`,calls:1,status_2xx:0,
               status_3xx:0,status_4xx:0,status_5xx:0,network_failures:0,route_count:1,allowed_calls:0,
               blocked_count:1,application_bootstrap_phase_count:0,authentication_phase_count:0,route_validation_phase_count:1,session_refresh_phase_count:0,
-              average_duration_ms:null,worst_duration_ms:null,health:'NOT_EXECUTED',observation_outcome:'BLOCKED_BY_VALIDATOR',policies:['READ_ONLY_BLOCK'],routes_using_endpoint:['/health']}))],
+              average_duration_ms:null,worst_duration_ms:null,health:'NOT_EXECUTED',observation_outcome:'BLOCKED_BY_VALIDATOR',observation_status:'BLOCKED_BY_POLICY',policies:['READ_ONLY_BLOCK'],routes_using_endpoint:['/health'],
+              response_status_counts:{},failure_count:0,authentication_classifications:['NOT_AUTHENTICATION'],
+              post_classifications:method === 'POST' ? ['POST_OBSERVED','POST_READ_ONLY_UNVERIFIED','POST_BLOCKED_BY_POLICY','POST_MUTATION_RESTRICTED'] : []}))],
             resource_details:[
               {type:'IMAGE',host:'cdn.example.net',path:'/hero.png',route:'/health',status:200,duration_ms:34,transfer_size_bytes:700000,encoded_body_size_bytes:699000,decoded_body_size_bytes:699000,size_categories:['LARGE_IMAGE'],failed:false},
               {type:'IMAGE',host:'cdn.example.net',path:'/opaque.png',route:'/health',status:200,duration_ms:14,transfer_size_bytes:null,encoded_body_size_bytes:null,decoded_body_size_bytes:null,size_categories:[],failed:false},
@@ -213,11 +220,33 @@ async def main():
         assert await page.locator(".metric").count() >= 10
         assert await page.locator("#api-list tr").count() == 6
         assert await page.locator("#api-method-filter option").all_text_contents() == [
-            "All methods", "DELETE", "GET", "PATCH", "POST", "PUT",
+            "All methods", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT",
         ]
+        diagnostic_values = {
+            "total_http_requests_observed": "24", "post_requests_observed": "11",
+            "post_requests_allowed": "9", "post_requests_blocked": "2",
+            "approved_read_only_post_endpoints": "1", "unverified_post_endpoints": "2",
+            "post_requests_without_completed_responses": "3", "unique_post_endpoints_reported": "2",
+        }
+        for name, expected in diagnostic_values.items():
+            assert await page.locator(f"#post-diagnostic-{name}").text_content() == expected
+        await page.evaluate("window.savedPostDiagnostics = lastReport.summary.post_diagnostics; delete lastReport.summary.post_diagnostics; renderApiInventory()")
+        assert await page.locator("#post-diagnostic-total_http_requests_observed").text_content() == "Not recorded"
+        await page.evaluate("lastReport.summary.post_diagnostics = window.savedPostDiagnostics; delete window.savedPostDiagnostics; renderApiInventory()")
+        await page.locator("#api-method-filter").select_option("OPTIONS")
+        assert await page.locator("#api-list .empty-table").text_content() == "No API requests match these filters."
         await page.locator("#api-method-filter").select_option("POST")
         assert await page.locator("#api-list tr").count() == 2
         assert await page.locator("#api-list tr td:first-child").all_text_contents() == ["POST", "POST"]
+        query_row = page.locator("#api-list tr").filter(has=page.locator("button.api-endpoint", has_text="/query"))
+        assert await query_row.locator(".api-response-status-cell").text_content() == "200 (8), 401 (1)"
+        assert await query_row.locator(".api-failure-count-cell").text_content() == "1"
+        assert await query_row.locator(".api-associated-routes-cell").text_content() == "/health"
+        assert await query_row.locator(".api-auth-class-cell").text_content() == "NOT_AUTHENTICATION"
+        assert "POST_READ_ONLY_APPROVED" in await query_row.locator(".api-post-class-cell").text_content()
+        blocked_post_row = page.locator("#api-list tr").filter(has=page.locator("button.api-endpoint", has_text="/blocked/0"))
+        assert await blocked_post_row.locator(".dimension-state").text_content() == "BLOCKED_BY_POLICY"
+        assert "POST_BLOCKED_BY_POLICY" in await blocked_post_row.locator(".api-post-class-cell").text_content()
         await page.locator("#api-method-filter").select_option("all")
         await page.evaluate("""() => {
           const challenge = lastReport.api_inventory.find(item => item.endpoint === '/blocked/0');
@@ -230,7 +259,7 @@ async def main():
         await page.locator("#api-role-filter").select_option("CHALLENGE")
         assert await page.locator("#api-list tr").count() == 1
         assert await page.locator("#api-list .api-role-cell").text_content() == "CHALLENGE"
-        assert "BLOCKED_BY_VALIDATOR" in await page.locator("#api-list").text_content()
+        assert "BLOCKED_BY_POLICY" in await page.locator("#api-list").text_content()
         await page.locator("#api-list .api-endpoint").click()
         lifecycle = await page.locator("#evidence-content .inspect-section dl").evaluate("""element =>
           Object.fromEntries([...element.children].map(row => [row.querySelector('dt').textContent, row.querySelector('dd').textContent]))
@@ -312,7 +341,7 @@ async def main():
         assert await page.locator('[data-api-sort="average_duration_ms"]').text_content() == "Average Time (ms)"
         assert await page.locator('[data-api-sort="worst_duration_ms"]').text_content() == "Worst Time (ms)"
         await page.locator("#api-columns > summary").click()
-        assert await page.locator("#api-columns input[type=checkbox]").count() == 21
+        assert await page.locator("#api-columns input[type=checkbox]").count() == 26
         screenshot_base, screenshot_extension = os.path.splitext(screenshot)
         await page.screenshot(path=f"{screenshot_base}-columns{screenshot_extension or '.png'}")
         await page.locator('[data-column-kind="api"][data-column-key="host"]').uncheck()
@@ -332,15 +361,15 @@ async def main():
         assert await page.locator('[data-api-sort="authentication_phase_count"]').is_visible()
         await page.locator("#route-columns > summary").click()
         saved_report = await page.evaluate("lastReport")
-        # Simulate an older release preference set. Policy is a newly added
-        # column and must remain visible unless explicitly disabled.
+        # Simulate an older release preference set. New POST-evidence columns
+        # must remain visible unless explicitly disabled.
         await page.evaluate("localStorage.setItem('portal-validator.api-columns', JSON.stringify({host:false}))")
         await page.reload(wait_until="networkidle")
         await page.evaluate("report => renderReport(report)", saved_report)
         assert abs(await route_panel.evaluate("element => element.getBoundingClientRect().height") - route_panel_height) <= 2
         assert not await page.locator('[data-api-sort="host"]').is_visible()
         assert not await page.locator('[data-sort="authentication_status"]').is_visible()
-        assert await page.locator("#api-table-wrap th").last.text_content() == "Policy"
+        assert await page.locator("#api-table-wrap th").last.text_content() == "POST classification"
         assert await page.locator("#api-table-wrap th").last.is_visible()
         for kind in ("api", "route"):
             await page.locator(f"#{kind}-columns > summary").click()
