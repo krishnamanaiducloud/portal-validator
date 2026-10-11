@@ -166,6 +166,9 @@ async def test_url_less_tabs_are_independently_validated_with_natural_post_calls
     assert report["summary"]["routes_discovered"] == 3
     assert report["summary"]["routes_validated"] == 3
     assert len({route["route_id"] for route in report["results"]}) == 3
+    assert all(route["parent_route_id"] for route in views)
+    assert all(route["navigation_hierarchy"][-1] == route["route_name"] for route in views)
+    assert all(route["parent_route_name"] for route in views)
     assert {route["canonical_route"] for route in report["results"]} == {origin + path}
     assert all(route["page_load_status"] == "LOADED" for route in views)
     assert all(route["passed"] is True for route in views)

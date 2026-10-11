@@ -126,8 +126,8 @@ SECURITY_HEADERS = (
 COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
     "ac", "co", "com", "edu", "gov", "net", "org",
 })
-VALIDATOR_VERSION = "1.12.4"
-REPORT_SCHEMA_VERSION = "2.3"
+VALIDATOR_VERSION = "1.12.5"
+REPORT_SCHEMA_VERSION = "2.4"
 
 
 @asynccontextmanager
@@ -949,6 +949,7 @@ async def execute_scan(
         "target",
         None,
         None,
+        None,
     )])
     seen: set[str] = set()
     discovered_routes: set[str] = {requested_route}
@@ -957,6 +958,8 @@ async def execute_scan(
     queued_view_keys: dict[str, set[str]] = defaultdict(set)
     action_limited_routes: set[str] = set()
     route_locations: dict[str, str] = {requested_route: requested_route}
+    route_parent_ids: dict[str, str | None] = {requested_route: None}
+    route_name_by_id: dict[str, str] = {requested_route: "Requested route"}
     view_navigation_aliases: dict[str, str] = {}
     active_view_source: str | None = None
     route_provenance: dict[str, dict[str, object]] = {
@@ -976,6 +979,7 @@ async def execute_scan(
         identity: str,
         route: DiscoveredRoute,
         discovered_from: str | None,
+        discovered_from_route_id: str | None = None,
     ) -> None:
         entry = route_provenance.setdefault(identity, {"observations": 0, "sources": []})
         entry["observations"] = int(entry["observations"]) + 1
@@ -985,6 +989,7 @@ async def execute_scan(
             "label": sanitize_text(route.label, limit=160) if route.label else None,
             "label_source": route.label_source,
             "discovered_from": sanitized_url(discovered_from) if discovered_from else None,
+            "discovered_from_route_id": discovered_from_route_id,
         }
         sources = entry["sources"]
         if source not in sources:
@@ -1021,11 +1026,15 @@ async def execute_scan(
             if any(word in urlparse(identity).path.lower() for word in DANGEROUS_PATH_WORDS):
                 continue
             if not route.view_control and identity in view_navigation_aliases:
-                remember_route_discovery(view_navigation_aliases[identity], route, source_url)
+                remember_route_discovery(
+                    view_navigation_aliases[identity], route, source_url, active_route_id,
+                )
                 continue
             route_key = discovered_route_key(route, identity)
             route_locations[route_key] = identity
-            remember_route_discovery(route_key, route, source_url)
+            parent_route_id = active_route_id
+            route_parent_ids.setdefault(route_key, parent_route_id)
+            remember_route_discovery(route_key, route, source_url, parent_route_id)
             if route.view_control:
                 # UI controls have their own bounded action budget. URLs still
                 # pass the exact existing portal/SSRF/read-only policies.
@@ -1050,6 +1059,7 @@ async def execute_scan(
                 route.label_source,
                 sanitize_text(route.accessible_name, limit=160) if route.accessible_name else None,
                 route.view_control,
+                parent_route_id,
             ))
             queued_routes.add(route_key)
             log_event(logging.DEBUG, "LINK_DISCOVERED", scan_id=scan_id,
@@ -1928,6 +1938,7 @@ async def execute_scan(
                         route_label_source,
                         route_accessible_name,
                         view_control,
+                        parent_route_id,
                     ) = queue.popleft()
                     route_identity = normalize_route_url(
                         url,
@@ -2609,6 +2620,18 @@ async def execute_scan(
                         document_title=title,
                         display_path=identity["display_path"],
                     )
+                    route_name_by_id[active_route_id] = route_name
+                    navigation_hierarchy: list[str] = []
+                    hierarchy_cursor = parent_route_id
+                    hierarchy_seen: set[str] = set()
+                    while hierarchy_cursor and hierarchy_cursor not in hierarchy_seen:
+                        hierarchy_seen.add(hierarchy_cursor)
+                        navigation_hierarchy.insert(
+                            0,
+                            route_name_by_id.get(hierarchy_cursor, hierarchy_cursor),
+                        )
+                        hierarchy_cursor = route_parent_ids.get(hierarchy_cursor)
+                    navigation_hierarchy.append(route_name)
                     provenance = route_provenance.get(route_key, {"observations": 1, "sources": []})
                     health_validation_ms = round((time.perf_counter() - health_validation_started) * 1000)
                     route_validation_ms = max(0, round((time.perf_counter() - started) * 1000) - route_discovery_ms)
@@ -2661,6 +2684,9 @@ async def execute_scan(
                             0, int(provenance.get("observations", 1)) - 1
                         ),
                         "discovered_from": sanitized_url(discovered_from) if discovered_from else None,
+                        "parent_route_id": parent_route_id,
+                        "parent_route_name": route_name_by_id.get(parent_route_id) if parent_route_id else None,
+                        "navigation_hierarchy": navigation_hierarchy,
                         "expected_origin": sanitized_url(url, include_path=False),
                         "normalized_route_identity": active_route_id,
                         "navigation_type": navigation_mode,
@@ -2703,6 +2729,12 @@ async def execute_scan(
                         "discovery_ms": route_discovery_ms,
                         "validation_ms": route_validation_ms,
                         "navigation_actions": navigation_actions,
+                        "navigation_controls_discovered": int(navigation_actions.get("inspected", 0)),
+                        "navigation_controls_activated": int(navigation_actions.get("activated", 0)),
+                        "navigation_controls_unresolved": (
+                            int(navigation_actions.get("skipped", 0))
+                            + int(bool(navigation_actions.get("timed_out")))
+                        ),
                         "unsafe_actions_skipped": navigation_actions["skipped"],
                         "discovery_limitations": (
                             int(navigation_actions.get("skipped", 0))
@@ -2857,6 +2889,10 @@ async def execute_scan(
         aggregate_api_events(scan_api_events)
         if scan_api_events else aggregate_api_inventory(results)
     )
+    business_api_inventory = [
+        item for item in api_inventory
+        if item.get("traffic_role") == "APPLICATION_API"
+    ]
     resource_inventory = (
         aggregate_resource_events(scan_resource_events)
         if scan_resource_events else aggregate_resource_inventory(results)
@@ -2868,10 +2904,22 @@ async def execute_scan(
         large_js_threshold_bytes=req.large_js_threshold_bytes,
         large_css_font_threshold_bytes=req.large_css_font_threshold_bytes,
     )
+    resource_summary["scope"] = "scan-wide unique resource calls"
+    # Keep route snapshots and scan-wide aggregation explicit. A route can
+    # observe the same resource more than once, while the inventory is unique
+    # by method/host/path and also includes late observer events.
+    resource_summary["route_resource_call_count"] = sum(
+        len(result.get("resources", [])) for result in results
+    )
+    resource_summary["scan_wide_unique_resource_count"] = len(resource_inventory)
+    resource_summary["scan_wide_resource_call_count"] = sum(
+        int(item.get("calls", 0)) for item in resource_inventory
+    )
     for event in scan_resource_events + scan_api_events:
         event.pop("_resource_timing_key", None)
     security_recommendations = aggregate_security_recommendations(results)
     summary["unique_apis"] = len(api_inventory)
+    summary["business_apis"] = len(business_api_inventory)
     summary["api_calls"] = sum(item["calls"] for item in api_inventory)
     # The scan-wide stream also contains discovery and late requests that may
     # fall outside a route's snapshot. Never undercount their policy blocks.
@@ -3022,6 +3070,7 @@ async def execute_scan(
         "summary": summary,
         "results": results,
         "api_inventory": api_inventory,
+        "business_api_inventory": business_api_inventory,
         "network_observation": network_observation,
         "scan_configuration": scan_configuration,
         "scan_timing": scan_timing,
@@ -3036,6 +3085,7 @@ async def execute_scan(
             "scan_completeness": summary["scan_completeness"],
             "execution_status": summary.get("execution_status"),
             "coverage_status": summary.get("coverage_status"),
+            "coverage_grade": summary.get("coverage_grade", "UNKNOWN"),
             "coverage_reasons": summary.get("coverage_reasons", []),
             "termination_reason": termination_reason,
             "routes_discovered": summary["routes_discovered"],
@@ -3045,6 +3095,10 @@ async def execute_scan(
             "routes_skipped": summary["routes_skipped"],
             "routes_remaining": summary["routes_remaining"],
             "routes_not_tested": summary["routes_not_tested"],
+            "navigation_controls_discovered": summary["navigation_controls_discovered"],
+            "navigation_controls_activated": summary["navigation_controls_activated"],
+            "navigation_controls_unresolved": summary["navigation_controls_unresolved"],
+            "business_apis": summary["business_apis"],
             "not_tested_reason_counts": summary["not_tested_reason_counts"],
         },
         "not_tested_routes": [

@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.12.4 is a read-only browser health validator with optional authentication for public,
+Portal Validator 1.12.5 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -268,10 +268,10 @@ runs as UID/GID 10001 while supporting an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.12.4 .
+docker build -t mohankrishna999/portal-validator:1.12.5 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.4 \
-  -t mohankrishna999/portal-validator:1.12.4-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.5 \
+  -t mohankrishna999/portal-validator:1.12.5-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -286,7 +286,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.12.4
+  mohankrishna999/portal-validator:1.12.5
 ```
 
 ## OpenShift
@@ -373,7 +373,7 @@ document into a load failure. `tls_status=TRUSTED` means Chromium completed cert
 validation; it does not claim independent inspection of the origin certificate
 when an enterprise TLS proxy is present.
 
-Report schema `2.3` keeps route identity independent from the rendered title and
+Report schema `2.4` keeps route identity independent from the rendered title and
 adds route-level application API coverage plus network-settle evidence.
 It preserves canonical hash/hashbang/history paths and exposes `route_name`,
 `route_name_source`, `route_name_confidence`, `display_path`, `spa_route`, and

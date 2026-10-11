@@ -400,10 +400,19 @@ async (maximumScrolls) => {
   window.__portalValidatorBaselinePanels = baselinePanels;
   const selectors = [
     'a[href]', 'area[href]', '[role="link"][href]', '[role="link"][data-href]',
-    'nav [data-url]', '[role="navigation"] [data-url]', '[role="menuitem"][data-href]',
-    '[role="tab"][data-href]', '[routerlink]',
+    '[data-href]', '[data-url]', '[data-route]',
+    // Angular/Angular Material may render router metadata on a custom element
+    // rather than on a descendant of <nav>. These are URL-bearing attributes,
+    // so collecting them is safe; activation still goes through the normal
+    // scope and read-only policy.
+    '[data-href]', '[data-url]', '[data-route]', '[routerlink]',
+    '[ng-reflect-router-link]', '[routerlinkactive]',
+    '[role="menuitem"][data-href]', '[role="tab"][data-href]',
+    '[role="menuitem"][data-route]', '[role="tab"][data-route]',
+    'nav [data-url]', '[role="navigation"] [data-url]',
     'nav [data-route]', '[role="navigation"] [data-route]',
-    '[role="menuitem"][data-route]', '[role="tab"][data-route]'
+    '[role="tab"][data-tab-target]', '[role="tab"][data-bs-target]',
+    '[role="tab"][data-target]'
   ];
   const roots = () => {
     const values = [document];
@@ -420,7 +429,8 @@ async (maximumScrolls) => {
       // them without clicking: the normal validation loop owns activation,
       // request attribution, readiness and the existing read-only policy.
       for (const element of root.querySelectorAll(
-        '[role="tab"], [data-bs-toggle="tab"], [data-toggle="tab"]'
+        '[role="tab"], [data-bs-toggle="tab"], [data-toggle="tab"], ' +
+        '[data-tab-target], [data-bs-target], [data-target]'
       )) {
         const raw = element.getAttribute('href') || '';
         // A declared router URL is already covered by normal URL navigation.
@@ -428,7 +438,8 @@ async (maximumScrolls) => {
         if (raw.startsWith('#/') || raw.startsWith('#!/') ||
             ['data-href','data-url','routerlink','data-route'].some(name => element.hasAttribute(name))) continue;
         const target = element.getAttribute('aria-controls') ||
-          element.getAttribute('data-bs-target') || element.getAttribute('data-target') ||
+          element.getAttribute('data-tab-target') || element.getAttribute('data-bs-target') ||
+          element.getAttribute('data-target') ||
           (raw.startsWith('#') ? raw : '');
         const panel = target.replace(/^#/, '');
         if (!panel || /[\s/?!]/.test(panel) || panel.length > 160 ||
@@ -455,8 +466,8 @@ async (maximumScrolls) => {
       }
       for (const element of root.querySelectorAll(selectors.join(','))) {
         const raw = element.getAttribute('href') || element.getAttribute('data-href') ||
-          element.getAttribute('data-url') || element.getAttribute('routerlink') ||
-          element.getAttribute('data-route');
+      element.getAttribute('data-url') || element.getAttribute('routerlink') ||
+      element.getAttribute('ng-reflect-router-link') || element.getAttribute('data-route');
         if (!raw) continue;
         let url;
         try { url = new URL(raw, document.baseURI).href; } catch (_) { continue; }
@@ -651,7 +662,7 @@ SEMANTIC_ROUTE_ACTIVATION_SCRIPT = r"""
   const selector = [
     'a[href]', 'area[href]', '[role="link"][href]', '[role="link"][data-href]',
     'nav [data-url]', '[role="navigation"] [data-url]', '[role="menuitem"][data-href]',
-    '[role="tab"][data-href]', '[routerlink]',
+    '[role="tab"][data-href]', '[routerlink]', '[ng-reflect-router-link]',
     'nav [data-route]', '[role="navigation"] [data-route]',
     '[role="menuitem"][data-route]', '[role="tab"][data-route]',
     '[role="menuitem"]', '[role="tab"]', 'nav button[aria-controls]',
@@ -682,8 +693,8 @@ SEMANTIC_ROUTE_ACTIVATION_SCRIPT = r"""
     if (element.closest('form') || element.hasAttribute('disabled') ||
         element.getAttribute('aria-disabled') === 'true') continue;
     const raw = element.getAttribute('href') || element.getAttribute('data-href') ||
-      element.getAttribute('data-url') || element.getAttribute('routerlink') ||
-      element.getAttribute('data-route');
+          element.getAttribute('data-url') || element.getAttribute('routerlink') ||
+          element.getAttribute('ng-reflect-router-link') || element.getAttribute('data-route');
     let urlMatches = false;
     if (raw) {
       try {
@@ -720,9 +731,9 @@ async def activate_semantic_route(
         return False
     selector = ",".join((
         "a[href]", "area[href]", '[role="link"][href]',
-        '[role="link"][data-href]', "nav [data-url]",
+        '[role="link"][data-href]', '[data-href]', '[data-url]', '[data-route]', "nav [data-url]",
         '[role="navigation"] [data-url]', '[role="menuitem"][data-href]',
-        '[role="tab"][data-href]', '[routerlink]',
+        '[role="tab"][data-href]', '[routerlink]', '[ng-reflect-router-link]',
         'nav [data-route]', '[role="navigation"] [data-route]',
         '[role="menuitem"][data-route]', '[role="tab"][data-route]',
         '[role="menuitem"]', '[role="tab"]', "nav button[aria-controls]",
@@ -853,14 +864,16 @@ UI_VIEW_CONTROL_SCRIPT = r"""
       if (element.shadowRoot) roots.push(element.shadowRoot);
     }
     for (const element of root.querySelectorAll(
-      '[role="tab"], [data-bs-toggle="tab"], [data-toggle="tab"]'
+      '[role="tab"], [data-bs-toggle="tab"], [data-toggle="tab"], ' +
+      '[data-tab-target], [data-bs-target], [data-target]'
     )) {
       if (element.closest('form') || element.hasAttribute('disabled') ||
           element.getAttribute('aria-disabled') === 'true') continue;
       const raw = element.getAttribute('href') || '';
       if (raw && !raw.startsWith('#')) continue;
       const controlled = (element.getAttribute('aria-controls') ||
-        element.getAttribute('data-bs-target') || element.getAttribute('data-target') || raw).replace(/^#/, '');
+        element.getAttribute('data-tab-target') || element.getAttribute('data-bs-target') ||
+        element.getAttribute('data-target') || raw).replace(/^#/, '');
       const name = (element.getAttribute('aria-label') || element.textContent ||
         element.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0,160);
       const style = getComputedStyle(element), rect = element.getBoundingClientRect();

@@ -534,3 +534,30 @@ def test_resource_inventory_keeps_resources_separate_from_routes_and_apis():
         "route_count": 1,
         "health": "DEGRADED",
     }]
+
+
+def test_api_inventory_exposes_validation_lifecycle_and_keeps_blocked_observations():
+    inventory = aggregate_api_events([
+        {
+            "url": "https://api.example.net/read",
+            "method": "GET",
+            "status": 200,
+            "response_seen": True,
+            "response_completed": True,
+            "traffic_role": "APPLICATION_API",
+        },
+        {
+            "url": "https://api.example.net/write",
+            "method": "POST",
+            "blocked_by_validator": True,
+            "block_reason": "READ_ONLY_MUTATION_BLOCKED",
+            "request_dispatched": False,
+            "lifecycle_status": "BLOCKED",
+            "traffic_role": "APPLICATION_API",
+        },
+    ])
+    read = next(item for item in inventory if item["endpoint"] == "/read")
+    blocked = next(item for item in inventory if item["endpoint"] == "/write")
+    assert read["validation_status"] == "VALIDATED"
+    assert blocked["validation_status"] == "BLOCKED"
+    assert blocked["blocked_calls"] == 1

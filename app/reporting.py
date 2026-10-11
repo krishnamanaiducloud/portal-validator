@@ -727,6 +727,15 @@ def aggregate_report(
     if not application_routes_validated:
         coverage_reasons["NO_APPLICATION_ROUTES"] = 1
     coverage_complete = not coverage_reasons
+    # Preserve the legacy coverage_status values for API compatibility while
+    # exposing a clear four-state grade for consumers that need to distinguish
+    # a complete scan from a scan limited by access or discovery boundaries.
+    coverage_grade = (
+        "UNKNOWN" if not results else
+        "COMPLETE" if coverage_complete else
+        "LIMITED" if not application_routes_validated else
+        "PARTIAL"
+    )
     execution_status = (
         "CANCELLED" if termination_reason == "USER_CANCELLED"
         else "TIMED_OUT" if termination_reason == "SCAN_TIMEOUT"
@@ -789,6 +798,15 @@ def aggregate_report(
         ),
         "slow_pages": sum(bool(result.get("slow")) for result in results),
         "unsafe_actions_skipped": sum(int(result.get("unsafe_actions_skipped", 0)) for result in results),
+        "navigation_controls_discovered": sum(
+            int(result.get("navigation_controls_discovered", 0)) for result in results
+        ),
+        "navigation_controls_activated": sum(
+            int(result.get("navigation_controls_activated", 0)) for result in results
+        ),
+        "navigation_controls_unresolved": sum(
+            int(result.get("navigation_controls_unresolved", 0)) for result in results
+        ),
         "read_only_blocks": sum(int(result.get("read_only_blocks", 0)) for result in results),
         "external_routes_skipped": sum(int(result.get("external_links_found", 0)) for result in results),
         "discovery_limitations": sum(int(result.get("discovery_limitations", 0)) for result in results),
@@ -800,6 +818,7 @@ def aggregate_report(
             "COMPLETE" if coverage_complete
             else "NONE" if not application_routes_validated else "PARTIAL"
         ),
+        "coverage_grade": coverage_grade,
         "coverage_complete": coverage_complete,
         "coverage_reasons": [
             {"code": code, "count": count} for code, count in sorted(coverage_reasons.items())
@@ -1048,6 +1067,14 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             "NOT_EXECUTED" if not item["responded_calls"] else
             "HEALTHY"
         )
+        validation_status = (
+            "BLOCKED" if item["blocked_calls"] and not item["allowed_calls"] else
+            "FAILED" if item["status_5xx"] or item["network_failures"] or item["response_body_failures"] else
+            "INCOMPLETE" if item["incomplete_calls"] or item["canceled_calls"] else
+            "VALIDATED" if item["completed_calls"] else
+            "OBSERVED" if item["observed_calls"] else
+            "NOT_TESTED"
+        )
         item.update({
             "routes_using_endpoint": routes,
             "route_count": len(routes),
@@ -1084,6 +1111,7 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             "status_counts": status_counts,
             "target_failure_count": target_failures,
             "observation_outcome": observation_outcome,
+            "validation_status": validation_status,
             "observation_status": (
                 "BLOCKED_BY_POLICY" if observation_outcome == "BLOCKED_BY_VALIDATOR"
                 else observation_outcome
