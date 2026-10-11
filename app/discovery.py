@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from collections import Counter
 from dataclasses import dataclass
@@ -76,13 +77,16 @@ class DiscoveredRoute:
     label_source: str | None = None
     accessible_name: str | None = None
     view_control: dict[str, str] | None = None
+    navigation_hierarchy: tuple[str, ...] = ()
 
 
 def discovered_route_key(route: DiscoveredRoute, canonical_url: str) -> str:
     """Keep a real URL separate from a UI panel's non-URL coverage identity."""
     if route.view_control:
         panel = route.view_control["panel"]
-        digest = hashlib.sha256(f"{canonical_url}\0{panel}".encode()).hexdigest()[:24]
+        scope = route.view_control.get("scope", "")
+        control_identity = f"{scope}\0{panel}" if scope else panel
+        digest = hashlib.sha256(f"{canonical_url}\0{control_identity}".encode()).hexdigest()[:24]
         return f"UI_VIEW_{digest}"
     return canonical_url
 
@@ -391,65 +395,151 @@ ROUTE_OBSERVER_SCRIPT = r"""
 """
 
 
-DISCOVER_ROUTES_SCRIPT = r"""
-async (maximumScrolls) => {
-  const values = [];
-  const seen = new Set();
-  const baselinePanels = window.__portalValidatorBaselinePanels || new Set();
-  const rememberBaseline = !window.__portalValidatorBaselinePanels;
-  window.__portalValidatorBaselinePanels = baselinePanels;
-  const selectors = [
-    'a[href]', 'area[href]', '[role="link"][href]', '[role="link"][data-href]',
-    '[data-href]', '[data-url]', '[data-route]',
-    // Angular/Angular Material may render router metadata on a custom element
-    // rather than on a descendant of <nav>. These are URL-bearing attributes,
-    // so collecting them is safe; activation still goes through the normal
-    // scope and read-only policy.
-    '[data-href]', '[data-url]', '[data-route]', '[routerlink]',
-    '[ng-reflect-router-link]', '[routerlinkactive]',
-    '[role="menuitem"][data-href]', '[role="tab"][data-href]',
-    '[role="menuitem"][data-route]', '[role="tab"][data-route]',
-    'nav [data-url]', '[role="navigation"] [data-url]',
-    'nav [data-route]', '[role="navigation"] [data-route]',
-    '[role="tab"][data-tab-target]', '[role="tab"][data-bs-target]',
-    '[role="tab"][data-target]'
-  ];
-  const roots = () => {
+# Keep collection and activation on the same DOM contract. Returning an actual
+# element handle avoids relying on CSS locator ordering across open shadow roots.
+NAVIGATION_DOM_HELPERS = r"""
+  const routeSelector = [
+    'a[href]', 'area[href]', '[role="link"][href]', '[data-href]',
+    '[data-url]', '[data-route]', '[routerlink]', '[ng-reflect-router-link]'
+  ].join(',');
+  const viewSelector = [
+    '[role="tab"]', '[data-bs-toggle="tab"]', '[data-toggle="tab"]',
+    '[data-tab-target]', '[data-bs-target]', '[data-target]',
+    '[role="menuitem"]', '[role="link"]', 'button', '[role="button"]', 'nav button',
+    '[role="navigation"] button', 'nav [aria-controls]',
+    '[role="navigation"] [aria-controls]', '[role="navigation"] [role="button"]',
+    'mat-nav-list mat-list-item', 'mat-nav-list [mat-list-item]'
+  ].join(',');
+  const navigationRoots = () => {
     const values = [document];
-    for (let index = 0; index < values.length; index += 1) {
-      for (const element of values[index].querySelectorAll('*')) {
+    for (let i = 0; i < values.length; i++) {
+      for (const element of values[i].querySelectorAll('*')) {
         if (element.shadowRoot) values.push(element.shadowRoot);
       }
     }
     return values;
   };
+  const rootScope = root => {
+    const parts = [];
+    while (root.host) {
+      const host = root.host;
+      const siblings = Array.from(host.parentNode?.children || []).filter(e => e.tagName === host.tagName);
+      parts.unshift(host.tagName.toLowerCase() + (host.id ? '#' + host.id : ':' + siblings.indexOf(host)));
+      root = host.getRootNode();
+    }
+    return parts.join('/');
+  };
+  const controlLabel = element => (element.getAttribute('aria-label') ||
+    element.textContent || element.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0,160);
+  const composedClosest = (element, selector) => {
+    for (let cursor = element; cursor; cursor = cursor.getRootNode().host) {
+      const found = cursor.closest(selector);
+      if (found) return found;
+    }
+    return null;
+  };
+  const isNavigationControl = element => element.matches(
+    '[role="tab"],[role="menuitem"],[role="link"],[data-bs-toggle="tab"],[data-toggle="tab"],'+
+    '[data-tab-target],[data-bs-target],[data-target],mat-nav-list mat-list-item,mat-nav-list [mat-list-item]'
+  ) || (!!composedClosest(element, 'nav,[role="navigation"]') &&
+    element.matches('button,[role="button"],[aria-controls]'));
+  const unsafeAction = element => {
+    const text = [element.getAttribute('aria-label'), element.textContent, element.getAttribute('title')]
+      .filter(Boolean).join(' ').replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    return ['add','approve','buy','cancel','checkout','confirm','create','delete','deploy','destroy',
+      'disable','edit','enable','execute','export','import','logout','pay','purchase','reboot',
+      'reject','remove','restart','save','send','sign out','signout','start','stop','submit',
+      'terminate','update','upload'].some(word => (' ' + text + ' ').includes(' ' + word + ' '));
+  };
+  const visibleControl = element => {
+    const style = getComputedStyle(element), rect = element.getBoundingClientRect();
+    if (element.closest('[hidden],[inert],[aria-hidden="true"]') ||
+        style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) return false;
+    const root = element.getRootNode();
+    return !root.host || visibleControl(root.host);
+  };
+  const routeAttribute = element => element.getAttribute('href') || element.getAttribute('data-href') ||
+    element.getAttribute('data-url') || element.getAttribute('routerlink') ||
+    element.getAttribute('ng-reflect-router-link') || element.getAttribute('data-route') || '';
+  const controlledPanel = element => {
+    const raw = element.getAttribute('aria-controls') || element.getAttribute('data-tab-target') ||
+      element.getAttribute('data-bs-target') || element.getAttribute('data-target') ||
+      (element.getAttribute('href') || '');
+    const panel = raw.replace(/^#/, '');
+    return panel && !/[\s/?!]/.test(panel) && panel.length <= 160 ? panel : '';
+  };
+  const isMenuExpander = element => {
+    const role = element.getAttribute('role');
+    if (role === 'tab' || element.matches('[data-bs-toggle="tab"],[data-toggle="tab"]')) return false;
+    if (element.hasAttribute('aria-expanded') || ['menu','true','tree','listbox'].includes(element.getAttribute('aria-haspopup')) ||
+        element.matches('[data-bs-toggle="collapse"],[data-bs-toggle="dropdown"],[data-toggle="collapse"],[data-toggle="dropdown"]')) return true;
+    const panel = controlledPanel(element);
+    const target = panel && element.getRootNode().querySelector('#' + CSS.escape(panel));
+    return !!target && (target.matches('nav,[role="navigation"],[role="menu"],[role="menubar"]') ||
+      !!target.querySelector('[role="menuitem"],[aria-expanded]'));
+  };
+  const navigationParents = element => {
+    const chains = [];
+    const openers = window.__portalValidatorPanelOpeners;
+    for (let cursor = element.parentElement || element.getRootNode().host; cursor;
+         cursor = cursor.parentElement || cursor.getRootNode().host) {
+      const opener = openers?.get(cursor);
+      if (opener) chains.unshift([...(opener.ancestors || []), opener.label]);
+    }
+    const names = [];
+    for (const chain of chains) {
+      // Controlled menus may be sibling/portal elements instead of physical
+      // descendants of their opener. Retain the opener's observed ancestry,
+      // merging only overlapping chains rather than erasing repeated names.
+      let overlap = Math.min(names.length, chain.length);
+      while (overlap && !names.slice(-overlap).every((label,index) => label === chain[index])) overlap -= 1;
+      names.push(...chain.slice(overlap));
+    }
+    return names;
+  };
+  const describeView = element => {
+    if (!isNavigationControl(element) || !visibleControl(element) || composedClosest(element, 'form') || element.hasAttribute('disabled') ||
+        element.getAttribute('aria-disabled') === 'true' || element.hasAttribute('download') ||
+        unsafeAction(element) || isMenuExpander(element)) return null;
+    const raw = routeAttribute(element);
+    if (raw && (!raw.startsWith('#') || raw.startsWith('#/') || raw.startsWith('#!/'))) return null;
+    const label = controlLabel(element);
+    if (!label) return null;
+    const panel = controlledPanel(element);
+    const target = panel && element.getRootNode().querySelector('#' + CSS.escape(panel));
+    // A broken explicit target is unresolved navigation, not a speculative view.
+    if (panel && !target) return null;
+    if (!target && !isNavigationControl(element)) return null;
+    const identity = panel || ('navigation:' + (element.id || label));
+    const region = composedClosest(element, 'nav,[role="navigation"],[role="menu"],[role="tablist"]');
+    const regionIdentity = region && (region.id ? '#' + region.id : region.getAttribute('aria-label'));
+    const scope = rootScope(element.getRootNode()) + (regionIdentity ? '|' + regionIdentity : '');
+    return {panel:identity, label, id:element.id || '', kind:target ? 'panel' : 'navigation',
+      scope, ancestors:JSON.stringify(navigationParents(element))};
+  };
+"""
+
+
+DISCOVER_ROUTES_SCRIPT = r"""
+async (maximumScrolls) => {
+  /* NAVIGATION_DOM_HELPERS */
+  const values = [];
+  const seen = new Set();
+  const baselinePanels = window.__portalValidatorBaselinePanels || new Set();
+  const rememberBaseline = !window.__portalValidatorBaselinePanels;
+  window.__portalValidatorBaselinePanels = baselinePanels;
   const collect = () => {
-    for (const root of roots()) {
+    for (const root of navigationRoots()) {
       // Panels are real UI views, not invented HTTP/hash routes. Discover
       // them without clicking: the normal validation loop owns activation,
       // request attribution, readiness and the existing read-only policy.
-      for (const element of root.querySelectorAll(
-        '[role="tab"], [data-bs-toggle="tab"], [data-toggle="tab"], ' +
-        '[data-tab-target], [data-bs-target], [data-target]'
-      )) {
-        const raw = element.getAttribute('href') || '';
-        // A declared router URL is already covered by normal URL navigation.
-        // Do not also enqueue it as a second UI view and dispatch its POST twice.
-        if (raw.startsWith('#/') || raw.startsWith('#!/') ||
-            ['data-href','data-url','routerlink','data-route'].some(name => element.hasAttribute(name))) continue;
-        const target = element.getAttribute('aria-controls') ||
-          element.getAttribute('data-tab-target') || element.getAttribute('data-bs-target') ||
-          element.getAttribute('data-target') ||
-          (raw.startsWith('#') ? raw : '');
-        const panel = target.replace(/^#/, '');
-        if (!panel || /[\s/?!]/.test(panel) || panel.length > 160 ||
-            (raw && !raw.startsWith('#')) || !root.querySelector('#' + CSS.escape(panel))) continue;
-        if (element.closest('form') || element.hasAttribute('disabled') ||
-            element.getAttribute('aria-disabled') === 'true' || element.hasAttribute('download')) continue;
-        const style = getComputedStyle(element), rect = element.getBoundingClientRect();
-        if (element.closest('[hidden],[inert],[aria-hidden="true"]') ||
-            style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) continue;
+      for (const element of root.querySelectorAll(viewSelector)) {
+        const view = describeView(element);
+        if (!view) continue;
+        const panel = view.scope + '\0' + view.panel;
         if (rememberBaseline && (element.getAttribute('aria-selected') === 'true' ||
+            ['page','true'].includes(element.getAttribute('aria-current')) ||
             element.classList.contains('active'))) baselinePanels.add(panel);
         if (baselinePanels.has(panel)) continue;
         const ariaLabel = (element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
@@ -462,12 +552,10 @@ async (maximumScrolls) => {
         values.push({url: window.location.href, label, source:'ui-tab',
           accessibleName:ariaLabel, labelSource:ariaLabel ? 'aria-label' : 'visible-text',
           safetyLabel:[ariaLabel, element.textContent, element.getAttribute('title')].filter(Boolean).join(' '),
-          viewControl:{panel, label, id:element.id || ''}});
+          navigationHierarchy:navigationParents(element), viewControl:view});
       }
-      for (const element of root.querySelectorAll(selectors.join(','))) {
-        const raw = element.getAttribute('href') || element.getAttribute('data-href') ||
-      element.getAttribute('data-url') || element.getAttribute('routerlink') ||
-      element.getAttribute('ng-reflect-router-link') || element.getAttribute('data-route');
+      for (const element of root.querySelectorAll(routeSelector)) {
+        const raw = routeAttribute(element);
         if (!raw) continue;
         let url;
         try { url = new URL(raw, document.baseURI).href; } catch (_) { continue; }
@@ -485,6 +573,7 @@ async (maximumScrolls) => {
           accessibleName: (ariaLabel || labelledBy || '').slice(0, 160),
           labelSource: ariaLabel ? 'aria-label' : labelledBy ? 'aria-labelledby' :
             visibleLabel ? 'visible-text' : titleLabel ? 'title' : 'none',
+          navigationHierarchy:navigationParents(element),
           source: element.hasAttribute('download') ? 'download' :
             (element.getAttribute('role') || element.tagName.toLowerCase())
         });
@@ -492,7 +581,7 @@ async (maximumScrolls) => {
     }
   };
   collect();
-  const scrollables = roots().flatMap(root => Array.from(root.querySelectorAll(
+  const scrollables = navigationRoots().flatMap(root => Array.from(root.querySelectorAll(
     'nav, [role="navigation"], [role="menu"], [role="menubar"]'
   ))).filter(element => element.scrollHeight > element.clientHeight && element.clientHeight > 0);
   const originalPositions = scrollables.map(element => element.scrollTop);
@@ -521,11 +610,12 @@ async (maximumScrolls) => {
   }
   return values;
 }
-"""
+""".replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
 
 
 EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
-async ({reset}) => {
+async ({reset, inspectOnly}) => {
+  /* NAVIGATION_DOM_HELPERS */
   const dangerous = new Set([
     'add','approve','buy','cancel','checkout','confirm','create','delete','deploy','destroy',
     'disable','edit','enable','execute','export','import','logout','pay','purchase','reboot',
@@ -539,7 +629,9 @@ async ({reset}) => {
     'aside [aria-expanded="false"][aria-controls]',
     '[role="tab"][aria-selected="false"][aria-controls]',
     '[aria-haspopup="menu"][aria-expanded="false"]',
-    '[role="menuitem"]', '[role="tab"]'
+    '[role="menuitem"]', '[role="tab"]',
+    'nav [data-bs-target]', '[role="navigation"] [data-bs-target]',
+    'nav [data-target]', '[role="navigation"] [data-target]'
   ].join(',');
   // This set lives only for one bounded expansion pass. Retain it between
   // steps so Python can observe lazy panel requests and collect transient
@@ -548,20 +640,17 @@ async ({reset}) => {
     window.__portalValidatorVisitedControls = new WeakSet();
   }
   const visited = window.__portalValidatorVisitedControls;
-  const visible = element => {
-    const style = getComputedStyle(element);
-    const bounds = element.getBoundingClientRect();
-    return !element.closest('[hidden], [inert], [aria-hidden="true"]') &&
-      style.display !== 'none' && style.visibility !== 'hidden' &&
-      bounds.width > 0 && bounds.height > 0;
-  };
   const controls = () => {
     const values = [];
     const visit = (root) => {
-      for (const element of root.querySelectorAll(selector)) {
+      for (const element of root.querySelectorAll(selector + ',' + viewSelector)) {
         // A collapsed child may precede its opener in DOM order. Do not mark
         // it visited until it is visible and can actually be inspected.
-        if (!visited.has(element) && visible(element)) values.push(element);
+        const raw = routeAttribute(element);
+        if (!visited.has(element) && visibleControl(element) &&
+            (isNavigationControl(element) || element.matches(selector)) &&
+            (!raw || (raw.startsWith('#') && !raw.startsWith('#/') && !raw.startsWith('#!/'))) &&
+            !describeView(element)) values.push(element);
       }
       for (const element of root.querySelectorAll('*')) {
         if (element.shadowRoot) visit(element.shadowRoot);
@@ -574,6 +663,7 @@ async ({reset}) => {
   let skipped = 0;
   let inspected = 0;
   const transitions = [];
+  if (inspectOnly) return {remaining:controls().length};
   while (activated < 1 && inspected < 25) {
     const candidates = controls();
     if (!candidates.length) break;
@@ -589,22 +679,21 @@ async ({reset}) => {
       .replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase();
     const style = getComputedStyle(element);
     const bounds = element.getBoundingClientRect();
-    const unsafe = element.closest('form') || element.hasAttribute('disabled') ||
+    const unsafe = composedClosest(element, 'form') || !isMenuExpander(element) || element.hasAttribute('disabled') ||
       element.getAttribute('aria-disabled') === 'true' || element.hasAttribute('href') ||
       element.hasAttribute('data-href') || element.hasAttribute('data-url') ||
-      element.hasAttribute('routerlink') || element.hasAttribute('data-route') ||
+      element.hasAttribute('routerlink') || element.hasAttribute('ng-reflect-router-link') || element.hasAttribute('data-route') ||
       !label || style.display === 'none' || style.visibility === 'hidden' ||
       bounds.width <= 0 || bounds.height <= 0 ||
       Array.from(dangerous).some(word =>
         (' ' + normalizedLabel.replace(/[^a-z0-9]+/g, ' ').trim() + ' ').includes(' ' + word + ' '));
-    // Tabs with a real controlled panel are queued independently. Clicking
-    // them here would issue their natural POST twice and attribute it to the
-    // parent instead of the view. Menu expanders remain discovery actions.
-    const panel = (element.getAttribute('aria-controls') || element.getAttribute('data-bs-target') ||
-      element.getAttribute('data-target') || element.getAttribute('href') || '').replace(/^#/, '');
-    if (element.getAttribute('role') === 'tab' && panel && !/[\s/?!]/.test(panel) &&
-        element.getRootNode().querySelector('#' + CSS.escape(panel))) continue;
     if (unsafe) { skipped += 1; continue; }
+    const panel = controlledPanel(element);
+    const targetPanel = panel && element.getRootNode().querySelector('#' + CSS.escape(panel));
+    if (targetPanel) {
+      window.__portalValidatorPanelOpeners ||= new WeakMap();
+      window.__portalValidatorPanelOpeners.set(targetPanel, {label, ancestors:navigationParents(element)});
+    }
     const before = window.location.href;
     element.click();
     await new Promise(resolve => setTimeout(resolve, 50));
@@ -621,9 +710,9 @@ async ({reset}) => {
     }
     activated += 1;
   }
-  return {activated, skipped, inspected, transitions};
+  return {activated, skipped, inspected, transitions, remaining:controls().length};
 }
-"""
+""".replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
 
 
 SAME_DOCUMENT_TRANSITION_SCRIPT = r"""
@@ -652,6 +741,7 @@ SAME_DOCUMENT_TRANSITION_SCRIPT = r"""
 
 SEMANTIC_ROUTE_ACTIVATION_SCRIPT = r"""
 ({target, expectedLabel, source}) => {
+  /* NAVIGATION_DOM_HELPERS */
   const candidate = new URL(target, document.baseURI);
   const dangerous = new Set([
     'add','approve','buy','cancel','checkout','confirm','create','delete','deploy','destroy',
@@ -659,28 +749,12 @@ SEMANTIC_ROUTE_ACTIVATION_SCRIPT = r"""
     'reject','remove','restart','save','send','sign out','signout','start','stop','submit',
     'terminate','update','upload'
   ]);
-  const selector = [
-    'a[href]', 'area[href]', '[role="link"][href]', '[role="link"][data-href]',
-    'nav [data-url]', '[role="navigation"] [data-url]', '[role="menuitem"][data-href]',
-    '[role="tab"][data-href]', '[routerlink]', '[ng-reflect-router-link]',
-    'nav [data-route]', '[role="navigation"] [data-route]',
-    '[role="menuitem"][data-route]', '[role="tab"][data-route]',
-    '[role="menuitem"]', '[role="tab"]', 'nav button[aria-controls]',
-    '[role="navigation"] button[aria-controls]', '[role="menuitem"][aria-controls]',
-    '[role="tab"][aria-controls]'
-  ].join(',');
-  const elements = [];
-  const visit = (root) => {
-    for (const element of root.querySelectorAll(selector)) elements.push(element);
-    for (const element of root.querySelectorAll('*')) {
-      if (element.shadowRoot) visit(element.shadowRoot);
-    }
-  };
-  visit(document);
+  const elements = navigationRoots().flatMap(root => Array.from(root.querySelectorAll(routeSelector + ',' + viewSelector)));
   const expected = (expectedLabel || '').replace(/\s+/g, ' ').trim().toLowerCase();
   const matches = [];
   for (let index = 0; index < elements.length && index < 500; index += 1) {
     const element = elements[index];
+    if (!visibleControl(element)) continue;
     const label = (
       element.getAttribute('aria-label') || element.textContent || element.getAttribute('title') || ''
     ).replace(/\s+/g, ' ').trim().toLowerCase();
@@ -690,11 +764,9 @@ SEMANTIC_ROUTE_ACTIVATION_SCRIPT = r"""
       .replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase();
     if (Array.from(dangerous).some(word =>
       (' ' + safetyLabel.replace(/[^a-z0-9]+/g, ' ').trim() + ' ').includes(' ' + word + ' '))) continue;
-    if (element.closest('form') || element.hasAttribute('disabled') ||
+    if (composedClosest(element, 'form') || element.hasAttribute('disabled') ||
         element.getAttribute('aria-disabled') === 'true') continue;
-    const raw = element.getAttribute('href') || element.getAttribute('data-href') ||
-          element.getAttribute('data-url') || element.getAttribute('routerlink') ||
-          element.getAttribute('ng-reflect-router-link') || element.getAttribute('data-route');
+    const raw = routeAttribute(element);
     let urlMatches = false;
     if (raw) {
       try {
@@ -707,11 +779,11 @@ SEMANTIC_ROUTE_ACTIVATION_SCRIPT = r"""
     const role = (element.getAttribute('role') || '').toLowerCase();
     const semanticControl = source === 'safe-click' && expected && label === expected &&
       (['tab', 'menuitem'].includes(role) || (role === '' && element.hasAttribute('aria-controls')));
-    if (urlMatches || semanticControl) matches.push(index);
+    if (urlMatches || semanticControl) matches.push(element);
   }
-  return matches;
+  return matches.find(element => controlLabel(element).toLowerCase() === expected) || matches[0] || null;
 }
-"""
+""".replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
 
 
 async def activate_semantic_route(
@@ -723,33 +795,20 @@ async def activate_semantic_route(
     timeout_ms: int,
 ) -> bool:
     """Use the closest safe user-navigation equivalent when it is unambiguous."""
-    indexes = await page.evaluate(
+    handle = await page.evaluate_handle(
         SEMANTIC_ROUTE_ACTIVATION_SCRIPT,
         {"target": url, "expectedLabel": label or "", "source": source or ""},
     )
-    if not isinstance(indexes, list) or not indexes:
-        return False
-    selector = ",".join((
-        "a[href]", "area[href]", '[role="link"][href]',
-        '[role="link"][data-href]', '[data-href]', '[data-url]', '[data-route]', "nav [data-url]",
-        '[role="navigation"] [data-url]', '[role="menuitem"][data-href]',
-        '[role="tab"][data-href]', '[routerlink]', '[ng-reflect-router-link]',
-        'nav [data-route]', '[role="navigation"] [data-route]',
-        '[role="menuitem"][data-route]', '[role="tab"][data-route]',
-        '[role="menuitem"]', '[role="tab"]', "nav button[aria-controls]",
-        '[role="navigation"] button[aria-controls]',
-        '[role="menuitem"][aria-controls]', '[role="tab"][aria-controls]',
-    ))
-    # Playwright CSS locators pierce open shadow roots, matching discovery behavior.
-    candidates = page.locator(selector)
-    for index in indexes:
-        candidate = candidates.nth(int(index))
-        if await candidate.is_visible():
-            # Once attempted, a click failure must propagate. Retrying another
-            # control or falling back to goto could duplicate a natural POST.
-            await candidate.click(timeout=min(timeout_ms, 5000))
-            return True
-    return False
+    try:
+        candidate = handle.as_element()
+        if candidate is None:
+            return False
+        # Once attempted, a click failure must propagate. Retrying another
+        # control or falling back to goto could duplicate a natural POST.
+        await candidate.click(timeout=min(timeout_ms, 5000))
+        return True
+    finally:
+        await handle.dispose()
 
 
 async def expand_safe_navigation(
@@ -813,9 +872,19 @@ async def expand_safe_navigation(
     for route in routes:
         key = discovered_route_key(route, normalize_route_url(route.url) or route.url)
         existing = unique.get(key)
-        if existing is None or (not existing.label and route.label):
+        if (existing is None or (not existing.label and route.label)
+                or len(route.navigation_hierarchy) > len(existing.navigation_hierarchy)):
             unique[key] = route
     totals["routes"] = list(unique.values())
+    remaining = await page.evaluate(
+        EXPAND_SAFE_NAVIGATION_SCRIPT,
+        {"reset": int(totals["inspected"]) == 0, "inspectOnly": True},
+    )
+    totals["remaining"] = int(remaining.get("remaining", 0))
+    totals["discovered"] = int(totals["inspected"]) + int(totals["remaining"])
+    totals["unresolved"] = int(totals["skipped"]) + int(totals["remaining"])
+    totals["limit_reached"] = bool(totals["remaining"])
+    totals["view_controls"] = sum(bool(route.view_control) for route in unique.values())
     return totals
 
 
@@ -850,46 +919,88 @@ async def discover_page_routes(page, maximum_scrolls: int = 3) -> list[Discovere
             label_source=str(item.get("labelSource") or "none")[:32],
             accessible_name=str(item.get("accessibleName") or "")[:160] or None,
             view_control=view_control,
+            navigation_hierarchy=tuple(
+                str(label)[:160] for label in item.get("navigationHierarchy", [])
+                if isinstance(label, str) and label.strip()
+            ),
         ))
     return routes
 
 
 UI_VIEW_CONTROL_SCRIPT = r"""
-({panel, label}) => {
-  const roots = [document];
+({panel, label, scope, id}) => {
+  /* NAVIGATION_DOM_HELPERS */
   const matches = [];
-  for (let i = 0; i < roots.length; i++) {
-    const root = roots[i];
-    for (const element of root.querySelectorAll('*')) {
-      if (element.shadowRoot) roots.push(element.shadowRoot);
-    }
-    for (const element of root.querySelectorAll(
-      '[role="tab"], [data-bs-toggle="tab"], [data-toggle="tab"], ' +
-      '[data-tab-target], [data-bs-target], [data-target]'
-    )) {
-      if (element.closest('form') || element.hasAttribute('disabled') ||
-          element.getAttribute('aria-disabled') === 'true') continue;
-      const raw = element.getAttribute('href') || '';
-      if (raw && !raw.startsWith('#')) continue;
-      const controlled = (element.getAttribute('aria-controls') ||
-        element.getAttribute('data-tab-target') || element.getAttribute('data-bs-target') ||
-        element.getAttribute('data-target') || raw).replace(/^#/, '');
-      const name = (element.getAttribute('aria-label') || element.textContent ||
-        element.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0,160);
-      const style = getComputedStyle(element), rect = element.getBoundingClientRect();
-      if (controlled === panel && name === label && !element.closest('[hidden],[inert],[aria-hidden="true"]') &&
-          style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0) {
+  for (const root of navigationRoots()) {
+    for (const element of root.querySelectorAll(viewSelector)) {
+      const view = describeView(element);
+      if (view && view.panel === panel && view.label === label &&
+          (scope === undefined || view.scope === scope) && (!id || element.id === id)) {
         matches.push(element);
       }
     }
   }
   return matches.length === 1 ? matches[0] : null;
 }
-"""
+""".replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
+
+
+RESTORE_MENU_ANCESTOR_SCRIPT = r"""
+(label) => {
+  /* NAVIGATION_DOM_HELPERS */
+  const matches = navigationRoots().flatMap(root => Array.from(root.querySelectorAll(
+    viewSelector + ',[aria-expanded][aria-controls],[aria-haspopup="menu"]'
+  ))).filter(element => visibleControl(element) && controlLabel(element) === label &&
+    isMenuExpander(element) && !unsafeAction(element) && !composedClosest(element, 'form') &&
+    !element.hasAttribute('disabled') && element.getAttribute('aria-disabled') !== 'true' && !routeAttribute(element));
+  if (matches.length !== 1) return null;
+  const element = matches[0], panel = controlledPanel(element);
+  const target = panel && element.getRootNode().querySelector('#' + CSS.escape(panel));
+  if (element.getAttribute('aria-expanded') === 'true' && target &&
+      !composedClosest(target, '[hidden],[inert],[aria-hidden="true"]') &&
+      getComputedStyle(target).display !== 'none' && getComputedStyle(target).visibility !== 'hidden') return 'open';
+  return element;
+}
+""".replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
+
+
+NAVIGATION_VIEW_EVIDENCE_SCRIPT = r"""
+(element) => {
+  /* NAVIGATION_DOM_HELPERS */
+  return {url:location.href,
+    text:navigationRoots().map(root => root === document ?
+      (document.querySelector('main,[role="main"]') || document.body).innerText : root.textContent).join('\0'),
+    selected:element.getAttribute('aria-selected') || element.getAttribute('aria-current') || ''};
+}
+""".replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
+
+
+NAVIGATION_VIEW_COMPLETED_SCRIPT = r"""
+({element, previous}) => {
+  /* NAVIGATION_DOM_HELPERS */
+  if (location.href !== previous.url) return true;
+  const text = navigationRoots().map(root => root === document ?
+    (document.querySelector('main,[role="main"]') || document.body).innerText : root.textContent).join('\0');
+  if (text && text !== previous.text) return true;
+  if (!element.isConnected) return false;
+  const selected = element.getAttribute('aria-selected') || element.getAttribute('aria-current') || '';
+  return selected !== previous.selected && ['true','page'].includes(selected);
+}
+""".replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
 
 
 async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> None:
-    """Activate one evidenced tab, never a form or a speculative button."""
+    """Activate one evidenced navigation view and verify a real UI transition."""
+    for label in json.loads(control.get("ancestors", "[]")):
+        opener_handle = await page.evaluate_handle(RESTORE_MENU_ANCESTOR_SCRIPT, label)
+        try:
+            opener = opener_handle.as_element()
+            if opener is not None:
+                await opener.click(timeout=timeout_ms)
+            elif await opener_handle.json_value() != "open":
+                raise RuntimeError("Discovered UI view's parent menu is not uniquely and safely activatable")
+        finally:
+            await opener_handle.dispose()
     handle = await page.evaluate_handle(UI_VIEW_CONTROL_SCRIPT, control)
     try:
         element = handle.as_element()
@@ -898,6 +1009,14 @@ async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> No
         labels = await element.evaluate("e => [e.textContent,e.getAttribute('aria-label'),e.getAttribute('title')].filter(Boolean).join(' ')")
         if dangerous_control_label(labels):
             raise RuntimeError("Discovered UI tab has an unsafe action label")
+        if control.get("kind") == "navigation":
+            evidence = await page.evaluate(NAVIGATION_VIEW_EVIDENCE_SCRIPT, element)
+            await element.click(timeout=timeout_ms)
+            await page.wait_for_function(
+                NAVIGATION_VIEW_COMPLETED_SCRIPT,
+                arg={"element": element, "previous": evidence}, timeout=timeout_ms,
+            )
+            return
         evidence = await element.evaluate(r"""(e, panel) => {
           const p = e.getRootNode().querySelector('#' + CSS.escape(panel));
           const style = p && getComputedStyle(p), rect = p && p.getBoundingClientRect();

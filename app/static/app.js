@@ -139,6 +139,15 @@ const postDiagnosticFields = [
   ['post_requests_without_completed_responses','POST requests without completed responses'],
   ['unique_post_endpoints_reported','Unique POST endpoints reported'],
 ];
+const apiLifecycleSummaryFields = [
+  ['api_requests_observed','Requests observed'],
+  ['api_responses_completed','Responses completed'],
+  ['api_requests_failed','Target request failures'],
+  ['api_requests_blocked','Policy-blocked requests'],
+  ['api_requests_canceled','Canceled requests'],
+  ['api_requests_incomplete','Incomplete requests'],
+  ['api_requests_not_actively_tested','Not actively tested'],
+];
 
 // Preferences contain column names only, never scan data or credentials. Unknown
 // keys default to visible, so a newly introduced column is not silently hidden.
@@ -162,7 +171,7 @@ const tableColumns = {
     ['session_refresh_phase_count','Refresh Calls','Recognized authentication/session/token-refresh calls; ordinary route calls are not refresh traffic.'],
     ['average_duration_ms','Average Time (ms)','Mean actual completed API response duration in milliseconds; excludes blocked and no-response calls.'],
     ['worst_duration_ms','Worst Time (ms)','Maximum actual completed API response duration in milliseconds.'],
-    ['observation_outcome','Health','Observed lifecycle/health; blocked attempts remain visible as BLOCKED_BY_POLICY, not target failures.'],
+    ['observation_outcome','Request lifecycle','Observed lifecycle; blocked attempts remain visible as BLOCKED_BY_POLICY, not target failures.'],
     ['traffic_role','Traffic role','Evidence-based authentication, challenge, configuration, business, or unclassified traffic; independent of request authorization.'],
     ['policies','Policy','Observed read-only approval/block decisions. No bodies are retained; explicit GraphQL query rules inspect operation types in memory.'],
     ['response_status_counts','Response status','Actual observed HTTP response codes and their call counts. N/A means no HTTP response was observed.'],
@@ -170,6 +179,9 @@ const tableColumns = {
     ['routes_using_endpoint','Associated routes','Logical portal routes or UI views on which this endpoint was naturally observed.'],
     ['authentication_classifications','Auth classification','Observed authentication-bootstrap/session-refresh purpose; independent of read-only approval and target health.'],
     ['post_classifications','POST classification','Evidence-based POST observation, approval, blocking, authentication, and network-failure labels. Multiple labels can apply to one call.'],
+    ['validation_outcome','Observed result','Result of passive browser observation; a URL alone does not establish successful validation.'],
+    ['active_validation_status','Active test','Whether a separate endpoint test was performed. Natural browser activity is passive observation.'],
+    ['validation_reason','Result reason','Safe explanation of incomplete, failed, blocked, or passively observed requests.'],
   ],
   route: [
     ['classification','Status','PASS and PASS_WITH_WARNINGS both count as healthy routes.'],
@@ -185,6 +197,8 @@ const tableColumns = {
     ['tls_status','TLS','Verified browser TLS trust; not an origin-certificate inspection claim.'],
     ['warning_findings','Warnings','Count and drill-down of sanitized non-fatal findings.'],
     ['details','Details','Route evidence and timing breakdown.'],
+    ['navigation_hierarchy','Navigation hierarchy','Parent and child navigation labels; distinct UI states retain their logical route identity.'],
+    ['discovery_sources','Discovery source','How the route was discovered, separate from its display-name source.'],
   ],
   resource: [
     ['type','Type','Naturally observed browser resource type.'],
@@ -205,7 +219,7 @@ const tablePagination = Object.fromEntries(['route','api','resource'].map((kind)
 
 function paginateTable(kind, items) {
   const state = tablePagination[kind];
-  const controls = kind === 'route' ? ['result-search','result-filter','navigation-filter'] : kind === 'api' ? ['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','api-failed-only'] : ['resource-search','resource-type-filter','resource-route-filter','resource-status-filter','resource-failed-only','resource-large-only'];
+  const controls = kind === 'route' ? ['result-search','result-filter','navigation-filter'] : kind === 'api' ? ['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','api-lifecycle-filter','api-response-filter','api-failed-only'] : ['resource-search','resource-type-filter','resource-route-filter','resource-status-filter','resource-failed-only','resource-large-only'];
   const filters = controls.map((id) => { const input = byId(id); return input.type === 'checkbox' ? input.checked : input.value; });
   const sort = kind === 'route' ? routeSort : kind === 'api' ? apiSort : resourceSort;
   const key = JSON.stringify([filters,sort,activeDrilldown,apiFailureOnly,items.map((item) => item.route_id || item.canonical_route || item.url || [item.method,item.host,item.endpoint,item.path])]);
@@ -436,17 +450,19 @@ function matchesOutcome(item, filter) {
   if (filter === 'failure') return failureOutcomes.has(item.classification) || item.page_load_status === 'FAILED_TO_LOAD';
   if (filter === 'auth') return authOutcomes.has(item.classification);
   if (filter === 'access') return accessOutcomes.has(item.classification);
+  if (filter === 'not-tested') return item.validation_status === 'NOT_TESTED' || item.page_load_status === 'NOT_TESTED';
   return item.classification === filter;
 }
 
 function matchesDrilldown(item) {
-  if (['all','discovered','validated'].includes(activeDrilldown)) return true;
+  if (['all','discovered'].includes(activeDrilldown)) return true;
+  if (activeDrilldown === 'validated') return item.validation_status !== 'NOT_TESTED' && item.page_load_status !== 'NOT_TESTED' && item.classification !== 'SKIPPED';
   if (activeDrilldown === 'healthy') return passOutcomes.has(item.classification);
   if (activeDrilldown === 'warnings') return item.classification === 'PASS_WITH_WARNINGS';
   if (activeDrilldown === 'failed') return matchesOutcome(item, 'failure');
   if (activeDrilldown === 'auth') return authOutcomes.has(item.classification);
   if (activeDrilldown === 'access') return accessOutcomes.has(item.classification);
-  if (activeDrilldown === 'not-tested') return item.page_load_status === 'NOT_TESTED';
+  if (activeDrilldown === 'not-tested') return matchesOutcome(item, 'not-tested');
   if (activeDrilldown === 'api-failures') return Number(item.api_failures || 0) > 0;
   if (activeDrilldown === 'resource-failures') return Number(item.resource_failure_count || 0) > 0;
   if (activeDrilldown === 'console') return (item.console_errors?.length || 0) + (item.page_errors?.length || 0) > 0;
@@ -579,13 +595,18 @@ function showRouteWarnings(item) {
   scrollAndFocus(byId('evidence-panel'));
 }
 
+function routeDiscoverySources(item) {
+  const sources = (item.discovery_sources || []).map((source) => typeof source === 'string' ? source : source.source || source.type || '');
+  return [...new Set([...sources,item.route_source].filter(Boolean))].join(', ') || 'Not recorded';
+}
+
 function renderRows() {
   if (!lastReport) return;
   const query = byId('result-search').value.trim().toLowerCase();
   const filter = byId('result-filter').value;
   const navigationFilter = byId('navigation-filter').value;
-  let rows = [...lastReport.results].map((item) => ({...item, warning_findings:routeWarnings(item).length, console_count:(item.console_errors?.length || 0) + (item.page_errors?.length || 0)})).filter((item) => {
-    const haystack = `${item.url} ${item.route_name || ''} ${item.display_path || ''} ${item.document_title || item.title || ''} ${item.navigation_label || item.route_label || ''} ${item.classification} ${item.failure_reason || ''}`.toLowerCase();
+  let rows = [...(lastReport.route_inventory || lastReport.results || [])].map((item) => ({...item, warning_findings:routeWarnings(item).length, console_count:(item.console_errors?.length || 0) + (item.page_errors?.length || 0)})).filter((item) => {
+    const haystack = `${item.url} ${item.route_name || ''} ${item.display_path || ''} ${item.document_title || item.title || ''} ${item.navigation_label || item.route_label || ''} ${(item.navigation_hierarchy || []).join(' ')} ${routeDiscoverySources(item)} ${item.classification} ${item.failure_reason || ''}`.toLowerCase();
     return (!query || haystack.includes(query)) && matchesOutcome(item, filter) && matchesDrilldown(item) && (navigationFilter === 'all' || item.navigation_type === navigationFilter);
   });
   rows.sort((left, right) => {
@@ -600,8 +621,10 @@ function renderRows() {
   byId('result-list').innerHTML = rows.map((item) => {
     const route = routeDisplay(item);
     const failure = item.failure_reason ? `<small class="failure-reason"><b>${escapeHtml(item.failure_dimension || 'VALIDATION')}</b>${escapeHtml(item.failure_reason)}</small>` : '';
-    return `<tr class="route-row outcome-${statusClass(item.classification)}"><td><span class="outcome-badge ${statusClass(item.classification)}">${escapeHtml(item.classification)}</span>${failure}</td><td class="route-name-cell"><strong>${escapeHtml(item.route_name || item.route_label || 'Unnamed route')}</strong><small>${escapeHtml(item.route_name_source || 'FALLBACK')}</small></td><td class="route-cell"><span>${escapeHtml(route.host)}</span><code>${escapeHtml(route.path)}</code></td><td><span class="dimension-state ${statusClass(item.navigation_status)}">${escapeHtml(item.navigation_type || 'DOCUMENT_NAVIGATION')}</span></td><td><strong class="http-status">${escapeHtml(item.http_status_display ?? item.status ?? 'N/A')}</strong></td><td><span class="time-value ${item.slow ? 'slow' : ''}">${escapeHtml(item.load_ms ?? '—')} ms</span></td><td><span class="dimension-state ${statusClass(item.api_status)}">${escapeHtml(item.api_status)}</span></td><td><span class="dimension-state ${statusClass(item.resource_status)}">${escapeHtml(item.resource_status)}</span></td><td><span class="dimension-state ${statusClass(item.console_status)}">${escapeHtml(item.console_status)}</span></td><td><span class="dimension-state ${statusClass(item.authentication_status)}">${escapeHtml(item.authentication_status)}</span></td><td><span class="dimension-state ${statusClass(item.tls_status)}">${escapeHtml(item.tls_status)}</span></td><td><strong>${escapeHtml(item.warning_findings || 0)}</strong></td><td><button type="button" class="secondary route-inspect" aria-expanded="false" aria-controls="route-inspector" aria-label="Inspect ${escapeHtml(item.route_name || item.display_path || 'route')}">Inspect</button></td></tr>`;
-  }).join('') || '<tr><td colspan="13" class="empty-table">No routes match this filter.</td></tr>';
+    const hierarchy = item.navigation_hierarchy?.length ? item.navigation_hierarchy.join(' › ') : [item.parent_route_name,item.route_name || item.route_label].filter(Boolean).join(' › ');
+    const dimension = (value) => `<span class="dimension-state ${statusClass(value)}">${escapeHtml(value || 'NOT_TESTED')}</span>`;
+    return `<tr class="route-row outcome-${statusClass(item.classification)}"><td><span class="outcome-badge ${statusClass(item.classification)}">${escapeHtml(item.classification)}</span>${failure}</td><td class="route-name-cell"><strong>${escapeHtml(item.route_name || item.route_label || 'Unnamed route')}</strong><small>${escapeHtml(item.route_name_source || 'FALLBACK')}</small></td><td class="route-cell"><span>${escapeHtml(route.host)}</span><code>${escapeHtml(route.path)}</code></td><td>${dimension(item.navigation_type || 'DOCUMENT_NAVIGATION')}</td><td><strong class="http-status">${escapeHtml(item.http_status_display ?? item.status ?? 'N/A')}</strong></td><td><span class="time-value ${item.slow ? 'slow' : ''}">${escapeHtml(item.load_ms ?? '—')} ms</span></td><td>${dimension(item.api_status)}</td><td>${dimension(item.resource_status)}</td><td>${dimension(item.console_status)}</td><td>${dimension(item.authentication_status)}</td><td>${dimension(item.tls_status)}</td><td><strong>${escapeHtml(item.warning_findings || 0)}</strong></td><td><button type="button" class="secondary route-inspect" aria-expanded="false" aria-controls="route-inspector" aria-label="Inspect ${escapeHtml(item.route_name || item.display_path || 'route')}">Inspect</button></td><td class="route-hierarchy-cell">${escapeHtml(hierarchy || 'Not recorded')}${item.parent_route_name ? `<small>Parent: ${escapeHtml(item.parent_route_name)}</small>` : ''}<small>${escapeHtml(item.spa_route || item.route_id || '')}</small></td><td class="route-discovery-cell">${escapeHtml(routeDiscoverySources(item))}</td></tr>`;
+  }).join('') || `<tr><td colspan="${tableColumns.route.length}" class="empty-table">No routes match this filter.</td></tr>`;
   byId('result-list').querySelectorAll('.route-row').forEach((row, index) => {
     const item = rows[index];
     if (accessOutcomes.has(item.classification)) {
@@ -665,6 +688,34 @@ function apiDisplayPolicies(item) {
   return [...new Set(names.filter((name) => typeof name === 'string').map((name) => aliases[name] || name))].sort();
 }
 
+function apiLifecycle(item) {
+  return item.observation_status || item.observation_outcome || (item.health === 'DEGRADED' ? 'WARNING' : item.health) || 'OBSERVED';
+}
+
+function apiValidationReason(item) {
+  return item.validation_reason || (item.validation_reasons || []).map((reason) => typeof reason === 'string' ? reason : reason.message || reason.code).filter(Boolean).join(' ') || 'No validation reason recorded in this report.';
+}
+
+function apiHasHttpResponse(item) {
+  // Older reports may contain response-class counters without individual codes.
+  return Number(item.responded_calls || 0) > 0
+    || ['status_2xx','status_3xx','status_4xx','status_5xx'].some((key) => Number(item[key] || 0) > 0)
+    || Object.values(item.response_status_counts || {}).some((count) => Number(count) > 0);
+}
+
+function updateApiEvidenceFilters(inventory) {
+  const lifecycle = byId('api-lifecycle-filter');
+  const selectedLifecycle = lifecycle.value;
+  const lifecycles = [...new Set(inventory.map(apiLifecycle))].sort();
+  lifecycle.innerHTML = `<option value="all">All lifecycle states</option><option value="NOT_ACTIVELY_TESTED">Not actively tested</option>${lifecycles.map((state) => `<option value="${escapeHtml(state)}">${escapeHtml(state)}</option>`).join('')}`;
+  if (selectedLifecycle === 'NOT_ACTIVELY_TESTED' || lifecycles.includes(selectedLifecycle)) lifecycle.value = selectedLifecycle;
+  const response = byId('api-response-filter');
+  const selectedResponse = response.value;
+  const codes = [...new Set(inventory.flatMap((item) => Object.keys(item.response_status_counts || {})))].sort((left,right) => Number(left) - Number(right));
+  response.innerHTML = `<option value="all">All HTTP responses</option><option value="none">No HTTP response</option>${codes.map((code) => `<option value="${escapeHtml(code)}">HTTP ${escapeHtml(code)}</option>`).join('')}`;
+  if (selectedResponse === 'none' || codes.includes(selectedResponse)) response.value = selectedResponse;
+}
+
 function renderApiInventory() {
   const inventory = lastReport?.api_inventory || [];
   const posts = lastReport?.summary?.post_summary || {};
@@ -674,6 +725,11 @@ function renderApiInventory() {
     byId(`post-summary-${key}`).setAttribute('aria-label', `${label}: ${value}`);
   });
   const diagnostics = lastReport?.summary?.post_diagnostics || {};
+  apiLifecycleSummaryFields.forEach(([key,label]) => {
+    const value = Number.isFinite(lastReport?.summary?.[key]) ? lastReport.summary[key] : 'Not recorded';
+    byId(`api-lifecycle-${key}`).textContent = String(value);
+    byId(`api-lifecycle-${key}`).setAttribute('aria-label', `${label}: ${value}`);
+  });
   postDiagnosticFields.forEach(([key,label]) => {
     const value = Number.isFinite(diagnostics[key]) ? diagnostics[key] : 'Not recorded';
     byId(`post-diagnostic-${key}`).textContent = String(value);
@@ -681,14 +737,17 @@ function renderApiInventory() {
   });
   const roleFilter = byId('api-role-filter');
   const previousRole = roleFilter.value;
-  const roles = [...new Set(inventory.map((item) => item.traffic_role || 'UNCLASSIFIED'))].sort();
+  const roles = [...new Set(['APPLICATION_API',...inventory.map((item) => item.traffic_role || 'UNCLASSIFIED')])].sort();
   roleFilter.innerHTML = `<option value="all">All traffic</option>${roles.map((role) => `<option value="${escapeHtml(role)}">${escapeHtml(role)}</option>`).join('')}`;
   if (roles.includes(previousRole)) roleFilter.value = previousRole;
+  updateApiEvidenceFilters(inventory);
   const search = byId('api-search').value.trim().toLowerCase();
   const method = byId('api-method-filter').value;
   const health = byId('api-status-filter').value;
   const policy = byId('api-policy-filter').value;
   const trafficRole = roleFilter.value;
+  const lifecycle = byId('api-lifecycle-filter').value;
+  const response = byId('api-response-filter').value;
   const route = byId('api-route-filter')?.value || 'all';
   const failedOnly = apiFailureOnly || byId('api-failed-only').checked;
   let visible = inventory.filter((item) => {
@@ -699,6 +758,8 @@ function renderApiInventory() {
       && (method === 'all' || item.method === method)
       && (health === 'all' || outcome === health)
       && (trafficRole === 'all' || (item.traffic_role || 'UNCLASSIFIED') === trafficRole)
+      && (lifecycle === 'all' || (lifecycle === 'NOT_ACTIVELY_TESTED' ? item.actively_tested !== true : apiLifecycle(item) === lifecycle))
+      && (response === 'all' || (response === 'none' ? !apiHasHttpResponse(item) : Number(item.response_status_counts?.[response] || 0) > 0))
       && (policy === 'all' || (policy === 'blocked' ? Number(item.blocked_count || 0) > 0 : policy === 'approved-post' ? item.method === 'POST' && policies.includes('APPROVED_READ_ONLY') : policy === 'target-failures' ? targetFailure : Number(item.allowed_calls ?? item.calls ?? 0) > 0))
       && (route === 'all' || (item.routes_using_endpoint || []).includes(route))
       && (!failedOnly || ['FAILED','WARNING'].includes(outcome));
@@ -718,15 +779,15 @@ function renderApiInventory() {
     const statusCodes = Object.entries(item.response_status_counts || {}).map(([status,count]) => `${status} (${count})`).join(', ') || 'N/A';
     const failureCount = item.failure_count ?? item.target_failure_count ?? (Number(item.status_4xx || 0) + Number(item.status_5xx || 0) + Number(item.network_failures || 0) + Number(item.response_body_failures || 0));
     const routeNames = (item.routes_using_endpoint || []).map((identity) => {
-      const matched = (lastReport?.results || []).find((result) => [result.route_id,result.normalized_route_identity,result.canonical_route,result.url].includes(identity));
+      const matched = (lastReport?.route_inventory || lastReport?.results || []).find((result) => [result.route_id,result.normalized_route_identity,result.canonical_route,result.url].includes(identity));
       return matched?.route_name || matched?.route_label || identity;
     }).join(', ') || 'Not attributed';
-    return `<tr><td><strong>${escapeHtml(item.method)}</strong></td><td>${escapeHtml(item.host)}</td><td><button class="api-endpoint" type="button" data-api-index="${index}" title="${escapeHtml(item.endpoint)}">${escapeHtml(item.endpoint)}</button></td>${numbers.map((value) => `<td>${escapeHtml(value)}</td>`).join('')}<td><span class="dimension-state ${statusClass(outcome)}">${escapeHtml(healthLabel)}</span></td><td class="api-role-cell">${escapeHtml(item.traffic_role || 'UNCLASSIFIED')}</td><td class="api-policy-cell">${escapeHtml(policies.join(', ') || 'N/A')}</td><td class="api-response-status-cell">${escapeHtml(statusCodes)}</td><td class="api-failure-count-cell">${escapeHtml(failureCount)}</td><td class="api-associated-routes-cell">${escapeHtml(routeNames)}</td><td class="api-auth-class-cell">${escapeHtml((item.authentication_classifications || []).join(', ') || 'Not recorded')}</td><td class="api-post-class-cell">${escapeHtml((item.post_classifications || []).join(', ') || (item.method === 'POST' ? 'Not recorded' : 'N/A'))}</td></tr>`;
-  }).join('') || `<tr><td colspan="26" class="empty-table">${method === 'POST' && !inventory.some((item) => item.method === 'POST') ? 'No POST requests were observed for this scan.' : failedOnly || policy === 'target-failures' ? 'No target API failures match these filters.' : 'No API requests match these filters.'}</td></tr>`;
+    return `<tr><td><strong>${escapeHtml(item.method)}</strong></td><td>${escapeHtml(item.host)}</td><td><button class="api-endpoint" type="button" data-api-index="${index}" title="${escapeHtml(item.endpoint)}">${escapeHtml(item.endpoint)}</button></td>${numbers.map((value) => `<td>${escapeHtml(value)}</td>`).join('')}<td><span class="dimension-state ${statusClass(outcome)}">${escapeHtml(healthLabel)}</span></td><td class="api-role-cell">${escapeHtml(item.traffic_role || 'UNCLASSIFIED')}</td><td class="api-policy-cell">${escapeHtml(policies.join(', ') || 'N/A')}</td><td class="api-response-status-cell">${escapeHtml(statusCodes)}</td><td class="api-failure-count-cell">${escapeHtml(failureCount)}</td><td class="api-associated-routes-cell">${escapeHtml(routeNames)}</td><td class="api-auth-class-cell">${escapeHtml((item.authentication_classifications || []).join(', ') || 'Not recorded')}</td><td class="api-post-class-cell">${escapeHtml((item.post_classifications || []).join(', ') || (item.method === 'POST' ? 'Not recorded' : 'N/A'))}</td><td class="api-validation-cell">${escapeHtml(item.validation_outcome || item.validation_status || 'NOT_RECORDED')}</td><td class="api-active-test-cell">${escapeHtml(item.active_validation_status || 'NOT_ACTIVELY_TESTED')}</td><td class="api-validation-reason-cell">${escapeHtml(apiValidationReason(item))}</td></tr>`;
+  }).join('') || `<tr><td colspan="${tableColumns.api.length}" class="empty-table">${method === 'POST' && !inventory.some((item) => item.method === 'POST') ? 'No POST requests were observed for this scan.' : failedOnly || policy === 'target-failures' ? 'No target API failures match these filters.' : 'No API requests match these filters.'}</td></tr>`;
   byId('api-list').querySelectorAll('[data-api-index]').forEach((button) => button.addEventListener('click', () => {
     const item = visible[Number(button.dataset.apiIndex)];
     showEvidence(`${item.method} ${item.host}${item.endpoint}`, item);
-    byId('evidence-content').insertAdjacentHTML('afterbegin', inspectSection('Request lifecycle', {traffic_role:item.traffic_role || 'UNCLASSIFIED',traffic_roles:item.traffic_roles,observed:item.observed_calls ?? item.calls ?? null,allowed:item.allowed_calls ?? null,blocked:item.blocked_calls ?? item.blocked_count ?? null,sent:item.sent_calls ?? null,responded:item.responded_calls ?? null,completed:item.completed_calls ?? null,failed:item.failed_calls ?? null,canceled:item.canceled_calls ?? null,incomplete:item.incomplete_calls ?? null,validation_status:item.validation_status,observation_status:item.observation_status || item.observation_outcome,post_classifications:item.post_classifications,authentication_classifications:item.authentication_classifications,response_status_counts:item.response_status_counts,block_reasons:item.block_reasons}));
+    byId('evidence-content').insertAdjacentHTML('afterbegin', inspectSection('Request lifecycle', {traffic_role:item.traffic_role || 'UNCLASSIFIED',traffic_roles:item.traffic_roles,observed:item.observed_calls ?? item.calls ?? null,allowed:item.allowed_calls ?? null,blocked:item.blocked_calls ?? item.blocked_count ?? null,sent:item.sent_calls ?? null,responded:item.responded_calls ?? null,completed:item.completed_calls ?? null,failed:item.failed_calls ?? null,canceled:item.canceled_calls ?? null,incomplete:item.incomplete_calls ?? null,validation_status:item.validation_status,validation_outcome:item.validation_outcome,active_validation_status:item.active_validation_status || 'NOT_ACTIVELY_TESTED',validation_basis:item.validation_basis,validation_reason:apiValidationReason(item),observation_status:item.observation_status || item.observation_outcome,post_classifications:item.post_classifications,authentication_classifications:item.authentication_classifications,response_status_counts:item.response_status_counts,block_reasons:item.block_reasons}));
   }));
   refreshScrollSync();
 }
@@ -787,6 +848,7 @@ function renderResourceSummary() {
     ['Resource Failures',summary.resource_failures ?? details.filter(resourceIsFailed).length],
   ];
   byId('resource-summary').innerHTML = cards.map(([label,value]) => `<div class="resource-card"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></div>`).join('');
+  byId('resource-scope').textContent = `Scope: ${summary.scope || 'scan-wide browser observations'}. ${summary.scan_wide_unique_resources ?? lastReport?.resource_inventory?.length ?? details.length} unique resources; ${summary.scan_wide_calls ?? summary.resources_observed ?? details.length} observed calls across the scan. ${summary.route_scoped_calls ?? summary.route_resource_call_count ?? 'Not recorded'} route-attributed calls (a shared resource may belong to multiple routes).`;
   const transferCard = byId('resource-summary').children[1];
   transferCard.title = `${summary.resources_with_transfer_size ?? measurable.length} of ${summary.resources_observed ?? details.length} resource observations expose transfer bytes; missing sizes are excluded, so this is a measured subtotal.`;
   renderResourceDetails();
@@ -816,12 +878,17 @@ function activateSummary(action, value, button) {
   activeDrilldown = action;
   apiFailureOnly = action === 'api-failures';
   byId('api-failed-only').checked = apiFailureOnly;
+  if (['business-apis','apis','api-failures'].includes(action)) {
+    ['api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-lifecycle-filter','api-response-filter'].forEach((id) => { byId(id).value = 'all'; });
+    byId('api-search').value = '';
+    byId('api-role-filter').value = action === 'business-apis' ? 'APPLICATION_API' : 'all';
+  }
   renderRows();
   renderApiInventory();
-  if (action === 'apis' || action === 'api-failures') scrollAndFocus(byId('api-inventory'));
+  if (['business-apis','apis','api-failures'].includes(action)) scrollAndFocus(byId('api-inventory'));
   else if (action === 'security') scrollAndFocus(byId('security-recommendations'));
   else if (action === 'resources') scrollAndFocus(byId('resource-inventory'));
-  else if (['discovered','validated','not-tested'].includes(action) && lastReport.coverage) showEvidence('Scan coverage', lastReport.coverage);
+  else if (['discovered','validated','not-tested'].includes(action)) scrollAndFocus(byId('route-results-panel'));
   else if (Number(value) === 0) showEvidence('No matching evidence', {message:`No ${action.replaceAll('-', ' ')} were observed during this scan.`});
 }
 
@@ -846,7 +913,7 @@ function renderReport(report) {
   const summaryMetrics = [
     ['Discovered routes', report.summary.routes_discovered, '', 'discovered'], ['Validated routes', report.summary.routes_validated, '', 'validated'], ['Healthy', report.summary.healthy_routes, 'good', 'healthy'], ['Passed with warnings', report.summary.routes_with_warnings, report.summary.routes_with_warnings ? 'warn' : '', 'warnings'], ['Failed', report.summary.failed_pages, report.summary.failed_pages ? 'bad' : 'good', 'failed'], ['Auth issues', authIssues, authIssues ? 'auth' : '', 'auth'], ['Access / challenges', accessIssues, accessIssues ? 'warn' : '', 'access'], ['Not tested', notTested, notTested ? 'warn' : 'good', 'not-tested'], ['Unique APIs observed', report.summary.unique_apis || 0, '', 'apis'], ['API failures', report.summary.api_failures, report.summary.api_failures ? 'bad' : 'good', 'api-failures'], ['Resources observed', report.summary.unique_resources || 0, '', 'resources'], ['Resource failures', report.summary.resource_failures, report.summary.resource_failures ? 'warn' : 'good', 'resource-failures'], ['Console issues', report.summary.console_failures || 0, report.summary.console_failures ? 'warn' : 'good', 'console'], ['Slow routes', report.summary.slow_pages, report.summary.slow_pages ? 'warn' : 'good', 'slow'], ['Read-only blocks', report.summary.read_only_blocks, report.summary.read_only_blocks ? 'warn' : 'good', 'read-only'], ['Security recommendations', report.summary.security_recommendations || 0, report.summary.security_recommendations ? 'warn' : 'good', 'security'], ['Scan duration', duration, '', 'validated'],
   ];
-  summaryMetrics.splice(8, 0, ['Business APIs', report.summary.business_apis ?? (report.business_api_inventory || []).length, '', 'apis']);
+  summaryMetrics.splice(8, 0, ['Business APIs', report.summary.business_apis ?? (report.business_api_inventory || []).length, '', 'business-apis']);
   byId('summary').innerHTML = summaryMetrics.map(([label, value, kind, action]) => `<button type="button" class="metric ${kind}" data-summary-action="${action}" aria-label="Show ${escapeHtml(label)} evidence"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></button>`).join('');
   byId('summary').querySelectorAll('[data-summary-action]').forEach((button) => button.addEventListener('click', () => activateSummary(button.dataset.summaryAction, button.querySelector('strong').textContent, button)));
   byId('summary').querySelector('[data-summary-action="access"]').title = 'Access restrictions and challenges limit application coverage. They do not establish that credentials are required or that the application failed.';
@@ -854,7 +921,10 @@ function renderReport(report) {
   const coverageStatus = coverage.coverage_grade || coverage.coverage_status || coverage.scan_completeness || 'UNKNOWN';
   const executionStatus = coverage.execution_status || 'FINISHED';
   const accessExplanation = accessIssues ? ` Access restrictions/challenges limited application coverage for ${accessIssues} route${accessIssues === 1 ? '' : 's'}. These responses do not establish an authentication requirement or application failure.` : '';
-  byId('coverage').innerHTML = `<strong>Coverage: ${escapeHtml(coverageStatus)}</strong><span>Execution: ${escapeHtml(executionStatus)}. ${escapeHtml(terminationMessage(coverage))}${escapeHtml(accessExplanation)}</span>`;
+  const limitations = [...new Set([...(coverage.coverage_reasons || []),...(report.summary.coverage_reasons || [])].map((reason) => typeof reason === 'string' ? reason : reason.message || reason.code).filter(Boolean))];
+  const navigationCounts = coverage.navigation_controls_discovered != null ? ` Navigation controls: ${coverage.navigation_controls_discovered} discovered, ${coverage.navigation_controls_activated || 0} activated, ${coverage.navigation_controls_unresolved || 0} unresolved.` : '';
+  const scopeExplanation = ' Coverage describes safely reachable routes observed within the configured limits; total application coverage remains unknown.';
+  byId('coverage').innerHTML = `<strong>Coverage: ${escapeHtml(coverageStatus)}</strong><span>Execution: ${escapeHtml(executionStatus)}. ${escapeHtml(terminationMessage(coverage))}${escapeHtml(accessExplanation)}${escapeHtml(navigationCounts)}${escapeHtml(scopeExplanation)}</span>${limitations.length ? `<span class="coverage-reasons">Limitations: ${escapeHtml(limitations.join('; '))}</span>` : ''}`;
   byId('scan-diagnostics-content').innerHTML = `${detailSection('Effective scan configuration', report.scan_configuration || report.scan_config || {})}${detailSection('Scan timing breakdown', report.scan_timing || report.scan_timings || {})}`;
   byId('raw-report').textContent = JSON.stringify(report, null, 2);
   activeDrilldown = 'all';
@@ -862,7 +932,7 @@ function renderReport(report) {
   byId('api-failed-only').checked = false;
   // A filter left over from a previous scan must not silently hide new POST
   // observations. Column/density preferences remain separate and persistent.
-  ['result-filter','navigation-filter','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','resource-type-filter','resource-route-filter','resource-status-filter'].forEach((id) => { if (byId(id)) byId(id).value = 'all'; });
+  ['result-filter','navigation-filter','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','api-lifecycle-filter','api-response-filter','resource-type-filter','resource-route-filter','resource-status-filter'].forEach((id) => { if (byId(id)) byId(id).value = 'all'; });
   ['result-search','api-search','resource-search'].forEach((id) => { byId(id).value = ''; });
   ['resource-failed-only','resource-large-only'].forEach((id) => { byId(id).checked = false; });
   updateApiMethodFilter(report.api_inventory || []);
@@ -967,7 +1037,7 @@ const apiRoleHeader = document.createElement('th');
 apiRoleHeader.textContent = 'Traffic role';
 document.querySelector('#api-table-wrap thead tr').append(apiRoleHeader);
 document.querySelector('#api-table-wrap thead tr').append(apiPolicyHeader);
-for (const [key,label] of tableColumns.api.slice(-5)) {
+for (const [key,label] of tableColumns.api.slice(21)) {
   const header = document.createElement('th');
   if (key === 'failure_count') {
     header.setAttribute('aria-sort', 'none');
@@ -979,6 +1049,27 @@ const apiRoleLabel = document.createElement('label');
 apiRoleLabel.className = 'field';
 apiRoleLabel.innerHTML = '<span>Traffic role</span><select id="api-role-filter"><option value="all">All traffic</option></select>';
 document.querySelector('.api-tools').append(apiRoleLabel);
+const lifecycleSummary = document.createElement('dl');
+lifecycleSummary.className = 'api-post-summary';
+lifecycleSummary.setAttribute('aria-label', 'Request lifecycle counts across the complete scan');
+lifecycleSummary.innerHTML = apiLifecycleSummaryFields.map(([key,label]) => `<div><dt>${label}</dt><dd id="api-lifecycle-${key}">Not recorded</dd></div>`).join('');
+document.querySelector('.api-tools').before(lifecycleSummary);
+const resourceScope = document.createElement('p');
+resourceScope.id = 'resource-scope';
+resourceScope.className = 'inventory-scope';
+byId('resource-summary').before(resourceScope);
+for (const [id,label,option] of [['api-lifecycle-filter','Request lifecycle','All lifecycle states'],['api-response-filter','HTTP response','All HTTP responses']]) {
+  const field = document.createElement('label');
+  field.className = 'field';
+  field.innerHTML = `<span>${label}</span><select id="${id}"><option value="all">${option}</option></select>`;
+  document.querySelector('.api-tools').append(field);
+}
+for (const [key,label] of tableColumns.route.slice(13)) {
+  const header = document.createElement('th');
+  header.textContent = label;
+  document.querySelector('#route-table-wrap thead tr').append(header);
+}
+byId('result-filter').insertAdjacentHTML('beforeend', '<option value="not-tested">Not tested</option><option value="SKIPPED">Skipped</option>');
 const postSummary = document.createElement('dl');
 postSummary.className = 'api-post-summary';
 postSummary.setAttribute('aria-label', 'Observed POST request counts across the complete scan');
@@ -1007,7 +1098,7 @@ authMode.addEventListener('change', renderAuthFields);
 byId('result-search').addEventListener('input', renderRows);
 byId('result-filter').addEventListener('change', renderRows);
 byId('navigation-filter').addEventListener('change', renderRows);
-['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','api-failed-only'].forEach((id) => byId(id)?.addEventListener(id === 'api-search' ? 'input' : 'change', () => { if (id === 'api-failed-only') apiFailureOnly = false; renderApiInventory(); }));
+['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','api-lifecycle-filter','api-response-filter','api-failed-only'].forEach((id) => byId(id)?.addEventListener(id === 'api-search' ? 'input' : 'change', () => { if (id === 'api-failed-only') apiFailureOnly = false; renderApiInventory(); }));
 byId('evidence-close').addEventListener('click', () => { byId('evidence-panel').hidden = true; });
 byId('route-inspector-close').addEventListener('click', () => closeRouteInspector());
 byId('route-inspector-fullscreen').addEventListener('click', toggleInspectorFullscreen);

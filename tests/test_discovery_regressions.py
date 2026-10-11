@@ -9,7 +9,13 @@ from threading import Thread
 import pytest
 from playwright.async_api import async_playwright
 
-from app.discovery import SPA_ROUTE_TRANSITION, expand_safe_navigation, perform_route_navigation
+from app.discovery import (
+    SPA_ROUTE_TRANSITION,
+    activate_ui_view,
+    discover_page_routes,
+    expand_safe_navigation,
+    perform_route_navigation,
+)
 from app.main import ScanRequest, detect_auth_signals, execute_scan
 
 
@@ -251,6 +257,9 @@ async def test_production_discovery_retains_lazy_and_transient_navigation_routes
     assert report["summary"]["routes_validated"] == 3
     assert report["summary"]["failed_pages"] == 0
     assert report["summary"]["discovery_status"] == "COMPLETE"
+    if path == "/nested-menus":
+        children = [item for item in report["results"] if item["requested_url"] != discovery_site + path]
+        assert all(item["navigation_hierarchy"][1:-1] == ["Services", "Reports menu"] for item in children)
     if path == "/router-links":
         root = next(item for item in report["results"] if item["requested_url"] == discovery_site + path)
         assert root["external_links_found"] == 1
@@ -310,9 +319,12 @@ async def test_semantic_url_less_navigation_is_discovered_without_destructive_ac
         render_settle_ms=150, min_observation_ms=200, network_quiet_ms=100,
         max_navigation_actions=2, check_security_headers=False,
     ))
-    assert {item["requested_url"] for item in report["results"]} == {
+    assert {item["final_url"] for item in report["results"]} == {
         target, target + "#/overview", target + "#/reports",
     }
+    views = [item for item in report["results"] if item["navigation_type"] == "UI_VIEW_ACTIVATION"]
+    assert {item["route_name"] for item in views} == {"Health overview", "Service reports"}
+    assert len({item["route_id"] for item in views}) == 2
     assert report["summary"]["routes_validated"] == 3
     assert report["summary"]["failed_pages"] == 0
     assert report["results"][0]["navigation_actions"]["skipped"] >= 1
@@ -337,9 +349,11 @@ async def test_successful_panel_routes_survive_a_later_discovery_deadline(discov
     summary = report["summary"]
     assert summary["routes_discovered"] == 2
     assert summary["routes_queued"] == 2
-    assert summary["discovery_status"] == "PARTIAL"
     assert all(summary["counter_invariants"].values())
     if deadline_kind == "route":
+        assert summary["discovery_status"] == "LIMITED"
+        assert any(item["code"] == "DISCOVERY_LIMITATION" for item in summary["coverage_reasons"])
+        assert summary["coverage_grade"] == "PARTIAL"
         healthy = next(item for item in report["results"] if item["requested_url"].endswith("/healthy-one"))
         assert healthy["passed"]
         assert summary["routes_validated"] == 2
@@ -358,6 +372,9 @@ async def test_successful_panel_routes_survive_a_later_discovery_deadline(discov
         route_elapsed_ms = stalled["total_validation_ms"] + stalled["discovery_ms"]
         assert route_budget_ms - 300 <= route_elapsed_ms < route_budget_ms + 1200
     else:
+        assert summary["discovery_status"] == "UNKNOWN"
+        assert summary["coverage_grade"] == "UNKNOWN"
+        assert any(item["code"] == "SCAN_TIMEOUT" for item in summary["coverage_reasons"])
         assert summary["termination_reason"] == "SCAN_TIMEOUT"
         assert summary["execution_status"] == "TIMED_OUT"
         assert summary["routes_validated"] == 0
@@ -389,8 +406,11 @@ async def test_hidden_submenu_is_reconsidered_after_its_opener_reveals_it():
             ))
             await page.goto("https://portal.example/")
             result = await expand_safe_navigation(page, 5)
-            assert result["activated"] == 2
-            assert any(route.url == "https://portal.example/reports" for route in result["routes"])
+            assert result["activated"] == 1
+            view = next(route for route in result["routes"] if route.label == "Reports")
+            assert view.view_control is not None
+            await activate_ui_view(page, view.view_control, 1000)
+            assert any(route.url == "https://portal.example/reports" for route in await discover_page_routes(page))
         finally:
             await browser.close()
 
@@ -405,7 +425,9 @@ async def test_observed_semantic_transition_is_retained_before_panel_timeout():
             page = await browser.new_page()
             await page.route("https://portal.example/**", lambda route: route.fulfill(
                 content_type="text/html", body='''<main><h1>Portal navigation</h1>
-                <button role="tab" onclick="history.pushState({},'', '#/busy')">Reports</button>
+                <nav><button aria-expanded="false" aria-controls="busy" onclick="
+                  this.setAttribute('aria-expanded','true');history.pushState({},'', '#/busy')">Reports</button>
+                  <div id="busy">Loading menu</div></nav>
                 </main>''',
             ))
             await page.goto("https://portal.example/app")

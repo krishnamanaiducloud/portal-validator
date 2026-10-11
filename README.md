@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.12.5 is a read-only browser health validator with optional authentication for public,
+Portal Validator 1.12.6 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -268,10 +268,10 @@ runs as UID/GID 10001 while supporting an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.12.5 .
+docker build -t mohankrishna999/portal-validator:1.12.6 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.5 \
-  -t mohankrishna999/portal-validator:1.12.5-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.6 \
+  -t mohankrishna999/portal-validator:1.12.6-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -286,7 +286,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.12.5
+  mohankrishna999/portal-validator:1.12.6
 ```
 
 ## OpenShift
@@ -373,7 +373,7 @@ document into a load failure. `tls_status=TRUSTED` means Chromium completed cert
 validation; it does not claim independent inspection of the origin certificate
 when an enterprise TLS proxy is present.
 
-Report schema `2.4` keeps route identity independent from the rendered title and
+Report schema `2.5` keeps route identity independent from the rendered title and
 adds route-level application API coverage plus network-settle evidence.
 It preserves canonical hash/hashbang/history paths and exposes `route_name`,
 `route_name_source`, `route_name_confidence`, `display_path`, `spa_route`, and
@@ -384,10 +384,14 @@ distinct routes. A failed validation also includes `failure_dimension`,
 HTTP status as independent evidence. Client-only transitions display
 `N/A (SPA)` rather than fabricating an HTTP response.
 
-The portal-health summary also reports discovered, eligible, queued, validated,
-skipped, and not-tested routes with `COMPLETE`, `PARTIAL`, `FAILED`, or
-`CANCELLED` coverage
-and an explicit termination reason. The default maximum is 50 routes; the
+The portal-health summary reports discovered, eligible, queued, validated,
+skipped, and not-tested routes. `coverage_grade` is `COMPLETE`, `PARTIAL`,
+`LIMITED`, or `UNKNOWN`, separately from execution status and termination reason.
+Coverage describes observed reachable scope, never proof of all application
+routes or APIs. Unresolved navigation controls prevent complete observed
+coverage. `route_inventory` includes both validated results and evidenced
+unvisited routes with explicit limit/coverage reasons; `results` remains the
+validation-only stream for compatibility. The default maximum is 50 routes; the
 request-scoped `max_pages` value may be raised to a bounded maximum of 1,500
 routes and limits routes actually validated rather than routes discovered.
 Terminal counters follow `discovered = validated +
@@ -398,7 +402,11 @@ Observed API calls are aggregated by sanitized method/host/normalized path with
 status distribution, timing, failure classification, affected routes, allowed
 and blocked counts, request classifications, and bootstrap/authentication/route
 validation/session-refresh phase counts. Every natural method is observed
-before read-only enforcement. Naturally observed authentication POSTs are
+before read-only enforcement. Completed responses, headers-only/incomplete
+observations, cancellations, policy blocks, HTTP errors and transport failures
+are distinguished with structured reasons. Passive browser observation is
+explicitly separate from active API testing, which is not performed.
+Naturally observed authentication POSTs are
 visible, but bodies, credentials, and sensitive headers are never captured.
 Required route APIs and optional/background APIs
 are attributed separately so an explained critical dependency failure can fail

@@ -126,8 +126,8 @@ SECURITY_HEADERS = (
 COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
     "ac", "co", "com", "edu", "gov", "net", "org",
 })
-VALIDATOR_VERSION = "1.12.5"
-REPORT_SCHEMA_VERSION = "2.4"
+VALIDATOR_VERSION = "1.12.6"
+REPORT_SCHEMA_VERSION = "2.5"
 
 
 @asynccontextmanager
@@ -960,6 +960,13 @@ async def execute_scan(
     route_locations: dict[str, str] = {requested_route: requested_route}
     route_parent_ids: dict[str, str | None] = {requested_route: None}
     route_name_by_id: dict[str, str] = {requested_route: "Requested route"}
+    route_metadata: dict[str, dict[str, object]] = {
+        requested_route: {
+            "route_label": "Requested route", "route_source": "target",
+            "navigation_type": DOCUMENT_NAVIGATION,
+            "discovery_type": "DOCUMENT_NAVIGATION", "depth": 0,
+        },
+    }
     view_navigation_aliases: dict[str, str] = {}
     active_view_source: str | None = None
     route_provenance: dict[str, dict[str, object]] = {
@@ -1034,6 +1041,20 @@ async def execute_scan(
             route_locations[route_key] = identity
             parent_route_id = active_route_id
             route_parent_ids.setdefault(route_key, parent_route_id)
+            route_metadata.setdefault(route_key, {
+                "route_label": sanitize_text(route.label, limit=160) if route.label else "Discovered route",
+                "route_source": route.source,
+                "navigation_type": route.navigation_mode,
+                "discovery_type": route.discovery_type,
+                "navigation_hierarchy": [
+                    sanitize_text(label, limit=160) for label in route.navigation_hierarchy
+                ],
+                "depth": depth + 1,
+            })
+            if len(route.navigation_hierarchy) > len(route_metadata[route_key].get("navigation_hierarchy", [])):
+                route_metadata[route_key]["navigation_hierarchy"] = [
+                    sanitize_text(label, limit=160) for label in route.navigation_hierarchy
+                ]
             remember_route_discovery(route_key, route, source_url, parent_route_id)
             if route.view_control:
                 # UI controls have their own bounded action budget. URLs still
@@ -2263,46 +2284,45 @@ async def execute_scan(
                                         validated=len(results),
                                         current_route=active_route_id,
                                     )
-                                    if req.max_navigation_actions:
-                                        async def retain_panel_routes(routes):
-                                            external_links[:] = sorted(set(external_links).union(
-                                                enqueue_discovered_routes(routes, depth, final_raw_url),
-                                            ))
+                                    async def retain_panel_routes(routes):
+                                        external_links[:] = sorted(set(external_links).union(
+                                            enqueue_discovered_routes(routes, depth, final_raw_url),
+                                        ))
 
-                                        async def observe_discovery_panel():
-                                            return await wait_for_render_settle(
-                                                page,
-                                                settle_ms=req.render_settle_ms,
-                                                maximum_ms=max(0, round((route_deadline - time.perf_counter()) * 1000)),
-                                                network_activity=route_activity_snapshot,
-                                                minimum_observation_ms=req.min_observation_ms,
-                                                network_quiet_ms=req.network_quiet_ms,
-                                            )
-
-                                        navigation_actions = await expand_safe_navigation(
+                                    async def observe_discovery_panel():
+                                        return await wait_for_render_settle(
                                             page,
-                                            req.max_navigation_actions,
-                                            wait_after_action=observe_discovery_panel,
-                                            maximum_scrolls=req.max_discovery_scrolls,
-                                            on_routes_discovered=retain_panel_routes,
+                                            settle_ms=req.render_settle_ms,
+                                            maximum_ms=max(0, round((route_deadline - time.perf_counter()) * 1000)),
+                                            network_activity=route_activity_snapshot,
+                                            minimum_observation_ms=req.min_observation_ms,
+                                            network_quiet_ms=req.network_quiet_ms,
                                         )
-                                        safe_routes = list(navigation_actions.pop("routes", []))
-                                        if navigation_actions["activated"]:
-                                            log_event(
-                                                logging.INFO,
-                                                "NAVIGATION_MENU_EXPANDED",
-                                                scan_id=scan_id,
-                                                count=navigation_actions["activated"],
-                                            )
-                                        if navigation_actions["skipped"]:
-                                            log_event(
-                                                logging.INFO,
-                                                "UNSAFE_CONTROL_SKIPPED",
-                                                scan_id=scan_id,
-                                                count=navigation_actions["skipped"],
-                                            )
-                                    else:
-                                        safe_routes = []
+
+                                    # A zero action budget forbids activation, not
+                                    # observation or accounting of unvisited controls.
+                                    navigation_actions = await expand_safe_navigation(
+                                        page,
+                                        req.max_navigation_actions,
+                                        wait_after_action=observe_discovery_panel,
+                                        maximum_scrolls=req.max_discovery_scrolls,
+                                        on_routes_discovered=retain_panel_routes,
+                                    )
+                                    safe_routes = list(navigation_actions.pop("routes", []))
+                                    if navigation_actions["activated"]:
+                                        log_event(
+                                            logging.INFO,
+                                            "NAVIGATION_MENU_EXPANDED",
+                                            scan_id=scan_id,
+                                            count=navigation_actions["activated"],
+                                        )
+                                    if navigation_actions["skipped"]:
+                                        log_event(
+                                            logging.INFO,
+                                            "UNSAFE_CONTROL_SKIPPED",
+                                            scan_id=scan_id,
+                                            count=navigation_actions["skipped"],
+                                        )
                                     discovered = safe_routes + await discover_page_routes(
                                         page,
                                         req.max_discovery_scrolls,
@@ -2334,7 +2354,8 @@ async def execute_scan(
                                         if identity is not None:
                                             key = discovered_route_key(route, identity)
                                             existing = unique_discovered.get(key)
-                                            if existing is None or (not existing.label and route.label):
+                                            if (existing is None or (not existing.label and route.label)
+                                                    or len(route.navigation_hierarchy) > len(existing.navigation_hierarchy)):
                                                 unique_discovered[key] = route
                                     discovered = list(unique_discovered.values())
                                     download_routes = [
@@ -2528,6 +2549,13 @@ async def execute_scan(
                             "DISCOVERY_TIMEOUT", "WARNING",
                             "Navigation discovery reached the configured route budget; earlier observed routes were retained.",
                         ))
+                    if navigation_actions.get("remaining", 0):
+                        limitation = finding(
+                            "NAVIGATION_ACTION_LIMIT", "WARNING",
+                            "Visible navigation controls remain unexplored within the configured action budget.",
+                        )
+                        limitation["count"] = int(navigation_actions["remaining"])
+                        health_findings.append(limitation)
                     if navigation_actions.get("downloads_observed", 0) or page_downloads:
                         observed_download = finding(
                             "DOWNLOAD_OBSERVED",
@@ -2631,6 +2659,10 @@ async def execute_scan(
                             route_name_by_id.get(hierarchy_cursor, hierarchy_cursor),
                         )
                         hierarchy_cursor = route_parent_ids.get(hierarchy_cursor)
+                    menu_hierarchy = route_metadata.get(route_key, {}).get("navigation_hierarchy", [])
+                    for menu_label in menu_hierarchy:
+                        if not navigation_hierarchy or navigation_hierarchy[-1] != menu_label:
+                            navigation_hierarchy.append(menu_label)
                     navigation_hierarchy.append(route_name)
                     provenance = route_provenance.get(route_key, {"observations": 1, "sources": []})
                     health_validation_ms = round((time.perf_counter() - health_validation_started) * 1000)
@@ -2685,7 +2717,7 @@ async def execute_scan(
                         ),
                         "discovered_from": sanitized_url(discovered_from) if discovered_from else None,
                         "parent_route_id": parent_route_id,
-                        "parent_route_name": route_name_by_id.get(parent_route_id) if parent_route_id else None,
+                        "parent_route_name": menu_hierarchy[-1] if menu_hierarchy else route_name_by_id.get(parent_route_id) if parent_route_id else None,
                         "navigation_hierarchy": navigation_hierarchy,
                         "expected_origin": sanitized_url(url, include_path=False),
                         "normalized_route_identity": active_route_id,
@@ -2729,15 +2761,15 @@ async def execute_scan(
                         "discovery_ms": route_discovery_ms,
                         "validation_ms": route_validation_ms,
                         "navigation_actions": navigation_actions,
-                        "navigation_controls_discovered": int(navigation_actions.get("inspected", 0)),
+                        "navigation_controls_discovered": int(navigation_actions.get("discovered", navigation_actions.get("inspected", 0))),
                         "navigation_controls_activated": int(navigation_actions.get("activated", 0)),
                         "navigation_controls_unresolved": (
-                            int(navigation_actions.get("skipped", 0))
+                            int(navigation_actions.get("unresolved", navigation_actions.get("skipped", 0)))
                             + int(bool(navigation_actions.get("timed_out")))
                         ),
                         "unsafe_actions_skipped": navigation_actions["skipped"],
                         "discovery_limitations": (
-                            int(navigation_actions.get("skipped", 0))
+                            int(navigation_actions.get("unresolved", navigation_actions.get("skipped", 0)))
                             + int(bool(navigation_actions.get("timed_out")))
                         ),
                         "read_only_blocks": read_only_blocks,
@@ -2884,6 +2916,89 @@ async def execute_scan(
     # Reporting may determine that exhausted navigation stopped at an auth or
     # access boundary. Execution completion is not proof of complete coverage.
     termination_reason = str(summary.get("termination_reason") or termination_reason)
+    # Menu-expansion observations and uniquely queued UI views are separate:
+    # views activate during validation, never as speculative discovery clicks.
+    for metric in ("discovered", "activated", "unresolved"):
+        summary[f"menu_controls_{metric}"] = summary[f"navigation_controls_{metric}"]
+    discovered_views = {key for key in discovered_routes if key.startswith("UI_VIEW_")}
+    activated_views = {
+        str(result["route_id"]) for result in results
+        if result.get("view_type") == "UI_TAB" and result.get("same_document_transition")
+    }
+    summary["view_controls_discovered"] = len(discovered_views)
+    summary["view_controls_activated"] = len(activated_views)
+    summary["view_controls_unresolved"] = len(discovered_views - activated_views)
+    for metric in ("discovered", "activated", "unresolved"):
+        summary[f"navigation_controls_{metric}"] += summary[f"view_controls_{metric}"]
+    # Results remain the validation-only stream for existing API consumers.
+    # The inventory also retains every evidenced route that a configured limit
+    # prevented us from visiting, with its real URL and explicit reason.
+    route_inventory = list(results)
+    for result in results:
+        route_name_by_id[str(result["route_id"])] = str(result["route_name"])
+    unvisited_reason = (
+        "NOT_TESTED_MAX_ROUTES" if termination_reason == "MAX_ROUTES_REACHED" else
+        "NOT_TESTED_TIMEOUT" if termination_reason == "SCAN_TIMEOUT" else
+        "NOT_TESTED_CANCELLED" if termination_reason == "USER_CANCELLED" else
+        "NOT_TESTED_SESSION_EXPIRED" if termination_reason == "SESSION_EXPIRED" else
+        "NOT_TESTED"
+    )
+    for route_key in sorted(remaining_routes | depth_limited_routes | action_limited_routes):
+        route_url = sanitized_url(route_locations[route_key])
+        route_fields = route_identity_fields(
+            route_url,
+            query_policy=req.query_parameter_policy,
+            allowed_query_parameters=set(req.allowed_query_parameters),
+        )
+        metadata = route_metadata[route_key]
+        name, name_source, name_confidence = resolve_route_name(
+            navigation_label=str(metadata["route_label"]),
+            accessible_name=None,
+            primary_heading=None,
+            breadcrumb=None,
+            metadata_name=None,
+            document_title=None,
+            display_path=route_fields["display_path"],
+        )
+        parent_id = route_parent_ids.get(route_key)
+        parent_name = route_name_by_id.get(parent_id) if parent_id else None
+        hierarchy: list[str] = [name]
+        cursor = parent_id
+        ancestors: set[str] = {route_key}
+        while cursor and cursor not in ancestors:
+            ancestors.add(cursor)
+            hierarchy.insert(0, route_name_by_id.get(cursor, "Discovered route"))
+            cursor = route_parent_ids.get(cursor)
+        menu_hierarchy = metadata.get("navigation_hierarchy", [])
+        if menu_hierarchy:
+            hierarchy[-1:-1] = menu_hierarchy
+            parent_name = menu_hierarchy[-1]
+        skipped = route_key in depth_limited_routes | action_limited_routes
+        reason = (
+            "SKIPPED_MAX_DEPTH" if route_key in depth_limited_routes else
+            "SKIPPED_MAX_NAVIGATION_ACTIONS" if route_key in action_limited_routes else
+            unvisited_reason
+        )
+        route_inventory.append({
+            **route_fields, **metadata,
+            "route_id": route_key if route_key.startswith("UI_VIEW_") else sanitized_url(route_key),
+            "normalized_route_identity": route_key if route_key.startswith("UI_VIEW_") else sanitized_url(route_key),
+            "url": route_url, "requested_url": route_url, "discovered_url": route_url,
+            "final_url": None, "route_name": name, "route_name_source": name_source,
+            "route_name_confidence": name_confidence,
+            "parent_route_id": parent_id, "parent_route_name": parent_name,
+            "navigation_hierarchy": hierarchy,
+            "view_type": "UI_TAB" if route_key.startswith("UI_VIEW_") else "URL_ROUTE",
+            "discovery_sources": route_provenance[route_key]["sources"],
+            "classification": "SKIPPED" if skipped else "NOT_TESTED",
+            "page_load_status": "NOT_TESTED", "validation_status": "NOT_TESTED",
+            "navigation_status": "NOT_TESTED", "render_status": "NOT_TESTED",
+            "authentication_status": "NOT_TESTED", "tls_status": "NOT_TESTED",
+            "api_status": "NOT_TESTED", "resource_status": "NOT_TESTED", "console_status": "NOT_TESTED",
+            "failure_dimension": "COVERAGE", "failure_reason": reason,
+            "coverage_reason": reason, "passed": False, "status": None,
+            "warning_reasons": [], "finding_details": [],
+        })
     aggregation_started = time.perf_counter()
     api_inventory = (
         aggregate_api_events(scan_api_events)
@@ -3069,6 +3184,7 @@ async def execute_scan(
         "pages": len(results),
         "summary": summary,
         "results": results,
+        "route_inventory": route_inventory,
         "api_inventory": api_inventory,
         "business_api_inventory": business_api_inventory,
         "network_observation": network_observation,
@@ -3086,6 +3202,8 @@ async def execute_scan(
             "execution_status": summary.get("execution_status"),
             "coverage_status": summary.get("coverage_status"),
             "coverage_grade": summary.get("coverage_grade", "UNKNOWN"),
+            "coverage_scope": summary.get("coverage_scope", "OBSERVED_REACHABLE_SCOPE"),
+            "total_application_coverage": summary.get("total_application_coverage", "UNKNOWN"),
             "coverage_reasons": summary.get("coverage_reasons", []),
             "termination_reason": termination_reason,
             "routes_discovered": summary["routes_discovered"],
@@ -3098,7 +3216,15 @@ async def execute_scan(
             "navigation_controls_discovered": summary["navigation_controls_discovered"],
             "navigation_controls_activated": summary["navigation_controls_activated"],
             "navigation_controls_unresolved": summary["navigation_controls_unresolved"],
+            "navigation_control_count_scope": "Menu-expander observations across routes plus unique discovered UI views",
             "business_apis": summary["business_apis"],
+            "api_requests_observed": summary.get("api_requests_observed", 0),
+            "api_responses_completed": summary.get("api_responses_completed", 0),
+            "api_requests_blocked": summary.get("api_requests_blocked", 0),
+            "api_requests_failed": summary.get("api_requests_failed", 0),
+            "api_requests_incomplete": summary.get("api_requests_incomplete", 0),
+            "api_requests_canceled": summary.get("api_requests_canceled", 0),
+            "api_requests_not_actively_tested": summary.get("api_requests_not_actively_tested", 0),
             "not_tested_reason_counts": summary["not_tested_reason_counts"],
         },
         "not_tested_routes": [

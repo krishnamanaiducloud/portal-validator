@@ -164,6 +164,16 @@ def test_navigation_modes_distinguish_documents_spa_hash_and_safe_clicks():
 class _TransitionFailurePage:
     url = "https://portal.example.com/app"
 
+    async def evaluate_handle(self, _script, _argument):
+        class EmptyHandle:
+            def as_element(self):
+                return None
+
+            async def dispose(self):
+                pass
+
+        return EmptyHandle()
+
     async def evaluate(self, _script, _argument):
         return True
 

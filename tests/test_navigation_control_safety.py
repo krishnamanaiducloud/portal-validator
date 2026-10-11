@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
-from playwright.async_api import Locator, TimeoutError as PlaywrightTimeoutError, async_playwright
+from playwright.async_api import ElementHandle, TimeoutError as PlaywrightTimeoutError, async_playwright
 
 from app.discovery import (
     SEMANTIC_LINK_NAVIGATION,
@@ -267,14 +267,14 @@ async def test_semantic_click_failure_after_dispatch_does_not_retry_another_cont
     async with _local_page(body) as page:
         post_requests = []
         page.on("request", lambda request: post_requests.append(request.url) if request.method == "POST" else None)
-        real_click = Locator.click
+        real_click = ElementHandle.click
 
         async def dispatched_click_then_timeout(locator, *args, **kwargs):
             await real_click(locator, *args, **kwargs)
             await page.wait_for_function("window.completed === true", timeout=1000)
             raise PlaywrightTimeoutError("fixture deadline after real browser click dispatch")
 
-        monkeypatch.setattr(Locator, "click", dispatched_click_then_timeout)
+        monkeypatch.setattr(ElementHandle, "click", dispatched_click_then_timeout)
         with pytest.raises(PlaywrightTimeoutError, match="after real browser click dispatch"):
             await perform_route_navigation(
                 page, "https://portal.example/reports", SEMANTIC_LINK_NAVIGATION, 1500,

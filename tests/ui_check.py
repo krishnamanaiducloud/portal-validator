@@ -109,29 +109,37 @@ async def main():
               post_diagnostics:{total_http_requests_observed:24,post_requests_observed:11,post_requests_allowed:9,
                 post_requests_blocked:2,approved_read_only_post_endpoints:1,unverified_post_endpoints:2,
                 post_requests_without_completed_responses:3,unique_post_endpoints_reported:2},
-              unique_apis:6,security_recommendations:1},
-            coverage:{scan_completeness:'PARTIAL',termination_reason:'MAX_ROUTES_REACHED',routes_discovered:3,routes_validated:1,routes_not_tested:2,routes_remaining:2},
+              unique_apis:6,business_apis:1,security_recommendations:1,
+              api_requests_observed:15,api_responses_completed:10,api_requests_failed:1,
+              api_requests_blocked:5,api_requests_canceled:0,api_requests_incomplete:0,api_requests_not_actively_tested:15},
+            coverage:{scan_completeness:'PARTIAL',termination_reason:'MAX_ROUTES_REACHED',routes_discovered:3,routes_validated:1,routes_not_tested:2,routes_remaining:2,
+              navigation_controls_discovered:5,navigation_controls_activated:3,navigation_controls_unresolved:2,coverage_reasons:[{code:'NAVIGATION_CONTROLS_UNRESOLVED',count:2}]},
             api_inventory:[{method:'GET',host:'api.example.net',endpoint:'/health',calls:1,status_2xx:1,
               status_3xx:0,status_4xx:0,status_5xx:0,network_failures:0,route_count:1,
               allowed_calls:1,blocked_count:0,application_bootstrap_phase_count:1,authentication_phase_count:0,route_validation_phase_count:0,session_refresh_phase_count:0,
-              average_duration_ms:12,worst_duration_ms:12,health:'HEALTHY',observation_outcome:'HEALTHY',routes_using_endpoint:['/health']},
+              average_duration_ms:12,worst_duration_ms:12,health:'HEALTHY',observation_outcome:'HEALTHY',observation_status:'COMPLETED',routes_using_endpoint:['/health'],
+              traffic_role:'MICROFRONTEND_CONFIG',completed_calls:1,response_status_counts:{200:1},validation_outcome:'PASSED',actively_tested:false,
+              active_validation_status:'NOT_ACTIVELY_TESTED',validation_reason:'Completed during passive browser observation.'},
               {method:'POST',host:'api.example.net',endpoint:'/query',calls:10,status_2xx:8,
               status_3xx:0,status_4xx:1,status_5xx:0,network_failures:0,route_count:1,
               allowed_calls:9,blocked_count:1,application_bootstrap_phase_count:2,authentication_phase_count:0,route_validation_phase_count:8,session_refresh_phase_count:0,
               average_duration_ms:25,worst_duration_ms:40,health:'DEGRADED',observation_outcome:'WARNING',policies:['APPROVED_READ_POST'],policy_classifications:['APPROVED_READ_ONLY'],classification_counts:{APPROVED_READ_POST:9,BLOCKED_MUTATION:1},routes_using_endpoint:['/health'],
               response_status_counts:{200:8,401:1},failure_count:1,authentication_classifications:['NOT_AUTHENTICATION'],
-              post_classifications:['POST_OBSERVED','POST_READ_ONLY_APPROVED','POST_READ_ONLY_UNVERIFIED','POST_BLOCKED_BY_POLICY','POST_MUTATION_RESTRICTED']},
+              post_classifications:['POST_OBSERVED','POST_READ_ONLY_APPROVED','POST_READ_ONLY_UNVERIFIED','POST_BLOCKED_BY_POLICY','POST_MUTATION_RESTRICTED'],
+              traffic_role:'APPLICATION_API',validation_outcome:'PARTIAL',actively_tested:false,
+              active_validation_status:'NOT_ACTIVELY_TESTED',validation_reason:'Some calls completed; one call was blocked by read-only policy.'},
               ...['POST','PUT','PATCH','DELETE'].map((method, index) => ({method,host:'api.example.net',endpoint:`/blocked/${index}`,calls:1,status_2xx:0,
               status_3xx:0,status_4xx:0,status_5xx:0,network_failures:0,route_count:1,allowed_calls:0,
               blocked_count:1,application_bootstrap_phase_count:0,authentication_phase_count:0,route_validation_phase_count:1,session_refresh_phase_count:0,
               average_duration_ms:null,worst_duration_ms:null,health:'NOT_EXECUTED',observation_outcome:'BLOCKED_BY_VALIDATOR',observation_status:'BLOCKED_BY_POLICY',policies:['READ_ONLY_BLOCK'],routes_using_endpoint:['/health'],
               response_status_counts:{},failure_count:0,authentication_classifications:['NOT_AUTHENTICATION'],
+              validation_outcome:'BLOCKED',actively_tested:false,active_validation_status:'NOT_ACTIVELY_TESTED',validation_reason:'Blocked by read-only policy; target response not tested.',
               post_classifications:method === 'POST' ? ['POST_OBSERVED','POST_READ_ONLY_UNVERIFIED','POST_BLOCKED_BY_POLICY','POST_MUTATION_RESTRICTED'] : []}))],
             resource_details:[
               {type:'IMAGE',host:'cdn.example.net',path:'/hero.png',route:'/health',status:200,duration_ms:34,transfer_size_bytes:700000,encoded_body_size_bytes:699000,decoded_body_size_bytes:699000,size_categories:['LARGE_IMAGE'],failed:false},
               {type:'IMAGE',host:'cdn.example.net',path:'/opaque.png',route:'/health',status:200,duration_ms:14,transfer_size_bytes:null,encoded_body_size_bytes:null,decoded_body_size_bytes:null,size_categories:[],failed:false},
               {type:'SCRIPT',host:'cdn.example.net',path:'/app.js',route:'/health',status:503,duration_ms:8,transfer_size_bytes:300,encoded_body_size_bytes:200,decoded_body_size_bytes:200,size_categories:[],failed:true}],
-            resource_summary:{resources_observed:3,total_transfer_size_bytes:700300,resources_with_transfer_size:2,large_resources:1,large_images:1,resource_failures:1},
+            resource_summary:{scope:'scan-wide unique resource calls',scan_wide_unique_resources:3,scan_wide_calls:3,route_scoped_calls:4,resources_observed:3,total_transfer_size_bytes:700300,resources_with_transfer_size:2,large_resources:1,large_images:1,resource_failures:1},
             security_recommendations:[{type:'MISSING_SECURITY_HEADER',header:'content-security-policy',
               severity:'RECOMMENDATION',impact:'NON_BLOCKING',affected_document_count:1,
               affected_documents:['https://portal.example.com/health']}],
@@ -141,7 +149,8 @@ async def main():
               discovered_url:'https://portal.example.com/health',final_url:'https://portal.example.com/health',
               route_label:'Health',navigation_label:'Health',route_name:'Health',route_name_source:'NAVIGATION_LABEL',
               route_name_confidence:'HIGH',route_source:'navigation',display_path:'/health',host:'portal.example.com',
-              canonical_route:'https://portal.example.com/health',discovery_sources:[],duplicate_discovery_count:0,
+              canonical_route:'https://portal.example.com/health',discovery_sources:[{source:'semantic_navigation'}],duplicate_discovery_count:0,
+              parent_route_id:'portal-root',parent_route_name:'Operations',navigation_hierarchy:['Operations','Health'],
               classification:'PASS_WITH_WARNINGS',page_load_status:'LOADED',validation_status:'WARNING',tls_status:'TRUSTED',
               security_headers_status:'PASS',navigation_status:'SUCCESS',render_status:'PASS',api_status:'PASS',
               resource_status:'PASS',console_status:'PASS',authentication_status:'PASS',read_only_status:'ENFORCED',
@@ -155,6 +164,13 @@ async def main():
         assert await page.locator("#result-list tr").count() == 1
         assert await page.locator("#result-list .route-name-cell strong").text_content() == "Health"
         assert await page.locator("#result-list .route-cell code").text_content() == "/health"
+        assert "Operations › Health" in await page.locator("#result-list .route-hierarchy-cell").text_content()
+        assert "semantic_navigation" in await page.locator("#result-list .route-discovery-cell").text_content()
+        assert "2 unresolved" in await page.locator("#coverage").text_content()
+        assert "NAVIGATION_CONTROLS_UNRESOLVED" in await page.locator("#coverage").text_content()
+        assert "total application coverage remains unknown" in await page.locator("#coverage").text_content()
+        assert await page.locator("#api-lifecycle-api_responses_completed").text_content() == "10"
+        assert await page.locator("#api-lifecycle-api_requests_not_actively_tested").text_content() == "15"
         assert await page.get_by_role("button", name="Show Scan duration evidence").locator("strong").inner_text() == "8.5s"
         assert await page.locator("#post-summary-observed_calls").inner_text() == "11"
         assert await page.locator("#post-summary-approved_read_only_calls").inner_text() == "9"
@@ -196,6 +212,33 @@ async def main():
         await page.locator("#route-inspector .inspect-raw > summary").click()
         assert "UI_VIEW_fixture_1" in await page.locator("#route-inspector").inner_text()
         await page.evaluate("renderReport(window.uiViewOriginalReport); delete window.uiViewOriginalReport")
+        # All discovered logical routes remain visible even when execution limits
+        # prevented validation. They must never be presented as target failures.
+        await page.evaluate("""() => {
+          window.inventoryOriginalReport = lastReport;
+          const validated = lastReport.results[0];
+          renderReport({...lastReport, route_inventory:[validated,
+            {...validated,route_id:'queued-view',route_name:'Pending reports',classification:'NOT_TESTED',
+              validation_status:'NOT_TESTED',page_load_status:'NOT_TESTED',status:null,
+              warning_reasons:[],failure_reason:'Maximum route limit reached before activation.'},
+            {...validated,route_id:'skipped-view',route_name:'Skipped reports',classification:'SKIPPED',
+              validation_status:'NOT_TESTED',page_load_status:'NOT_TESTED',status:null,
+              warning_reasons:[],failure_reason:'Maximum discovery depth reached.'}]});
+        }""")
+        assert await page.locator("#result-list .route-row").count() == 3
+        await page.locator("#result-filter").select_option("not-tested")
+        assert await page.locator("#result-list .route-row").count() == 2
+        assert "Maximum route limit reached" in await page.locator("#result-list").text_content()
+        await page.locator("#result-filter").select_option("failure")
+        assert await page.locator("#result-list .route-row").count() == 0
+        await page.locator("#result-filter").select_option("SKIPPED")
+        assert await page.locator("#result-list .route-name-cell strong").text_content() == "Skipped reports"
+        await page.locator("#result-filter").select_option("all")
+        await page.get_by_role("button", name="Show Validated routes evidence").click()
+        assert await page.locator("#result-list .route-row").count() == 1
+        await page.get_by_role("button", name="Show Discovered routes evidence").click()
+        assert await page.locator("#result-list .route-row").count() == 3
+        await page.evaluate("renderReport(window.inventoryOriginalReport); delete window.inventoryOriginalReport")
         route_panel = page.locator("#route-results-panel")
         route_handle = page.locator("#route-results-resize")
         # Restoring the report starts its intentional smooth document scroll.
@@ -274,7 +317,7 @@ async def main():
           Object.assign(challenge, {traffic_role:'CHALLENGE',traffic_roles:{CHALLENGE:1},observed_calls:1,
             allowed_calls:0,blocked_calls:1,sent_calls:0,responded_calls:0,completed_calls:0,
             failed_calls:0,canceled_calls:0,incomplete_calls:0});
-          lastReport.api_inventory.find(item => item.endpoint === '/query').traffic_role = 'BUSINESS';
+          lastReport.api_inventory.find(item => item.endpoint === '/query').traffic_role = 'APPLICATION_API';
           renderApiInventory();
         }""")
         await page.locator("#api-role-filter").select_option("CHALLENGE")
@@ -292,6 +335,27 @@ async def main():
         assert lifecycle["incomplete"] == "0"
         await page.locator("#evidence-close").click()
         await page.locator("#api-role-filter").select_option("all")
+        await page.get_by_role("button", name="Show Business APIs evidence").click()
+        assert await page.locator("#api-role-filter").input_value() == "APPLICATION_API"
+        assert await page.locator("#api-list .api-endpoint").all_text_contents() == ["/query"]
+        assert await page.locator("#api-list .api-validation-cell").text_content() == "PARTIAL"
+        assert await page.locator("#api-list .api-active-test-cell").text_content() == "NOT_ACTIVELY_TESTED"
+        assert "one call was blocked" in await page.locator("#api-list .api-validation-reason-cell").text_content()
+        await page.get_by_role("button", name="Show Unique APIs observed evidence").click()
+        assert await page.locator("#api-list tr").count() == 6
+        await page.locator("#api-lifecycle-filter").select_option("BLOCKED_BY_POLICY")
+        assert await page.locator("#api-list tr").count() == 4
+        await page.locator("#api-lifecycle-filter").select_option("all")
+        await page.locator("#api-response-filter").select_option("none")
+        assert await page.locator("#api-list tr").count() == 4
+        await page.locator("#api-response-filter").select_option("200")
+        assert await page.locator("#api-list tr").count() == 2
+        await page.locator("#api-response-filter").select_option("401")
+        assert await page.locator("#api-list .api-endpoint").all_text_contents() == ["/query"]
+        await page.locator("#api-response-filter").select_option("all")
+        await page.locator("#api-lifecycle-filter").select_option("NOT_ACTIVELY_TESTED")
+        assert await page.locator("#api-list tr").count() == 6
+        await page.locator("#api-lifecycle-filter").select_option("all")
         await page.locator("#api-policy-filter").select_option("blocked")
         assert await page.locator("#api-list tr").count() == 5
         await page.locator("#api-policy-filter").select_option("all")
@@ -337,7 +401,9 @@ async def main():
         for outcome in ("INCOMPLETE", "CANCELED"):
             await page.evaluate("""outcome => {
               lastReport.api_inventory = [{...window.lifecycleInventory[0],
-                health:'NOT_EXECUTED',observation_outcome:outcome,
+                health:'NOT_EXECUTED',observation_outcome:outcome,observation_status:outcome,
+                status_2xx:0,response_status_counts:{},validation_outcome:'INCOMPLETE',
+                validation_reason:outcome === 'INCOMPLETE' ? 'No completed response was observed.' : 'The browser canceled this request.',
                 sent_calls:1,responded_calls:0,completed_calls:0,failed_calls:0,
                 incomplete_calls:outcome === 'INCOMPLETE' ? 1 : 0,
                 canceled_calls:outcome === 'CANCELED' ? 1 : 0}];
@@ -345,6 +411,13 @@ async def main():
             }""", outcome)
             assert await page.locator("#api-list .dimension-state").text_content() == outcome
             assert "NOT_EXECUTED" not in await page.locator("#api-list").text_content()
+            assert await page.locator("#api-list .api-validation-cell").text_content() == "INCOMPLETE"
+            await page.locator("#api-lifecycle-filter").select_option(outcome)
+            assert await page.locator("#api-list .api-endpoint").count() == 1
+            await page.locator("#api-response-filter").select_option("none")
+            assert await page.locator("#api-list .api-endpoint").count() == 1
+            await page.locator("#api-lifecycle-filter").select_option("all")
+            await page.locator("#api-response-filter").select_option("all")
             await page.locator("#api-list .api-endpoint").click()
             lifecycle = await page.locator("#evidence-content .inspect-section dl").evaluate("""element =>
               Object.fromEntries([...element.children].map(row => [row.querySelector('dt').textContent, row.querySelector('dd').textContent]))
@@ -362,7 +435,10 @@ async def main():
         assert await page.locator('[data-api-sort="average_duration_ms"]').text_content() == "Average Time (ms)"
         assert await page.locator('[data-api-sort="worst_duration_ms"]').text_content() == "Worst Time (ms)"
         await page.locator("#api-columns > summary").click()
-        assert await page.locator("#api-columns input[type=checkbox]").count() == 26
+        assert await page.locator("#api-columns input[type=checkbox]").count() == 29
+        await page.locator('[data-column-kind="api"][data-column-key="validation_reason"]').uncheck()
+        assert not await page.locator("#api-list .api-validation-reason-cell").first.is_visible()
+        await page.locator('[data-column-kind="api"][data-column-key="validation_reason"]').check()
         screenshot_base, screenshot_extension = os.path.splitext(screenshot)
         await page.screenshot(path=f"{screenshot_base}-columns{screenshot_extension or '.png'}")
         await page.locator('[data-column-kind="api"][data-column-key="host"]').uncheck()
@@ -390,7 +466,7 @@ async def main():
         assert abs(await route_panel.evaluate("element => element.getBoundingClientRect().height") - route_panel_height) <= 2
         assert not await page.locator('[data-api-sort="host"]').is_visible()
         assert not await page.locator('[data-sort="authentication_status"]').is_visible()
-        assert await page.locator("#api-table-wrap th").last.text_content() == "POST classification"
+        assert await page.locator("#api-table-wrap th").last.text_content() == "Result reason"
         assert await page.locator("#api-table-wrap th").last.is_visible()
         for kind in ("api", "route"):
             await page.locator(f"#{kind}-columns > summary").click()
@@ -501,6 +577,8 @@ async def main():
         await page.locator("#scan-diagnostics > summary").click()
         assert not await page.locator("#resource-details").get_attribute("open")
         assert await page.locator("#resource-summary .resource-card").count() == 7
+        assert "3 unique resources; 3 observed calls" in await page.locator("#resource-scope").text_content()
+        assert "4 route-attributed calls" in await page.locator("#resource-scope").text_content()
         assert await page.evaluate("""() => {
           lastReport.resource_details.push({type:'FONT',host:'cdn.example.net',path:'/small.woff',size_categories:[]});
           renderResourceSummary();
@@ -564,6 +642,7 @@ async def main():
         # Compact tables may fit a desktop viewport. Synchronized scrolling is
         # required only when selected columns genuinely overflow.
         await page.set_viewport_size({"width": 768, "height": 1024})
+        await page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
         await route_scroller.wait_for(state="visible")
         assert await route_scroller.is_visible()
         await route_scroller.evaluate("element => { element.scrollLeft = 120; element.dispatchEvent(new Event('scroll')); }")
@@ -576,7 +655,8 @@ async def main():
         await api_scroller.evaluate("element => { element.scrollLeft = 0; element.dispatchEvent(new Event('scroll')); }")
         await page.set_viewport_size({"width": 1440, "height": 1100})
         await page.get_by_role("button", name="Show Discovered routes evidence").click()
-        assert await page.locator("#evidence-panel").is_visible()
+        assert await page.locator("#route-results-panel").is_visible()
+        assert await page.locator("#result-list .route-row").count() == 1
         assert not await page.locator(".raw-report").get_attribute("open")
         main_width = await page.locator("main").evaluate("element => element.getBoundingClientRect().width")
         assert main_width > 1300

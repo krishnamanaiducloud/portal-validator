@@ -33,6 +33,19 @@
 .inspect-section dd {margin:0;overflow-wrap:anywhere}
 .hide-column-21 th:nth-child(21),.hide-column-21 td:nth-child(21) {display:none}
 .api-role-cell {font:600 10px/1.5 ui-monospace,monospace;color:var(--blue)}
+.hide-column-22 th:nth-child(22),.hide-column-22 td:nth-child(22),
+.hide-column-23 th:nth-child(23),.hide-column-23 td:nth-child(23),
+.hide-column-24 th:nth-child(24),.hide-column-24 td:nth-child(24),
+.hide-column-25 th:nth-child(25),.hide-column-25 td:nth-child(25),
+.hide-column-26 th:nth-child(26),.hide-column-26 td:nth-child(26),
+.hide-column-27 th:nth-child(27),.hide-column-27 td:nth-child(27),
+.hide-column-28 th:nth-child(28),.hide-column-28 td:nth-child(28),
+.hide-column-29 th:nth-child(29),.hide-column-29 td:nth-child(29) {display:none}
+.route-hierarchy-cell,.route-discovery-cell,.api-validation-reason-cell {min-width:190px;max-width:320px;white-space:normal;overflow-wrap:anywhere}
+.route-hierarchy-cell small {display:block;color:var(--muted);font-size:10px;margin-top:4px}
+.inventory-scope,.coverage-reasons {color:var(--muted);font-size:12px}
+.outcome-not-tested .failure-reason,.outcome-not-tested .failure-reason b,
+.outcome-skipped .failure-reason,.outcome-skipped .failure-reason b {color:var(--muted)}
 .api-tools .table-controls {grid-column:1 / -1}
 .api-tools .columns-panel {left:0;right:auto}
 .inspect-content pre {white-space:pre-wrap;overflow-wrap:anywhere;font:500 12px/1.65 ui-monospace,monospace;color:#bdd0c7;margin:0}
