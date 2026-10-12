@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app.network import normalize_api_endpoint, safe_api_identity
-from app.reporting import finding
+from app.reporting import finding, request_failure_types
 
 
 RESOURCE_TIMING_SCRIPT = r"""
@@ -206,14 +206,36 @@ def build_resource_report(
         route = str(event.get("initiating_route") or "")
         # Preserve logical SPA route fragments, but never serialize query values
         # or opaque identifiers from resource correlation metadata.
-        if route:
+        if route and not re.fullmatch(r"UI_VIEW_[0-9a-f]{24}", route):
             parsed_route = urlparse(route)
             route, _, _ = safe_api_identity(route)
             if parsed_route.fragment.startswith(("/", "!/")):
                 fragment_path = parsed_route.fragment.split("?", 1)[0].lstrip("!")
                 route += "#" + normalize_api_endpoint(fragment_path)
         status = event.get("status")
-        failed = not blocked and (bool(event.get("error")) or isinstance(status, int) and status >= 400)
+        failure_types = request_failure_types(event)
+        failed = any(kind in failure_types for kind in (
+            "HTTP_4XX", "HTTP_5XX", "NETWORK_FAILURE", "RESPONSE_BODY_FAILURE",
+        ))
+        lifecycle = str(event.get("lifecycle_status") or "NOT_RECORDED")
+        if blocked:
+            lifecycle = "BLOCKED"
+        elif "CANCELED" in failure_types:
+            lifecycle = "CANCELED"
+        if lifecycle not in {"REQUESTED", "ALLOWED", "RESPONDED", "COMPLETED", "FAILED", "BLOCKED", "CANCELED", "INCOMPLETE"}:
+            lifecycle = "NOT_RECORDED"
+        incomplete_reason = None
+        if "INCOMPLETE" in failure_types:
+            configured_reason = event.get("incomplete_reason")
+            if isinstance(configured_reason, str) and configured_reason in {
+                "NO_RESPONSE_BEFORE_SCAN_END", "RESPONSE_BODY_NOT_COMPLETED", "NOT_DISPATCHED_BEFORE_SCAN_END",
+            }:
+                incomplete_reason = configured_reason
+            else:
+                incomplete_reason = (
+                    "RESPONSE_BODY_NOT_COMPLETED" if event.get("response_seen", isinstance(status, int))
+                    else "NO_RESPONSE_BEFORE_SCAN_END"
+                )
         details.append({
             "url": safe_url,
             "host": host,
@@ -230,6 +252,16 @@ def build_resource_report(
             "warning_size_basis": measurement if categories else None,
             "failed": failed,
             "blocked_by_validator": blocked,
+            "failure_types": failure_types,
+            "failure_reason": (
+                "VALIDATOR_POLICY_BLOCK" if blocked else
+                f"HTTP_{status}" if isinstance(status, int) and not isinstance(status, bool) and 400 <= status < 600 else
+                incomplete_reason if incomplete_reason else
+                failure_types[0] if failure_types else None
+            ),
+            "lifecycle_status": lifecycle,
+            "request_canceled": "CANCELED" in failure_types,
+            "incomplete_reason": incomplete_reason,
         })
     transfers = [item["transfer_size_bytes"] for item in details if item["transfer_size_bytes"] is not None]
     summary = {

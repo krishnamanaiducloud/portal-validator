@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlparse, urldefrag
 
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 
+from app.discovery import retry_dom_operation
 from app.security import DestinationError, normalized_host, sanitize_url
 
 
 AUTH_PATH_MARKERS = frozenset({
-    "auth", "authorize", "authorization", "oauth", "oidc", "saml", "sso", "signin", "login", "idp",
+    "auth", "authorize", "authorization", "oauth", "oauth2", "oidc", "saml", "sso", "signin", "login", "idp",
 })
 
 
@@ -162,6 +164,27 @@ def authentication_form_signal(post_data: str | None) -> bool:
     )
 
 
+def oauth_token_form_signal(post_data: str | None) -> bool:
+    """Recognize browser OAuth code/refresh exchanges, never password grants.
+
+    This is only protocol evidence, not authorization. The caller must still
+    require an active flow, explicitly approved destination, trusted initiating
+    frame, and independent network/TLS validation. Payloads are never retained.
+    """
+    if not post_data or len(post_data) > 64 * 1024:
+        return False
+    try:
+        values = parse_qs(post_data, keep_blank_values=True, max_num_fields=100)
+    except (TypeError, ValueError):
+        return False
+    # Duplicate protocol fields are ambiguous; do not choose one silently.
+    if any(len(items) != 1 for items in values.values()):
+        return False
+    grant = values.get("grant_type", [""])[0]
+    required = {"authorization_code": "code", "refresh_token": "refresh_token"}.get(grant)
+    return bool(required and values.get(required, [""])[0].strip())
+
+
 @dataclass
 class AuthenticationNavigationPolicy:
     """Track an SSO navigation chain without broadening crawler or resource scope."""
@@ -203,6 +226,121 @@ class AuthenticationNavigationPolicy:
         return allowed
 
 
+    def allows_browser_request(
+        self,
+        method: str,
+        url: str,
+        post_data: str | None = None,
+        *,
+        resource_type: str,
+        document_navigation: bool,
+        source_url: str,
+        source_portal_scoped: bool = False,
+        portal_scoped: bool = False,
+    ) -> bool:
+        """Supplement top-level navigation policy for explicit SSO bridges.
+
+        Auth iframe navigations and OAuth fetches are not business resources.
+        They are nevertheless *not* a blanket resource-host exception: require
+        an already observed flow, approved source/destination and concrete
+        protocol evidence. Independent destination/redirect SSRF checks remain
+        mandatory before dispatch. This function never sends/replays requests.
+        """
+        source_host = normalized_host(urlparse(source_url).hostname or "")
+        if not source_portal_scoped and source_host not in self.approved_hosts:
+            return False
+        destination_host = normalized_host(urlparse(url).hostname or "")
+        host_approved = destination_host in self.approved_hosts
+        normalized_method = method.upper()
+        url_signal = auth_protocol_signal(url)
+        if document_navigation:
+            if normalized_method in {"GET", "HEAD", "OPTIONS"}:
+                allowed = bool(url_signal and (host_approved or self.active and portal_scoped))
+                if allowed:
+                    # An explicitly approved GET identity iframe can begin the
+                    # flow. A mutating request can never manufacture that state.
+                    self.observe(url, normalized_method)
+                return allowed
+            return self.allows_main_frame_method(
+                normalized_method, url, post_data, portal_scoped=portal_scoped,
+            )
+        token_endpoint = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1].lower() == "token"
+        if not self.active or resource_type.lower() not in {"xhr", "fetch"} or not host_approved:
+            return False
+        if normalized_method in {"GET", "HEAD", "OPTIONS"}:
+            return url_signal
+        return normalized_method == "POST" and (url_signal or token_endpoint) and oauth_token_form_signal(post_data)
+
+
+    def allows_redirect(
+        self, method: str, source_url: str, destination_url: str, *,
+        document_navigation: bool, authentication_form: bool = False,
+        oauth_token_form: bool = False, source_portal_scoped: bool = False,
+        destination_portal_scoped: bool = False,
+    ) -> bool:
+        """Validate a naturally followed auth redirect using safe protocol facts.
+
+        CDP supplies only booleans derived from the browser's existing request
+        body. Absent token-body evidence fails closed for preserved POSTs; no
+        source URL alone can authorize an OAuth fetch mutation. Destination
+        URL/port/DNS validation is still performed by the redirect guard caller.
+        """
+        if not self.active:
+            return False
+        source_host = normalized_host(urlparse(source_url).hostname or "")
+        destination_host = normalized_host(urlparse(destination_url).hostname or "")
+        if not source_portal_scoped and source_host not in self.approved_hosts:
+            return False
+        normalized_method = method.upper()
+        if document_navigation:
+            return bool(
+                normalized_method in {"GET", "HEAD", "OPTIONS", "POST"}
+                and (
+                    authentication_form if normalized_method == "POST"
+                    else authentication_form or auth_protocol_signal(source_url)
+                )
+                and (destination_portal_scoped or destination_host in self.approved_hosts)
+            )
+        if source_host not in self.approved_hosts or destination_host not in self.approved_hosts:
+            return False
+        destination_token = urlparse(destination_url).path.rstrip("/").rsplit("/", 1)[-1].lower() == "token"
+        if not (auth_protocol_signal(destination_url) or destination_token):
+            return False
+        if normalized_method in {"GET", "HEAD", "OPTIONS"}:
+            return bool(oauth_token_form or auth_protocol_signal(source_url))
+        return normalized_method == "POST" and oauth_token_form
+
+
+    def identifies_authentication_attempt(
+        self, method: str, url: str, post_data: str | None, *,
+        resource_type: str, document_navigation: bool, portal_scoped: bool,
+    ) -> bool:
+        """Classify a denied SSO request, not authorize or activate its flow.
+
+        Protocol words on assets/business endpoints are insufficient evidence
+        that authentication failed. POST navigation needs an actual protocol
+        form; API exchanges additionally require explicit identity-host scope.
+        """
+        if not self.active:
+            return False
+        normalized_method = method.upper()
+        if document_navigation:
+            if normalized_method == "POST":
+                return authentication_form_signal(post_data)
+            return bool(
+                normalized_method in {"GET", "HEAD", "OPTIONS"}
+                and auth_protocol_signal(url, boundary_only=portal_scoped)
+            )
+        if normalized_method != "POST" or resource_type.lower() not in {"xhr", "fetch"}:
+            return False
+        host = normalized_host(urlparse(url).hostname or "")
+        token_endpoint = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1].lower() == "token"
+        return bool(
+            host in self.approved_hosts and (auth_protocol_signal(url) or token_endpoint)
+            and oauth_token_form_signal(post_data)
+        )
+
+
 async def settle_authentication_navigation(
     page: Any,
     *,
@@ -233,7 +371,8 @@ async def settle_authentication_navigation(
             "final_host": normalized_host(urlparse(page.url).hostname or ""),
         }
 
-    while True:
+    async def observe_document() -> tuple[str, bool, bool, int | None, bool, bool]:
+        """Read one consistent document snapshot; an auth bridge may replace it."""
         current_url = page.url
         signals = await detect_signals(page)
         if isinstance(signals, dict):
@@ -241,21 +380,14 @@ async def settle_authentication_navigation(
             mfa = bool(signals.get("mfa_form"))
         else:
             password, mfa = map(bool, signals)
-        if mfa:
-            return result("MFA_REQUIRED", mfa=True, password=password)
-        if password:
-            return result("LOGIN_REQUIRED", password=True)
         effective_status = current_status() if current_status is not None else status
-        if effective_status is not None and effective_status >= 400:
-            return result("HTTP_ERROR")
         portal_scoped = in_portal_scope(current_url)
         approved_external_identity = bool(
             not portal_scoped and is_approved_authentication_host is not None
             and is_approved_authentication_host(normalized_host(urlparse(current_url).hostname or ""))
         )
         auth_surface = auth_protocol_signal(current_url, boundary_only=portal_scoped) or approved_external_identity
-        active = active or auth_surface
-        if active and not auth_surface:
+        if active and not auth_surface and not password and not mfa:
             # A protocol auto-post form is concrete bridge evidence both inside
             # and outside portal scope. Observe it; never submit it ourselves.
             auth_surface = await page.evaluate("""() => Array.from(document.forms).some(form => {
@@ -266,6 +398,27 @@ async def settle_authentication_navigation(
                 return fields.has('samlrequest') || fields.has('samlresponse') ||
                     (fields.has('state') && (fields.has('code') || fields.has('id_token')));
             })""")
+        if page.url != current_url:
+            # A frame's URL and DOM evidence must describe the same document.
+            # Retrying this read-only snapshot cannot replay an SSO submission.
+            raise PlaywrightError("Execution context was destroyed during authentication observation")
+        return current_url, password, mfa, effective_status, portal_scoped, bool(auth_surface)
+
+    while True:
+        try:
+            current_url, password, mfa, effective_status, portal_scoped, auth_surface = await retry_dom_operation(
+                page, observe_document,
+                timeout_ms=max(1, round((deadline - time.perf_counter()) * 1000)),
+            )
+        except asyncio.TimeoutError:
+            return result("AUTHENTICATION_PENDING", timed_out=True)
+        if mfa:
+            return result("MFA_REQUIRED", mfa=True, password=password)
+        if password:
+            return result("LOGIN_REQUIRED", password=True)
+        if effective_status is not None and effective_status >= 400:
+            return result("HTTP_ERROR")
+        active = active or auth_surface
         if portal_scoped and not auth_surface:
             return result("APPLICATION", completed=True)
         if not auth_surface and not portal_scoped:

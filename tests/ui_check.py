@@ -54,13 +54,14 @@ async def main():
         }""")
         await concurrency.fill("")
         assert "concurrency_limit" not in await page.evaluate("phaseConfiguration()")
-        for control in ("navigation-timeout", "authentication-timeout", "api-timeout", "readiness-timeout"):
+        for control in ("navigation-timeout", "authentication-timeout", "api-timeout", "readiness-timeout", "per-route-timeout"):
             await page.locator(f"#{control}").fill("12345")
         await page.locator("#readiness-selector").fill("[data-app-ready]")
         await page.locator("#authentication-hosts").fill("login.example.net, identity.example.org")
         assert await page.evaluate("phaseConfiguration()") == {
             "navigation_timeout_ms": 12345, "authentication_timeout_ms": 12345,
             "api_timeout_ms": 12345, "readiness_timeout_ms": 12345,
+            "per_route_timeout_ms": 12345,
             "readiness_selector": "[data-app-ready]",
             "authentication_hosts": ["login.example.net", "identity.example.org"],
         }
@@ -68,7 +69,7 @@ async def main():
         assert "integer between" in await page.evaluate("""() => {
           try { phaseConfiguration(); return ''; } catch (error) { return error.message; }
         }""")
-        for control in ("navigation-timeout", "authentication-timeout", "api-timeout", "readiness-timeout", "readiness-selector", "authentication-hosts"):
+        for control in ("navigation-timeout", "authentication-timeout", "api-timeout", "readiness-timeout", "per-route-timeout", "readiness-selector", "authentication-hosts"):
             await page.locator(f"#{control}").fill("")
         await page.locator("#scan-timing-settings > summary").click()
         await page.locator("#auth-mode").select_option("storage_state")
@@ -147,7 +148,7 @@ async def main():
             scan_timing:{authentication_ms:20,discovery_ms:30,route_validation_ms:125,total_scan_ms:175},
             results:[{url:'https://portal.example.com/health',requested_url:'https://portal.example.com/health',
               discovered_url:'https://portal.example.com/health',final_url:'https://portal.example.com/health',
-              route_label:'Health',navigation_label:'Health',route_name:'Health',route_name_source:'NAVIGATION_LABEL',
+              route_id:'/health',route_label:'Health',navigation_label:'Health',route_name:'Health',route_name_source:'NAVIGATION_LABEL',
               route_name_confidence:'HIGH',route_source:'navigation',display_path:'/health',host:'portal.example.com',
               canonical_route:'https://portal.example.com/health',discovery_sources:[{source:'semantic_navigation'}],duplicate_discovery_count:0,
               parent_route_id:'portal-root',parent_route_name:'Operations',navigation_hierarchy:['Operations','Health'],
@@ -169,6 +170,17 @@ async def main():
         assert "2 unresolved" in await page.locator("#coverage").text_content()
         assert "NAVIGATION_CONTROLS_UNRESOLVED" in await page.locator("#coverage").text_content()
         assert "total application coverage remains unknown" in await page.locator("#coverage").text_content()
+        assert await page.locator('[data-navigation-metric="visited_views"]').text_content() == "1"
+        assert await page.locator('[data-navigation-metric="unresolved_controls"]').text_content() == "2"
+        assert "NAVIGATION_CONTROLS_UNRESOLVED" in await page.locator("#navigation-coverage-limitations").text_content()
+        await page.locator("#navigation-explorer > summary").click()
+        assert "Operations" in await page.locator("#navigation-tree").text_content()
+        assert "Associated APIs (6)" in await page.locator("#navigation-tree").text_content()
+        await page.locator("#navigation-tree details > summary").first.click()
+        await page.locator('[data-navigation-route="0"]').click()
+        assert "Inspect: Health" in await page.locator("#route-inspector-title").text_content()
+        await page.locator("#route-inspector-close").click()
+        await page.locator("#navigation-explorer > summary").click()
         assert await page.locator("#api-lifecycle-api_responses_completed").text_content() == "10"
         assert await page.locator("#api-lifecycle-api_requests_not_actively_tested").text_content() == "15"
         assert await page.get_by_role("button", name="Show Scan duration evidence").locator("strong").inner_text() == "8.5s"
@@ -305,7 +317,7 @@ async def main():
         query_row = page.locator("#api-list tr").filter(has=page.locator("button.api-endpoint", has_text="/query"))
         assert await query_row.locator(".api-response-status-cell").text_content() == "200 (8), 401 (1)"
         assert await query_row.locator(".api-failure-count-cell").text_content() == "1"
-        assert await query_row.locator(".api-associated-routes-cell").text_content() == "/health"
+        assert await query_row.locator(".api-associated-routes-cell").text_content() == "Health"
         assert await query_row.locator(".api-auth-class-cell").text_content() == "NOT_AUTHENTICATION"
         assert "POST_READ_ONLY_APPROVED" in await query_row.locator(".api-post-class-cell").text_content()
         blocked_post_row = page.locator("#api-list tr").filter(has=page.locator("button.api-endpoint", has_text="/blocked/0"))
@@ -346,6 +358,11 @@ async def main():
         await page.locator("#api-lifecycle-filter").select_option("BLOCKED_BY_POLICY")
         assert await page.locator("#api-list tr").count() == 4
         await page.locator("#api-lifecycle-filter").select_option("all")
+        await page.locator("#api-failure-type-filter").select_option("HTTP_4XX")
+        assert await page.locator("#api-list .api-endpoint").all_text_contents() == ["/query"]
+        await page.locator("#api-failure-type-filter").select_option("POLICY_BLOCKED")
+        assert await page.locator("#api-list tr").count() == 5
+        await page.locator("#api-failure-type-filter").select_option("all")
         await page.locator("#api-response-filter").select_option("none")
         assert await page.locator("#api-list tr").count() == 4
         await page.locator("#api-response-filter").select_option("200")

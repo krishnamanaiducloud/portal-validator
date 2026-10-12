@@ -470,7 +470,10 @@ async def test_full_scan_natural_spa_post_observer_policy_network_and_report(pro
         allow_private_networks=True,
         max_pages=route_count + 1,
         max_depth=2,
-        timeout_ms=5000,
+        # This fixture validates attribution/policy across 51 real browser
+        # transitions, not a 5s deadline. Leave room for constrained debug CI;
+        # dedicated deadline tests exercise the actual timeout behavior.
+        timeout_ms=10000,
         total_timeout_ms=240000,
         render_settle_ms=500,
         max_navigation_actions=0,
@@ -485,7 +488,10 @@ async def test_full_scan_natural_spa_post_observer_policy_network_and_report(pro
         }] if approve_post else []),
     )
     report = await execute_scan(request)
-    assert report["summary"]["routes_validated"] == route_count + 1
+    assert report["summary"]["routes_validated"] == route_count + 1, [
+        (item["route_name"], item["classification"], item.get("application_readiness"), item.get("error"))
+        for item in report["results"]
+    ]
     inventory = {(item["method"], item["endpoint"]): item for item in report["api_inventory"]}
     post = inventory[("POST", "/api/query")]
     assert post["calls"] == 7 * route_count

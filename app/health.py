@@ -7,6 +7,7 @@ from typing import Any
 
 from app.network import safe_api_identity
 from app.reporting import finding
+from app.discovery import evaluate_dom
 
 
 RENDER_HEALTH_SCRIPT = r"""
@@ -68,7 +69,7 @@ RENDER_SAMPLE_INTERVAL_SECONDS = 0.1
 
 
 async def capture_render_health(page) -> dict[str, Any]:
-    result = await page.evaluate(RENDER_HEALTH_SCRIPT)
+    result = await evaluate_dom(page, RENDER_HEALTH_SCRIPT)
     return {
         "ready_state": str(result.get("ready_state") or "unknown"),
         "title": str(result.get("title") or "")[:256],
@@ -87,7 +88,7 @@ async def document_navigation_timing(page) -> tuple[int, float, float] | None:
     Using performance.timeOrigin avoids treating evaluate()/IPC return latency
     as part of the document's clock offset and clipping away policy pauses.
     """
-    timing = await page.evaluate("""() => {
+    timing = await evaluate_dom(page, """() => {
       const entry = performance.getEntriesByType('navigation')[0];
       return entry && entry.domContentLoadedEventEnd > 0
         ? {duration: entry.domContentLoadedEventEnd - entry.startTime,
@@ -100,6 +101,22 @@ async def document_navigation_timing(page) -> tuple[int, float, float] | None:
     epoch_to_monotonic = time.perf_counter() - time.time()
     started = timing["epochStart"] / 1000 + epoch_to_monotonic
     return duration_ms, started, started + duration_ms / 1000
+
+
+def application_shell_ready(snapshot: dict[str, Any] | None) -> bool:
+    """Observable rendered readiness, not HTTP 200 or an authentication claim.
+
+    A deployment can additionally require its own visible shell selector.
+    Polling/API quiet is deliberately not a prerequisite for visible readiness.
+    """
+    return bool(
+        snapshot
+        and snapshot.get("ready_state") in {"interactive", "complete"}
+        and snapshot.get("configured_readiness_met", True)
+        and not snapshot.get("busy_indicators", 0)
+        and not snapshot.get("challenge_indicators", 0)
+        and (snapshot.get("text_length", 0) >= 20 or snapshot.get("visible_elements", 0) >= 3)
+    )
 
 
 async def wait_for_render_settle(

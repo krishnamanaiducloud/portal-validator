@@ -1,13 +1,90 @@
 from __future__ import annotations
 
 import json
+import copy
 import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-from app.security import DestinationError, sanitize_url, validate_http_url
+from app.security import DestinationError, normalized_host, sanitize_url, validate_http_url
+
+
+SCOPED_COOKIE_HOSTS = "_portal_validator_scoped_cookie_hosts"
+
+
+def scope_storage_state(state: dict, approved_hosts: set[str] | frozenset[str]) -> dict:
+    """Return a private copy scoped to explicit portal/identity destinations.
+
+    A mounted profile can serve multiple independent portals. Never alter it or
+    transfer unrelated cookies/storage into a scan. Broad-domain profile cookies
+    are materialized as host-only copies for their explicitly approved hosts so
+    an unrelated sibling cannot inherit credentials during a public redirect.
+    Playwright's browser-managed SameSite/Secure/HttpOnly rules remain intact.
+    """
+    allowed = {normalized_host(host) for host in approved_hosts if host}
+    scoped = copy.deepcopy(state)
+    authoritative_hosts = set(scoped.pop(SCOPED_COOKIE_HOSTS, []))
+    retained: dict[tuple[str, str, str, str], dict] = {}
+    # Prefer a more-specific cookie if broad-domain and host-only entries collide.
+    candidates = sorted(
+        (cookie for cookie in state.get("cookies", []) if isinstance(cookie, dict)),
+        key=lambda cookie: (
+            len(str(cookie.get("domain", "")).lstrip(".")),
+            not str(cookie.get("domain", "")).startswith("."),
+        ),
+    )
+    for cookie in candidates:
+        domain = normalized_host(str(cookie.get("domain", "")).lstrip("."))
+        if not domain:
+            continue
+        is_domain_cookie = str(cookie.get("domain", "")).startswith(".")
+        destinations = {
+            host for host in allowed
+            if host == domain or is_domain_cookie and host.endswith("." + domain)
+        }
+        for host in sorted(destinations):
+            if is_domain_cookie and host in authoritative_hosts:
+                # This host has a refreshed private snapshot. Do not resurrect
+                # its deleted/expired cookie from a broader original profile.
+                continue
+            copied = copy.deepcopy(cookie)
+            copied["domain"] = host
+            key = (
+                host, str(cookie.get("path", "/")), str(cookie.get("name", "")),
+                str(cookie.get("partitionKey", "")),
+            )
+            retained[key] = copied
+    scoped["cookies"] = list(retained.values())
+    scoped["origins"] = [
+        copy.deepcopy(origin) for origin in state.get("origins", [])
+        if isinstance(origin, dict)
+        and urlparse(str(origin.get("origin", ""))).scheme in {"http", "https"}
+        and normalized_host(urlparse(str(origin.get("origin", ""))).hostname or "") in allowed
+    ]
+    return scoped
+
+
+def merge_scoped_storage_state(previous: dict, current: dict, approved_hosts: set[str]) -> dict:
+    """Refresh one scope while retaining another portal's private session state."""
+    allowed = {normalized_host(host) for host in approved_hosts if host}
+    fresh = scope_storage_state(current, allowed)
+    merged = copy.deepcopy(previous)
+    merged["cookies"] = [
+        copy.deepcopy(cookie) for cookie in previous.get("cookies", [])
+        if isinstance(cookie, dict) and (
+            str(cookie.get("domain", "")).startswith(".")
+            or normalized_host(str(cookie.get("domain", ""))) not in allowed
+        )
+    ] + fresh["cookies"]
+    merged["origins"] = [
+        copy.deepcopy(origin) for origin in previous.get("origins", [])
+        if isinstance(origin, dict)
+        and normalized_host(urlparse(str(origin.get("origin", ""))).hostname or "") not in allowed
+    ] + fresh["origins"]
+    merged[SCOPED_COOKIE_HOSTS] = sorted(set(previous.get(SCOPED_COOKIE_HOSTS, [])) | allowed)
+    return merged
 
 
 @dataclass(frozen=True)
@@ -40,6 +117,7 @@ class RuntimeSessionStore:
         context,
         *,
         expected_mtime_ns: int | None = None,
+        approved_hosts: set[str] | None = None,
     ) -> Path | None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         target = self.path_for(profile)
@@ -50,6 +128,9 @@ class RuntimeSessionStore:
         ):
             return None
         state = await context.storage_state()
+        if approved_hosts is not None:
+            previous = json.loads(target.read_text(encoding="utf-8")) if target.is_file() else {"cookies": [], "origins": []}
+            state = merge_scoped_storage_state(previous, state, approved_hosts)
         payload = json.dumps(state, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         if (
             expected_mtime_ns is not None

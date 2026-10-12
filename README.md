@@ -1,10 +1,13 @@
 # Portal Validator
 
-Portal Validator 1.12.6 is a read-only browser health validator with optional authentication for public,
+Portal Validator 1.12.7 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
 results without disabling certificate verification.
+
+See [1.12.7 release verification](docs/RELEASE-1.12.7.md) for authenticated SPA,
+per-view API health, image checks and remaining coverage limitations.
 
 Targets may be hostnames (`google.com`, `www.google.com`) or complete HTTP(S)
 URLs. Bare hostnames default to HTTPS.
@@ -268,10 +271,10 @@ runs as UID/GID 10001 while supporting an arbitrary OpenShift UID.
 Build versioned tags only:
 
 ```bash
-docker build -t mohankrishna999/portal-validator:1.12.6 .
+docker build -t mohankrishna999/portal-validator:1.12.7 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.6 \
-  -t mohankrishna999/portal-validator:1.12.6-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.7 \
+  -t mohankrishna999/portal-validator:1.12.7-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -286,7 +289,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.12.6
+  mohankrishna999/portal-validator:1.12.7
 ```
 
 ## OpenShift

@@ -352,8 +352,8 @@ async def test_service_worker_visibility_policy_blocks_registration_not_client_p
     original_options = main.browser_context_options
     effective_options = []
 
-    def captured_options(state_path):
-        options = original_options(state_path)
+    def captured_options(state_path, approved_storage_hosts=None):
+        options = original_options(state_path, approved_storage_hosts)
         effective_options.append(options)
         return options
 

@@ -533,6 +533,10 @@ def test_resource_inventory_keeps_resources_separate_from_routes_and_apis():
         "routes_using_resource": ["https://portal.example.com/home"],
         "route_count": 1,
         "health": "DEGRADED",
+        "response_status_counts": {"200": 1, "503": 1},
+        "failure_type_counts": {"HTTP_5XX": 1},
+        "failure_types": ["HTTP_5XX"],
+        "lifecycle_status_counts": {"NOT_RECORDED": 2},
     }]
 
 

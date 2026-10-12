@@ -44,6 +44,15 @@
 .route-hierarchy-cell,.route-discovery-cell,.api-validation-reason-cell {min-width:190px;max-width:320px;white-space:normal;overflow-wrap:anywhere}
 .route-hierarchy-cell small {display:block;color:var(--muted);font-size:10px;margin-top:4px}
 .inventory-scope,.coverage-reasons {color:var(--muted);font-size:12px}
+.navigation-tree,.navigation-tree ul {list-style:none;padding-left:18px;margin:10px 0}
+.navigation-tree {padding-left:0;max-height:480px;overflow:auto;overflow-wrap:anywhere}
+.navigation-tree li {margin:8px 0}
+.navigation-tree summary {cursor:pointer;color:var(--lime);font-size:13px}
+.navigation-view>.secondary {margin-right:10px;padding:7px 10px;font-size:12px}
+.navigation-view>small {display:block;margin-top:6px;color:var(--muted)}
+.navigation-view code {font-size:11px;white-space:normal}
+#navigation-explorer>summary {cursor:pointer;font-size:14px;font-weight:700}
+#navigation-explorer>p {color:var(--muted);font-size:12px}
 .outcome-not-tested .failure-reason,.outcome-not-tested .failure-reason b,
 .outcome-skipped .failure-reason,.outcome-skipped .failure-reason b {color:var(--muted)}
 .api-tools .table-controls {grid-column:1 / -1}

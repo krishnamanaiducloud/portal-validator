@@ -106,8 +106,15 @@ def test_failure_count_counts_calls_not_multiple_failure_dimensions():
         event("canceled-response", status=200, error="net::ERR_ABORTED", request_failed=True, request_canceled=True),
     ])[0]
     assert item["calls"] == 2
-    assert item["failure_count"] == 1
-    assert item["target_failure_count"] == 2  # Existing dimension-based field remains unchanged.
+    assert item["failure_count"] == item["target_failure_count"] == 1
+    # HTTP and body-transfer evidence describe the same failed occurrence;
+    # preserve both dimensions without counting the request twice.
+    assert item["status_5xx"] == item["response_body_failures"] == 1
+    assert item["network_failures"] == 0
+    assert item["canceled_calls"] == 1
+    assert item["failure_type_counts"] == {
+        "HTTP_5XX": 1, "RESPONSE_BODY_FAILURE": 1, "CANCELED": 1,
+    }
 
 
 def test_report_adds_eight_diagnostics_without_changing_legacy_post_summary():

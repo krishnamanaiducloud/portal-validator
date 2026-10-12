@@ -3,11 +3,14 @@
 import io
 import json
 import logging
+import sys
 
 import pytest
 
 from app import logging_config
 from app.logging_config import RedactingFilter
+from uvicorn.config import LOGGING_CONFIG
+from uvicorn.logging import AccessFormatter
 
 
 @pytest.mark.parametrize("query", (
@@ -91,9 +94,85 @@ def test_raw_access_log_format_and_sensitive_arguments_remain_redacted():
     )
     assert RedactingFilter().filter(record)
     rendered = logging.Formatter("%(message)s").format(record)
-    assert rendered.startswith('127.0.0.1:1234 - "GET /callback?')
+    assert rendered.startswith('127.0.0.1:1234 - "GET /callback HTTP/')
     assert rendered.endswith('HTTP/1.1" 200')
     assert "fixture-private-" not in rendered
+
+
+@pytest.mark.parametrize("target", (
+    "/callback?code=fixture-private-code&state=fixture-private-state",
+    "/callback?unrecognized=fixture-private-query#fixture-private-fragment",
+    "/callback#fixture-private-fragment",
+))
+def test_real_uvicorn_access_formatter_preserves_structure_after_repeated_filtering(target):
+    record = logging.LogRecord(
+        "uvicorn.access", logging.INFO, __file__, 1,
+        logging_config.UVICORN_ACCESS_FORMAT,
+        ("127.0.0.1:1234", "GET", target, "1.1", 200), None,
+    )
+    redaction = RedactingFilter()
+    formatter = AccessFormatter(
+        '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+        use_colors=False,
+    )
+    for _ in range(3):
+        assert redaction.filter(record)
+        assert len(record.args) == 5
+        rendered = formatter.format(record)
+        assert '127.0.0.1:1234 - "GET /callback HTTP/1.1" 200 OK' in rendered
+        assert "fixture-private-" not in rendered
+        assert "?" not in rendered and "#" not in rendered
+
+
+def test_actual_access_handler_emits_redacted_request_to_stdout(capsys):
+    logger = logging.Logger("uvicorn.access", level=logging.INFO)
+    logger.addFilter(RedactingFilter())
+    handler = logging.StreamHandler(sys.stdout)
+    handler.addFilter(RedactingFilter())
+    handler.setFormatter(AccessFormatter(
+        LOGGING_CONFIG["formatters"]["access"]["fmt"], use_colors=False,
+    ))
+    logger.addHandler(handler)
+    logger.info(
+        logging_config.UVICORN_ACCESS_FORMAT, "127.0.0.1:1234", "POST",
+        "/callback?opaque=fixture-private-query", "1.1", 200,
+    )
+
+    captured = capsys.readouterr()
+    assert 'POST /callback HTTP/1.1" 200 OK' in captured.out
+    assert "fixture-private-" not in captured.out
+    assert captured.err == ""
+    assert LOGGING_CONFIG["handlers"]["access"]["stream"] == "ext://sys.stdout"
+    assert LOGGING_CONFIG["handlers"]["default"]["stream"] == "ext://sys.stderr"
+
+
+@pytest.mark.parametrize("logger_name", ("uvicorn.error", "uvicorn.access"))
+def test_generic_formatted_authentication_arguments_still_redact_full_message(logger_name):
+    record = logging.LogRecord(
+        logger_name, logging.ERROR, __file__, 1,
+        "Authentication failed: %s=%s", ("Authorization", "Bearer fixture-private-bearer"), None,
+    )
+    for _ in range(3):
+        assert RedactingFilter().filter(record)
+    rendered = logging.Formatter("%(message)s").format(record)
+    assert "Authentication failed:" in rendered
+    assert "[REDACTED]" in rendered
+    assert "fixture-private-" not in rendered
+
+
+def test_application_logging_keeps_redacted_errors_on_stderr_and_events_on_stdout(monkeypatch, capsys):
+    monkeypatch.setattr(logging_config, "LOGGER_NAME", "isolated-stream-redaction-test")
+    logger = logging_config.configure_logging()
+    logger.info("Read request: token=%s", "fixture-private-info")
+    logger.error("Request failed: Authorization=%s", "Bearer fixture-private-error")
+
+    captured = capsys.readouterr()
+    assert "Read request:" in captured.out
+    assert "Request failed:" not in captured.out
+    assert "Request failed:" in captured.err
+    assert "Read request:" not in captured.err
+    assert "fixture-private-" not in captured.out + captured.err
+    assert "[REDACTED]" in captured.out and "[REDACTED]" in captured.err
 
 
 def test_long_structured_record_retains_valid_json():

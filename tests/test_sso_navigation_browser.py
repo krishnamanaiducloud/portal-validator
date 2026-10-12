@@ -46,6 +46,29 @@ def sso_portal(tmp_path, monkeypatch):
             cookies = self.headers.get("Cookie", "")
             requests.append((role, "GET", path, cookies))
             if role == "portal":
+                if path == "/business-warning-page":
+                    return self.reply(200, ('''<html><body><h1>Generic application shell</h1>
+                        <nav><a href="/business-target-page">Public dashboard</a></nav><main>Application content is available.</main>
+                        <img src="''' + origins["oauth"] + '''/analytics/sso.gif" alt="optional metric">
+                        <script>fetch('/api/oauth/report',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});</script>
+                        </body></html>''').encode())
+                if path == "/business-target-page":
+                    return self.reply(200, b'''<html><body><h1>Public application dashboard</h1>
+                        <main>A safely reachable second application view is rendered with its expected dashboard content.</main>
+                        </body></html>''')
+                if path == "/embedded-page":
+                    return self.reply(200, ('''<html><body><h1>Application shell</h1>
+                        <main>Application content remains available.</main><iframe src="'''
+                        + origins["oauth"] + '''/saml/iframe-start"></iframe>
+                        </body></html>''').encode())
+                if path == "/oauth-exchange-page":
+                    endpoint = json.dumps(origins["oauth"] + "/oauth/token")
+                    return self.reply(200, ('''<html><body><h1>Application shell</h1>
+                        <main>Application content remains available.</main><script>
+                        fetch(''' + endpoint + ''', {method:'POST',credentials:'include',
+                        headers:{'Content-Type':'application/x-www-form-urlencoded'},
+                        body:'grant_type=authorization_code&code=fixture-private-code'});
+                        </script></body></html>''').encode())
                 if path == "/popup-window-page":
                     return self.reply(200, ('''<html><body><h1>Generic application</h1>
                         <main>The application document remains ready while its separate
@@ -97,6 +120,13 @@ def sso_portal(tmp_path, monkeypatch):
                     <script>fetch('/api/read',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});</script>
                     </body></html>''')
             if role == "oauth":
+                if path == "/saml/iframe-start":
+                    # Exercise iframe policy independently of browser SameSite
+                    # cookie restrictions. No cookie/security flag is changed.
+                    return self.reply(200, ('''<html><body><h1>Approved federation bridge</h1>
+                        <form method="POST" action="''' + origins["saml"] + '''/saml/consume">
+                        <input type="hidden" name="SAMLRequest" value="fixture-private-saml"></form>
+                        <script>document.forms[0].submit();</script></body></html>''').encode())
                 if path == "/bridge":
                     destination = json.dumps(origins["oauth"] + "/authorize?client_id=portal&response_type=code&state=fixture-private-state")
                     return self.reply(200, ('''<html><body><h1>Completing sign-in</h1><script>
@@ -129,6 +159,11 @@ def sso_portal(tmp_path, monkeypatch):
             self.rfile.read(int(self.headers.get("Content-Length", "0")))
             cookies = self.headers.get("Cookie", "")
             requests.append((role, "POST", path, cookies))
+            if role == "oauth" and path == "/oauth/token":
+                return self.reply(
+                    200, b'{"authorized":true}', Access_Control_Allow_Origin=origins["portal"],
+                    Access_Control_Allow_Credentials="true",
+                )
             if role == "saml" and path == "/saml/consume":
                 if origins.saml_redirect_delay_ms:
                     time.sleep(origins.saml_redirect_delay_ms / 1000)
@@ -173,8 +208,8 @@ def sso_portal(tmp_path, monkeypatch):
 
     async def fixture_resolver(host, allow_private):
         resolved_hosts.append(host)
-        if host in {"127.0.0.1", "localhost"}:
-            return ["127.0.0.1"]
+        if host in {"127.0.0.1", "127.0.0.2", "localhost"}:
+            return ["127.0.0.2" if host == "127.0.0.2" else "127.0.0.1"]
         return await original_resolver(host, allow_private)
 
     # Only fixture hosts bypass loopback rejection. Every other destination still
@@ -272,14 +307,70 @@ async def test_real_authentication_post_to_unapproved_identity_host_stays_blocke
     await require_browser()
     origins, requests, _, profile_dir = sso_portal
     write_profile(profile_dir)
+    # The initial identity provider is approved and receives its scoped cookie;
+    # the subsequent federation destination is not. This exercises denial of an
+    # actual SAML request rather than stopping earlier at an unauthenticated IdP.
+    origins["saml"] = origins["saml"].replace("localhost", "127.0.0.2")
     report = await execute_scan(configuration(
-        origins["portal"], authentication_hosts=[],
+        origins["portal"], authentication_hosts=["localhost"],
         authentication={"mode": "storage_state", "storage_profile": "approved"},
     ))
     assert not any(role == "saml" and method == "POST" for role, method, _, _ in requests)
     auth = next(item for item in report["api_inventory"] if item["endpoint"] == "/saml/consume")
     assert auth["blocked_calls"] == 1 and auth["allowed_calls"] == 0
     assert not report["summary"]["coverage_complete"]
+
+
+@pytest.mark.asyncio
+async def test_real_saml_iframe_post_is_not_treated_as_a_business_mutation(sso_portal):
+    await require_browser()
+    origins, requests, _, profile_dir = sso_portal
+    write_profile(profile_dir)
+    report = await execute_scan(configuration(
+        origins["portal"] + "/embedded-page", max_pages=1, min_observation_ms=1200,
+        authentication={"mode": "storage_state", "storage_profile": "approved"},
+    ))
+    assert sum(role == "saml" and method == "POST" for role, method, _, _ in requests) == 1
+    assert any(role == "portal" and path == "/callback" for role, _, path, _ in requests)
+    event = next(item for item in report["api_inventory"] if item["endpoint"] == "/saml/consume")
+    assert event["allowed_calls"] == 1 and event["blocked_calls"] == 0
+    assert event["policies"] == ["AUTH_FLOW"]
+    assert "fixture-private" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approved", [True, False])
+async def test_real_oauth_fetch_requires_separate_explicit_authentication_approval(sso_portal, approved):
+    await require_browser()
+    origins, requests, resolved, _ = sso_portal
+    report = await execute_scan(configuration(
+        origins["portal"] + "/oauth-exchange-page", max_pages=1, min_observation_ms=500,
+        authentication_hosts=["localhost"] if approved else [],
+    ))
+    assert sum(role == "oauth" and method == "POST" for role, method, _, _ in requests) == int(approved)
+    event = next(item for item in report["api_inventory"] if item["endpoint"] == "/oauth/token")
+    assert event["allowed_calls"] == int(approved) and event["blocked_calls"] == int(not approved)
+    if approved:
+        assert event["policies"] == ["AUTH_FLOW"] and "localhost" in resolved
+    assert "fixture-private" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_blocked_business_oauth_path_and_sso_asset_do_not_halt_authenticated_navigation(sso_portal):
+    await require_browser()
+    origins, requests, _, profile_dir = sso_portal
+    write_profile(profile_dir)
+    report = await execute_scan(configuration(
+        origins["portal"] + "/business-warning-page", max_pages=2, min_observation_ms=500,
+        authentication={"mode": "storage_state", "storage_profile": "approved"},
+    ))
+    assert len(report["results"]) == 2
+    assert all(item["authentication_status"] == "PASS" for item in report["results"])
+    assert any(role == "portal" and path == "/business-target-page" for role, _, path, _ in requests)
+    assert not any(method == "POST" and path == "/api/oauth/report" for _, method, path, _ in requests)
+    event = next(item for item in report["api_inventory"] if item["endpoint"] == "/api/oauth/report")
+    assert event["blocked_calls"] == 1 and event["allowed_calls"] == 0
+    assert "fixture-private" not in json.dumps(report)
 
 
 @pytest.mark.asyncio
@@ -293,9 +384,11 @@ async def test_popup_authentication_post_redirect_keeps_the_approved_sso_boundar
     # to nondeterministically block this approved callback on a busy host.
     origins.saml_redirect_delay_ms = 700
     write_profile(profile_dir)
+    if not approved:
+        origins["saml"] = origins["saml"].replace("localhost", "127.0.0.2")
     report = await execute_scan(configuration(
         origins["portal"] + "/popup-window-page", max_pages=1, min_observation_ms=2000,
-        authentication_hosts=["localhost"] if approved else [],
+        authentication_hosts=["localhost"],
         authentication={"mode": "storage_state", "storage_profile": "approved"},
     ))
     assert sum(role == "saml" and method == "POST" for role, method, _, _ in requests) == int(approved), (

@@ -11,10 +11,28 @@ from app.security import sanitize_data, sanitize_text
 
 
 LOGGER_NAME = "portal_validator"
+UVICORN_ACCESS_FORMAT = '%s - "%s %s HTTP/%s" %d'
 
 
 class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
+        if (
+            record.name == "uvicorn.access" and record.msg == UVICORN_ACCESS_FORMAT
+            and isinstance(record.args, tuple) and len(record.args) == 5
+        ):
+            # Uvicorn's AccessFormatter consumes these five arguments directly.
+            # Flattening them into record.msg breaks the formatter. Preserve its
+            # structure, but never retain any query/fragment, including secrets
+            # whose parameter names are unknown to the central redactor.
+            client, method, target, version, status = record.args
+            target_path = str(target).split("?", 1)[0].split("#", 1)[0]
+            record.args = (
+                sanitize_text(client), sanitize_text(method),
+                sanitize_text(target_path), sanitize_text(version), status,
+            )
+            if record.exc_info:
+                record.exc_text = "[REDACTED_EXCEPTION]"
+            return True
         try:
             payload = json.loads(record.getMessage())
         except (json.JSONDecodeError, RecursionError):

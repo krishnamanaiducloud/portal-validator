@@ -13,6 +13,7 @@ from urllib.parse import urljoin
 
 from playwright.async_api import Error as PlaywrightError
 
+from app.navigation import authentication_form_signal, oauth_token_form_signal
 from app.security import DestinationError
 
 
@@ -138,9 +139,15 @@ class RedirectResponseGuard:
 
     def _metadata(self, event: dict[str, Any]) -> dict[str, Any]:
         request = event.get("request", {})
+        method = str(request.get("method", "GET")).upper()
+        # Request bodies stay local and are never added to diagnostic metadata.
+        # Missing CDP postData is not positive protocol evidence.
+        post_data = request.get("postData") if method == "POST" else None
         return {
             "url": request.get("url", ""),
-            "method": str(request.get("method", "GET")).upper(),
+            "method": method,
+            "authentication_form": authentication_form_signal(post_data),
+            "oauth_token_form": oauth_token_form_signal(post_data),
             "resource_type": str(event.get("resourceType", "other")).lower(),
             "response_status": event.get("responseStatusCode"),
             "document_navigation": event.get("resourceType") == "Document",

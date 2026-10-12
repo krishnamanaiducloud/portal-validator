@@ -66,6 +66,24 @@ def guard_with(validator, *, session=None):
     ), errors
 
 
+@pytest.mark.parametrize("body,authentication_form,oauth_token_form", [
+    ("SAMLRequest=fixture-private-assertion", True, False),
+    ("code=fixture-private-code&state=fixture-private-state", True, False),
+    ("grant_type=authorization_code&code=fixture-private-code", False, True),
+    ("grant_type=password&password=fixture-private-password", False, False),
+    (None, False, False),
+])
+def test_redirect_metadata_exposes_only_non_sensitive_protocol_evidence(body, authentication_form, oauth_token_form):
+    guard, _ = guard_with(None)
+    event = redirect(status=307)
+    event["request"].update(method="POST", postData=body)
+    metadata = guard._metadata(event)
+    assert metadata["authentication_form"] is authentication_form
+    assert metadata["oauth_token_form"] is oauth_token_form
+    assert "fixture-private" not in str(metadata)
+    assert "postData" not in metadata and "body" not in metadata
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
 async def test_each_redirect_is_validated_before_release_and_retains_source(status):

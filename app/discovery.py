@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import hashlib
 import json
@@ -41,6 +42,52 @@ NON_DOCUMENT_EXTENSIONS = frozenset({
 })
 
 
+def context_replacement_error(error: Exception) -> bool:
+    """Recognize transient document replacement, not arbitrary browser failures."""
+    message = str(error).lower()
+    return any(value in message for value in (
+        "execution context was destroyed", "cannot find context with specified id",
+        "cannot find execution context", "execution context is not available in detached frame",
+    ))
+
+
+async def retry_dom_operation(
+    target,
+    operation: Callable[[], Awaitable[Any]],
+    *,
+    timeout_ms: int = 5000,
+    attempts: int = 3,
+) -> Any:
+    """Retry read-only DOM inspection across bounded document replacements.
+
+    Never use this for a click, form submission, history mutation or request:
+    an interrupted browser response does not prove an action was not dispatched.
+    The caller's route/scan deadline remains authoritative.
+    """
+    async with asyncio.timeout(max(1, timeout_ms) / 1000):
+        for attempt in range(max(1, min(attempts, 5))):
+            try:
+                return await operation()
+            except Exception as error:
+                if not context_replacement_error(error) or attempt + 1 >= max(1, min(attempts, 5)):
+                    raise
+                # DOMContentLoaded is intentionally used instead of networkidle:
+                # authenticated SPAs may poll or hold long-lived connections.
+                await target.wait_for_load_state("domcontentloaded", timeout=max(1, timeout_ms))
+                await asyncio.sleep(0.05)
+
+
+async def evaluate_dom(
+    target, script: str, argument: Any = None, *, handle: bool = False,
+    timeout_ms: int = 5000, attempts: int = 3,
+) -> Any:
+    method = target.evaluate_handle if handle else target.evaluate
+    return await retry_dom_operation(
+        target, lambda: method(script) if argument is None else method(script, argument),
+        timeout_ms=timeout_ms, attempts=attempts,
+    )
+
+
 def is_document_route_candidate(url: str) -> bool:
     """Exclude explicit resource links, not speculative API/path-name matches."""
     path = unquote(urlsplit(url).path).rstrip("/").lower()
@@ -59,7 +106,7 @@ SENSITIVE_QUERY_KEYS = frozenset({
     "__cf_chl_rt_tk", "__cf_chl_tk", "challenge_token", "captcha_token",
 })
 DANGEROUS_CONTROL_WORDS = frozenset({
-    "add", "approve", "buy", "cancel", "checkout", "confirm", "create", "delete",
+    "add", "approve", "begin", "buy", "cancel", "checkout", "confirm", "create", "delete",
     "deploy", "destroy", "disable", "edit", "enable", "execute", "export", "import",
     "logout", "pay", "purchase", "reboot", "reject", "remove", "restart", "save",
     "send", "sign out", "signout", "start", "stop", "submit", "terminate", "update",
@@ -83,7 +130,7 @@ class DiscoveredRoute:
 def discovered_route_key(route: DiscoveredRoute, canonical_url: str) -> str:
     """Keep a real URL separate from a UI panel's non-URL coverage identity."""
     if route.view_control:
-        panel = route.view_control["panel"]
+        panel = route.view_control.get("identity") or route.view_control["panel"]
         scope = route.view_control.get("scope", "")
         control_identity = f"{scope}\0{panel}" if scope else panel
         digest = hashlib.sha256(f"{canonical_url}\0{control_identity}".encode()).hexdigest()[:24]
@@ -226,7 +273,7 @@ ROUTE_NAME_EVIDENCE_SCRIPT = r"""
 
 
 async def collect_route_name_evidence(page) -> dict[str, str]:
-    result = await page.evaluate(ROUTE_NAME_EVIDENCE_SCRIPT)
+    result = await evaluate_dom(page, ROUTE_NAME_EVIDENCE_SCRIPT)
     return {
         "primary_heading": str(result.get("primaryHeading") or "")[:160],
         "breadcrumb": str(result.get("breadcrumb") or "")[:160],
@@ -424,7 +471,8 @@ NAVIGATION_DOM_HELPERS = r"""
     while (root.host) {
       const host = root.host;
       const siblings = Array.from(host.parentNode?.children || []).filter(e => e.tagName === host.tagName);
-      parts.unshift(host.tagName.toLowerCase() + (host.id ? '#' + host.id : ':' + siblings.indexOf(host)));
+      parts.unshift(host.tagName.toLowerCase() + ':' + siblings.indexOf(host) +
+        (host.getAttribute('aria-label') ? '[' + host.getAttribute('aria-label') + ']' : ''));
       root = host.getRootNode();
     }
     return parts.join('/');
@@ -447,7 +495,7 @@ NAVIGATION_DOM_HELPERS = r"""
     const text = [element.getAttribute('aria-label'), element.textContent, element.getAttribute('title')]
       .filter(Boolean).join(' ').replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
       .replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-    return ['add','approve','buy','cancel','checkout','confirm','create','delete','deploy','destroy',
+    return ['add','approve','begin','buy','cancel','checkout','confirm','create','delete','deploy','destroy',
       'disable','edit','enable','execute','export','import','logout','pay','purchase','reboot',
       'reject','remove','restart','save','send','sign out','signout','start','stop','submit',
       'terminate','update','upload'].some(word => (' ' + text + ' ').includes(' ' + word + ' '));
@@ -511,11 +559,17 @@ NAVIGATION_DOM_HELPERS = r"""
     // A broken explicit target is unresolved navigation, not a speculative view.
     if (panel && !target) return null;
     if (!target && !isNavigationControl(element)) return null;
-    const identity = panel || ('navigation:' + (element.id || label));
     const region = composedClosest(element, 'nav,[role="navigation"],[role="menu"],[role="tablist"]');
-    const regionIdentity = region && (region.id ? '#' + region.id : region.getAttribute('aria-label'));
+    const regionLabel = region && (region.getAttribute('aria-label') ||
+      region.getAttribute('role') || region.tagName.toLowerCase());
+    const regions = region && Array.from(region.getRootNode().querySelectorAll(
+      'nav,[role="navigation"],[role="menu"],[role="tablist"]')).filter(other =>
+        (other.getAttribute('aria-label') || other.getAttribute('role') || other.tagName.toLowerCase()) === regionLabel);
+    const regionIdentity = region && regionLabel + ':' + regions.indexOf(region);
     const scope = rootScope(element.getRootNode()) + (regionIdentity ? '|' + regionIdentity : '');
-    return {panel:identity, label, id:element.id || '', kind:target ? 'panel' : 'navigation',
+    // Framework-generated DOM IDs remain locators, not stable view identity.
+    const identity = JSON.stringify([navigationParents(element), label, element.getAttribute('role') || 'navigation']);
+    return {panel:panel || ('navigation:' + label), identity, label, id:element.id || '', kind:target ? 'panel' : 'navigation',
       scope, ancestors:JSON.stringify(navigationParents(element))};
   };
 """
@@ -537,7 +591,7 @@ async (maximumScrolls) => {
       for (const element of root.querySelectorAll(viewSelector)) {
         const view = describeView(element);
         if (!view) continue;
-        const panel = view.scope + '\0' + view.panel;
+        const panel = view.scope + '\0' + view.identity;
         if (rememberBaseline && (element.getAttribute('aria-selected') === 'true' ||
             ['page','true'].includes(element.getAttribute('aria-current')) ||
             element.classList.contains('active'))) baselinePanels.add(panel);
@@ -614,10 +668,10 @@ async (maximumScrolls) => {
 
 
 EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
-async ({reset, inspectOnly}) => {
+({reset, inspectOnly}) => {
   /* NAVIGATION_DOM_HELPERS */
   const dangerous = new Set([
-    'add','approve','buy','cancel','checkout','confirm','create','delete','deploy','destroy',
+    'add','approve','begin','buy','cancel','checkout','confirm','create','delete','deploy','destroy',
     'disable','edit','enable','execute','export','import','logout','pay','purchase','reboot',
     'reject','remove','restart','save','send','sign out','signout','start','stop','submit',
     'terminate','update','upload'
@@ -694,25 +748,65 @@ async ({reset, inspectOnly}) => {
       window.__portalValidatorPanelOpeners ||= new WeakMap();
       window.__portalValidatorPanelOpeners.set(targetPanel, {label, ancestors:navigationParents(element)});
     }
-    const before = window.location.href;
-    element.click();
-    await new Promise(resolve => setTimeout(resolve, 50));
-    const after = window.location.href;
-    if (after !== before) {
-      transitions.push({
-        url: after,
-        label,
-        accessibleName: ariaLabel.slice(0, 160),
-        labelSource: ariaLabel ? 'aria-label' : visibleLabel ? 'visible-text' :
-          titleLabel ? 'title' : 'none',
-        source: 'safe-click'
-      });
-    }
-    activated += 1;
+    // Return the observed element without dispatching inside evaluate(). A
+    // document navigation could destroy that execution context after click,
+    // and retrying the entire script would repeat a natural request.
+    return {activated:0, skipped, inspected, transitions, remaining:controls().length,
+      element, before:location.href, label, accessibleName:ariaLabel.slice(0,160),
+      labelSource:ariaLabel ? 'aria-label' : visibleLabel ? 'visible-text' : titleLabel ? 'title' : 'none'};
   }
   return {activated, skipped, inspected, transitions, remaining:controls().length};
 }
 """.replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
+
+
+MENU_REVEALED_SCRIPT = r"""
+(element) => {
+  /* NAVIGATION_DOM_HELPERS */
+  const panel = controlledPanel(element);
+  const target = panel && element.getRootNode().querySelector('#' + CSS.escape(panel));
+  return {expanded:element.getAttribute('aria-expanded') === 'true',
+    panelVisible:!!target && visibleControl(target)};
+}
+""".replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
+
+
+async def _expand_one_menu(page, reset: bool, timeout_ms: int) -> dict[str, Any]:
+    handle = await evaluate_dom(
+        page, EXPAND_SAFE_NAVIGATION_SCRIPT, {"reset": reset}, handle=True, timeout_ms=timeout_ms,
+    )
+    element_handle = None
+    try:
+        result = await handle.evaluate("value => { const {element, ...metadata} = value; return metadata; }")
+        element_handle = await handle.get_property("element")
+        element = element_handle.as_element()
+        if element is None:
+            return result
+        # Hover-first supports CSS/JS dropdowns without an unnecessary click.
+        # Neither action is retried after dispatch, even if it navigates away.
+        try:
+            before = await element.evaluate(MENU_REVEALED_SCRIPT)
+            await element.hover(timeout=timeout_ms)
+            revealed = await element.evaluate(MENU_REVEALED_SCRIPT)
+            if not ((revealed["expanded"] and not before["expanded"]) or
+                    (revealed["panelVisible"] and not before["panelVisible"])):
+                await element.click(timeout=timeout_ms)
+        except Exception as error:
+            if not context_replacement_error(error):
+                raise
+            await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        result["activated"] = 1
+        after = page.url
+        if after != result.get("before"):
+            result["transitions"] = [{
+                "url": after, "label": result["label"], "accessibleName": result["accessibleName"],
+                "labelSource": result["labelSource"], "source": "safe-click",
+            }]
+        return result
+    finally:
+        if element_handle is not None:
+            await element_handle.dispose()
+        await handle.dispose()
 
 
 SAME_DOCUMENT_TRANSITION_SCRIPT = r"""
@@ -744,7 +838,7 @@ SEMANTIC_ROUTE_ACTIVATION_SCRIPT = r"""
   /* NAVIGATION_DOM_HELPERS */
   const candidate = new URL(target, document.baseURI);
   const dangerous = new Set([
-    'add','approve','buy','cancel','checkout','confirm','create','delete','deploy','destroy',
+    'add','approve','begin','buy','cancel','checkout','confirm','create','delete','deploy','destroy',
     'disable','edit','enable','execute','export','import','logout','pay','purchase','reboot',
     'reject','remove','restart','save','send','sign out','signout','start','stop','submit',
     'terminate','update','upload'
@@ -795,9 +889,11 @@ async def activate_semantic_route(
     timeout_ms: int,
 ) -> bool:
     """Use the closest safe user-navigation equivalent when it is unambiguous."""
-    handle = await page.evaluate_handle(
+    handle = await evaluate_dom(
+        page,
         SEMANTIC_ROUTE_ACTIVATION_SCRIPT,
         {"target": url, "expectedLabel": label or "", "source": source or ""},
+        handle=True, timeout_ms=timeout_ms,
     )
     try:
         candidate = handle.as_element()
@@ -818,6 +914,7 @@ async def expand_safe_navigation(
     wait_after_action: Callable[[], Awaitable[object]] | None = None,
     maximum_scrolls: int = 3,
     on_routes_discovered: Callable[[list[DiscoveredRoute]], Awaitable[None]] | None = None,
+    timeout_ms: int = 5000,
 ) -> dict[str, object]:
     """Observe each safe panel before opening the next; never guess route URLs.
 
@@ -834,9 +931,7 @@ async def expand_safe_navigation(
     if on_routes_discovered is not None:
         await on_routes_discovered(routes.copy())
     while int(totals["activated"]) < maximum and int(totals["inspected"]) < max(25, maximum * 5):
-        result = await page.evaluate(
-            EXPAND_SAFE_NAVIGATION_SCRIPT, {"reset": int(totals["inspected"]) == 0},
-        )
+        result = await _expand_one_menu(page, reset=int(totals["inspected"]) == 0, timeout_ms=timeout_ms)
         for key in ("activated", "skipped", "inspected"):
             totals[key] = int(totals[key]) + int(result.get(key, 0))
         transition_routes: list[DiscoveredRoute] = []
@@ -876,7 +971,8 @@ async def expand_safe_navigation(
                 or len(route.navigation_hierarchy) > len(existing.navigation_hierarchy)):
             unique[key] = route
     totals["routes"] = list(unique.values())
-    remaining = await page.evaluate(
+    remaining = await evaluate_dom(
+        page,
         EXPAND_SAFE_NAVIGATION_SCRIPT,
         {"reset": int(totals["inspected"]) == 0, "inspectOnly": True},
     )
@@ -890,7 +986,7 @@ async def expand_safe_navigation(
 
 async def discover_page_routes(page, maximum_scrolls: int = 3) -> list[DiscoveredRoute]:
     """Discover one document or frame; its own URL/baseURI resolves relative links."""
-    raw = await page.evaluate(DISCOVER_ROUTES_SCRIPT, max(0, min(maximum_scrolls, 20)))
+    raw = await evaluate_dom(page, DISCOVER_ROUTES_SCRIPT, max(0, min(maximum_scrolls, 20)))
     document_url = page.url
     routes: list[DiscoveredRoute] = []
     for item in raw:
@@ -901,6 +997,14 @@ async def discover_page_routes(page, maximum_scrolls: int = 3) -> list[Discovere
         if isinstance(view_control, dict):
             if dangerous_control_label(str(item.get("safetyLabel") or item.get("label") or "")):
                 continue
+            if getattr(page, "parent_frame", None) is not None:
+                # Preserve the observed frame context. A tab inside an iframe
+                # must not navigate the top-level application to the frame URL.
+                view_control = {
+                    **view_control,
+                    "frame_url": normalize_route_url(document_url) or document_url,
+                    "frame_name": str(getattr(page, "name", "") or "")[:160],
+                }
         else:
             view_control = None
         navigation_mode = (
@@ -928,14 +1032,14 @@ async def discover_page_routes(page, maximum_scrolls: int = 3) -> list[Discovere
 
 
 UI_VIEW_CONTROL_SCRIPT = r"""
-({panel, label, scope, id}) => {
+({panel, identity, label, scope, id}) => {
   /* NAVIGATION_DOM_HELPERS */
   const matches = [];
   for (const root of navigationRoots()) {
     for (const element of root.querySelectorAll(viewSelector)) {
       const view = describeView(element);
-      if (view && view.panel === panel && view.label === label &&
-          (scope === undefined || view.scope === scope) && (!id || element.id === id)) {
+      if (view && (identity ? view.identity === identity : view.panel === panel) && view.label === label &&
+          (scope === undefined || view.scope === scope) && (identity || !id || element.id === id)) {
         matches.push(element);
       }
     }
@@ -992,20 +1096,28 @@ NAVIGATION_VIEW_COMPLETED_SCRIPT = r"""
 async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> None:
     """Activate one evidenced navigation view and verify a real UI transition."""
     for label in json.loads(control.get("ancestors", "[]")):
-        opener_handle = await page.evaluate_handle(RESTORE_MENU_ANCESTOR_SCRIPT, label)
+        opener_handle = await evaluate_dom(page, RESTORE_MENU_ANCESTOR_SCRIPT, label, handle=True, timeout_ms=timeout_ms)
         try:
             opener = opener_handle.as_element()
             if opener is not None:
-                await opener.click(timeout=timeout_ms)
+                before = await opener.evaluate(MENU_REVEALED_SCRIPT)
+                await opener.hover(timeout=timeout_ms)
+                revealed = await opener.evaluate(MENU_REVEALED_SCRIPT)
+                if not ((revealed["expanded"] and not before["expanded"]) or
+                        (revealed["panelVisible"] and not before["panelVisible"])):
+                    await opener.click(timeout=timeout_ms)
             elif await opener_handle.json_value() != "open":
                 raise RuntimeError("Discovered UI view's parent menu is not uniquely and safely activatable")
         finally:
             await opener_handle.dispose()
-    handle = await page.evaluate_handle(UI_VIEW_CONTROL_SCRIPT, control)
+    handle = await evaluate_dom(page, UI_VIEW_CONTROL_SCRIPT, control, handle=True, timeout_ms=timeout_ms)
     try:
         element = handle.as_element()
         if element is None:
             raise RuntimeError("Discovered UI tab is not uniquely and safely activatable")
+        control = {**control, **await element.evaluate(
+            "element => {" + NAVIGATION_DOM_HELPERS + "return describeView(element);}",
+        )}
         labels = await element.evaluate("e => [e.textContent,e.getAttribute('aria-label'),e.getAttribute('title')].filter(Boolean).join(' ')")
         if dangerous_control_label(labels):
             raise RuntimeError("Discovered UI tab has an unsafe action label")
@@ -1021,21 +1133,46 @@ async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> No
           const p = e.getRootNode().querySelector('#' + CSS.escape(panel));
           const style = p && getComputedStyle(p), rect = p && p.getBoundingClientRect();
           return {requiresSelection:e.hasAttribute('aria-selected'),
+            panelText:p?.innerText || '',
             wasHidden:!p || !!p.closest('[hidden],[inert],[aria-hidden="true"]') ||
               style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0};
         }""", control["panel"])
         await element.click(timeout=timeout_ms)
-        await page.wait_for_function(r"""({element, panel, requiresSelection, wasHidden}) => {
+        await page.wait_for_function(r"""({element, panel, requiresSelection, wasHidden, panelText}) => {
           if (!element.isConnected) return false;
           const target = element.getRootNode().querySelector('#' + CSS.escape(panel));
           if (!target || target.closest('[hidden],[inert],[aria-hidden="true"]')) return false;
           const style = getComputedStyle(target), rect = target.getBoundingClientRect();
           if (style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) return false;
+          if (target.innerText && target.innerText !== panelText) return true;
           return requiresSelection ? element.getAttribute('aria-selected') === 'true' :
             wasHidden || element.classList.contains('active') || element.parentElement?.classList.contains('active');
         }""", arg={"element": element, **control, **evidence}, timeout=timeout_ms)
     finally:
         await handle.dispose()
+
+
+def resolve_view_target(page, view_control: dict[str, str] | None = None):
+    """Resolve an observed frame view without broadening its original boundary.
+
+    Reuse for activation and subsequent DOM/readiness inspection so a child
+    frame cannot inherit the parent application's rendered health.
+    """
+    if not view_control or not view_control.get("frame_url"):
+        return page
+    main_origin = urlsplit(page.url)
+    frames = []
+    for frame in page.frames:
+        origin = urlsplit(frame.url)
+        if (frame != page.main_frame and
+            (origin.scheme, origin.hostname, origin.port) ==
+            (main_origin.scheme, main_origin.hostname, main_origin.port) and
+            normalize_route_url(frame.url) == view_control["frame_url"] and
+            str(frame.name or "") == view_control.get("frame_name", "")):
+            frames.append(frame)
+    if len(frames) != 1:
+        raise RuntimeError("Discovered frame view is not uniquely available in the same-origin application")
+    return frames[0]
 
 
 async def perform_route_navigation(
@@ -1056,6 +1193,9 @@ async def perform_route_navigation(
     if mode == UI_VIEW_ACTIVATION:
         if view_control is None:
             raise RuntimeError("UI view activation requires an observed tab control")
+        if view_control.get("frame_url"):
+            await activate_ui_view(resolve_view_target(page, view_control), view_control, timeout_ms)
+            return None, True, "SAME_ORIGIN_FRAME_UI_CONTROL"
         response = None
         if normalize_route_url(page.url) != normalize_route_url(url):
             response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)

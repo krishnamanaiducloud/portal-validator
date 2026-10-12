@@ -2,6 +2,7 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
+from types import SimpleNamespace
 
 import pytest
 from playwright.async_api import async_playwright
@@ -22,6 +23,30 @@ class FakeRequest:
         self.resource_type = resource_type
         self.headers = {"Authorization": "Bearer never-store-this"}
         self.post_data = "password=never-store-this"
+
+
+@pytest.mark.parametrize(("frame_url", "expected_origin"), (
+    (
+        "https://user:private-password@PORTAL.example.com:8443/private/path;parameter"
+        "?token=private-token&unrecognized=private-query#/private-view?opaque=private-fragment",
+        "https://portal.example.com:8443",
+    ),
+    ("http://[2001:db8::1]:8080/private?arbitrary=private-query", "http://[2001:db8::1]:8080"),
+    ("about:blank?arbitrary=private-query", None),
+))
+def test_request_initiator_contains_only_origin_not_url_details(frame_url, expected_origin):
+    request = FakeRequest("GET", "https://portal.example.com/api/query")
+    request.frame = SimpleNamespace(parent_frame=None, url=frame_url)
+    observer = PassiveNetworkObserver([])
+
+    event = observer.observe_request(
+        request, phase="ROUTE_VALIDATION", importance="REQUIRED",
+        initiating_route="https://portal.example.com/", main_document=False,
+    )
+
+    assert event["initiator"] == {"kind": "BROWSER_FRAME", "origin": expected_origin}
+    assert "private-" not in json.dumps(event)
+    assert "user:" not in json.dumps(event)
 
 
 @pytest.mark.parametrize(

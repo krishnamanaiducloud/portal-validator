@@ -679,8 +679,18 @@ class PassiveNetworkObserver:
             frame_identity = (
                 "MAIN_FRAME" if request.frame.parent_frame is None else "CHILD_FRAME"
             )
+            frame_url = str(request.frame.url)
+            frame_origin = urlparse(frame_url)._replace(
+                path="", params="", query="", fragment="",
+            )
+            initiator = {
+                "kind": "BROWSER_FRAME",
+                "origin": sanitize_url(frame_origin.geturl(), include_path=False)
+                if frame_origin.scheme in {"http", "https"} else None,
+            }
         except Exception:
             frame_identity = "UNKNOWN_FRAME"
+            initiator = {"kind": "UNAVAILABLE", "origin": None}
         event: dict[str, Any] = {
             "request_id": f"request-{self._sequence}",
             "url": safe_url,
@@ -715,6 +725,7 @@ class PassiveNetworkObserver:
             "serialized_to_report": False,
             "main_document": main_document,
             "frame_identity": frame_identity,
+            "initiator": initiator,
             "request_classification": "SAFE_METHOD" if method in SAFE_HTTP_METHODS else "UNKNOWN",
             "policy_classification": "SAFE_METHOD" if method in SAFE_HTTP_METHODS else "UNKNOWN",
             "allowed_by_policy": method in SAFE_HTTP_METHODS,

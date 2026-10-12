@@ -121,7 +121,7 @@ function toggleRouteResultsFullscreen() {
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
 const splitList = (value) => value.split(',').map((item) => item.trim()).filter(Boolean);
 const statusClass = (value) => String(value || 'NOT_TESTED').toLowerCase().replaceAll('_', '-');
-const authOutcomes = new Set(['AUTH_REQUIRED','AUTH_FAILED','AUTH_TIMEOUT','MFA_REQUIRED','SESSION_EXPIRED']);
+const authOutcomes = new Set(['AUTH_REQUIRED','AUTHENTICATION_REQUIRED','AUTHENTICATION_BLOCKED','AUTH_FAILED','AUTH_TIMEOUT','MFA_REQUIRED','SESSION_EXPIRED']);
 const accessOutcomes = new Set(['ACCESS_RESTRICTED','CHALLENGE_REQUIRED']);
 const failureOutcomes = new Set(['TLS_ERROR','DNS_ERROR','NETWORK_ERROR','HTTP_ERROR','TIMEOUT','NAVIGATION_ERROR','VALIDATION_FAILED','PAGE_RENDER_ERROR','FAIL']);
 const passOutcomes = new Set(['PASS','PASS_WITH_WARNINGS']);
@@ -219,7 +219,7 @@ const tablePagination = Object.fromEntries(['route','api','resource'].map((kind)
 
 function paginateTable(kind, items) {
   const state = tablePagination[kind];
-  const controls = kind === 'route' ? ['result-search','result-filter','navigation-filter'] : kind === 'api' ? ['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','api-lifecycle-filter','api-response-filter','api-failed-only'] : ['resource-search','resource-type-filter','resource-route-filter','resource-status-filter','resource-failed-only','resource-large-only'];
+  const controls = kind === 'route' ? ['result-search','result-filter','navigation-filter'] : kind === 'api' ? ['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','api-lifecycle-filter','api-response-filter','api-failure-type-filter','api-failed-only'] : ['resource-search','resource-type-filter','resource-route-filter','resource-status-filter','resource-failed-only','resource-large-only'];
   const filters = controls.map((id) => { const input = byId(id); return input.type === 'checkbox' ? input.checked : input.value; });
   const sort = kind === 'route' ? routeSort : kind === 'api' ? apiSort : resourceSort;
   const key = JSON.stringify([filters,sort,activeDrilldown,apiFailureOnly,items.map((item) => item.route_id || item.canonical_route || item.url || [item.method,item.host,item.endpoint,item.path])]);
@@ -326,7 +326,7 @@ function approvedReadPostOperations() {
 
 function phaseConfiguration() {
   const configuration = {};
-  const fields = {navigation_timeout_ms:'navigation-timeout',authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout',concurrency_limit:'concurrency-limit'};
+  const fields = {navigation_timeout_ms:'navigation-timeout',authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout',per_route_timeout_ms:'per-route-timeout',concurrency_limit:'concurrency-limit'};
   for (const [name,id] of Object.entries(fields)) {
     const input = byId(id);
     if (!input.value.trim()) continue;
@@ -486,10 +486,10 @@ function detailSection(title, value) {
 // credential form inputs, browser storage, or an arbitrary full route object.
 function routeDiagnostics(item) {
   return {
-    overview: {route_name:item.route_name || item.route_label,classification:item.classification,validation_status:item.validation_status,access_status:item.access_status,coverage_detail:item.coverage_detail,warning_reasons:routeWarnings(item),finding_details:item.finding_details},
+    overview: {route_name:item.route_name || item.route_label,classification:item.classification,validation_status:item.validation_status,application_ready:item.application_ready,application_readiness:item.application_readiness,access_status:item.access_status,coverage_detail:item.coverage_detail,warning_reasons:routeWarnings(item),finding_details:item.finding_details},
     page_load: {status:item.page_load_status,http_status:item.http_status_display ?? item.status ?? null,render_status:item.render_status,failure_dimension:item.failure_dimension,failure_reason:item.failure_reason},
     navigation: {requested_url:item.requested_url,discovered_url:item.discovered_url,final_url:item.final_url,redirects:item.redirects,type:item.navigation_type,status:item.navigation_status,identity:{route_id:item.route_id,view_type:item.view_type,parent_route_id:item.parent_route_id,parent_route_name:item.parent_route_name,navigation_hierarchy:item.navigation_hierarchy,canonical_route:item.canonical_route,display_path:item.display_path,origin:item.origin,host:item.host,pathname:item.pathname,query_sanitized:item.query_sanitized,fragment:item.fragment,spa_route:item.spa_route,route_name:item.route_name,route_name_source:item.route_name_source,route_name_confidence:item.route_name_confidence,discovery_sources:item.discovery_sources,duplicate_discovery_count:item.duplicate_discovery_count,depth:item.depth}},
-    authentication: {status:item.authentication_status,stage:item.authentication_stage},
+    authentication: {status:item.authentication_status,stage:item.authentication_stage,observation:item.authentication_observation || item.auth_observation},
     apis: {status:item.api_status,coverage:item.api_coverage,observed:item.apis_observed,application_observed:item.application_apis_observed,blocked:item.blocked_api_attempts,failures:item.api_failures,requests:item.api_requests,read_only_status:item.read_only_status,read_only_blocks:item.read_only_blocks},
     resources: {status:item.resource_status,failures:item.resource_failure_count,observations:item.resources,failed_resources:item.failed_resources,frames:item.frames,external_links:item.external_links},
     console: {status:item.console_status,messages:item.console_errors,page_errors:item.page_errors},
@@ -703,6 +703,20 @@ function apiHasHttpResponse(item) {
     || Object.values(item.response_status_counts || {}).some((count) => Number(count) > 0);
 }
 
+function apiFailureTypes(item) {
+  if (Array.isArray(item.failure_types)) return item.failure_types;
+  // Preserve older reports without inferring transport failure from a policy abort.
+  const types = [];
+  if (Number(item.status_4xx || 0)) types.push('HTTP_4XX');
+  if (Number(item.status_5xx || 0)) types.push('HTTP_5XX');
+  if (Number(item.network_failures || 0)) types.push('NETWORK_FAILURE');
+  if (Number(item.response_body_failures || 0)) types.push('RESPONSE_BODY_FAILURE');
+  if (Number(item.blocked_count || item.blocked_calls || 0)) types.push('POLICY_BLOCKED');
+  if (Number(item.canceled_calls || 0)) types.push('CANCELED');
+  if (Number(item.incomplete_calls || 0)) types.push('INCOMPLETE');
+  return types;
+}
+
 function updateApiEvidenceFilters(inventory) {
   const lifecycle = byId('api-lifecycle-filter');
   const selectedLifecycle = lifecycle.value;
@@ -749,6 +763,7 @@ function renderApiInventory() {
   const lifecycle = byId('api-lifecycle-filter').value;
   const response = byId('api-response-filter').value;
   const route = byId('api-route-filter')?.value || 'all';
+  const failureType = byId('api-failure-type-filter').value;
   const failedOnly = apiFailureOnly || byId('api-failed-only').checked;
   let visible = inventory.filter((item) => {
     const outcome = item.observation_outcome || (item.health === 'DEGRADED' ? 'WARNING' : item.health);
@@ -762,6 +777,7 @@ function renderApiInventory() {
       && (response === 'all' || (response === 'none' ? !apiHasHttpResponse(item) : Number(item.response_status_counts?.[response] || 0) > 0))
       && (policy === 'all' || (policy === 'blocked' ? Number(item.blocked_count || 0) > 0 : policy === 'approved-post' ? item.method === 'POST' && policies.includes('APPROVED_READ_ONLY') : policy === 'target-failures' ? targetFailure : Number(item.allowed_calls ?? item.calls ?? 0) > 0))
       && (route === 'all' || (item.routes_using_endpoint || []).includes(route))
+      && (failureType === 'all' || apiFailureTypes(item).includes(failureType))
       && (!failedOnly || ['FAILED','WARNING'].includes(outcome));
   });
   visible.sort((left, right) => compareValues(left[apiSort.key], right[apiSort.key], numericApiKeys.has(apiSort.key)) * apiSort.direction);
@@ -803,6 +819,14 @@ function resourceIsFailed(item) {
   return Boolean(item.failed || item.failure_category || item.failure) || Number(item.status || 0) >= 400;
 }
 
+function resourceObservationStatus(item) {
+  if (item.blocked_by_validator) return 'POLICY_BLOCKED';
+  if (Number(item.status || 0) >= 400) return `HTTP_${Math.floor(Number(item.status) / 100)}XX`;
+  if (Array.isArray(item.failure_types) && item.failure_types.length) return item.failure_types.join(', ');
+  if (resourceIsFailed(item)) return 'WARNING';
+  return item.lifecycle_status === 'INCOMPLETE' ? 'INCOMPLETE' : 'OBSERVED';
+}
+
 function renderResourceDetails() {
   const details = lastReport?.resource_details || [];
   const filter = byId('resource-type-filter').value;
@@ -824,7 +848,7 @@ function renderResourceDetails() {
   updateAriaSort('[data-resource-sort]', resourceSort, 'resourceSort');
   byId('resource-count').textContent = `${visible.length} of ${details.length} resource observations`;
   visible = paginateTable('resource', visible);
-  byId('resource-list').innerHTML = visible.map((item) => `<tr><td>${escapeHtml(item.type || item.resource_type || 'OTHER')}</td><td>${escapeHtml(item.host || '')}</td><td class="resource-path" title="${escapeHtml(item.content_type || 'Content type unavailable')}"><code>${escapeHtml(item.path || item.endpoint || item.url || '')}</code></td><td>${escapeHtml(formatBytes(item.transfer_size_bytes))}</td><td>${escapeHtml(formatBytes(item.encoded_body_size_bytes))}</td><td>${escapeHtml(formatBytes(item.decoded_body_size_bytes))}</td><td>${escapeHtml(item.duration_ms == null ? 'N/A' : `${item.duration_ms} ms`)}</td><td class="resource-path">${escapeHtml(item.route || '')}</td><td>${escapeHtml(item.status ?? 'N/A')}</td><td title="${escapeHtml(item.warning_threshold_bytes == null ? 'No size warning' : `Configured threshold: ${formatBytes(item.warning_threshold_bytes)}`)}">${escapeHtml((item.size_categories || []).join(', ') || '—')}</td><td><span class="dimension-state ${resourceIsFailed(item) ? 'warning' : 'pass'}">${resourceIsFailed(item) ? 'WARNING' : 'OBSERVED'}</span></td></tr>`).join('') || '<tr><td colspan="11" class="empty-table">No observed resources match these filters.</td></tr>';
+  byId('resource-list').innerHTML = visible.map((item) => `<tr><td>${escapeHtml(item.type || item.resource_type || 'OTHER')}</td><td>${escapeHtml(item.host || '')}</td><td class="resource-path" title="${escapeHtml(item.content_type || 'Content type unavailable')}"><code>${escapeHtml(item.path || item.endpoint || item.url || '')}</code></td><td>${escapeHtml(formatBytes(item.transfer_size_bytes))}</td><td>${escapeHtml(formatBytes(item.encoded_body_size_bytes))}</td><td>${escapeHtml(formatBytes(item.decoded_body_size_bytes))}</td><td>${escapeHtml(item.duration_ms == null ? 'N/A' : `${item.duration_ms} ms`)}</td><td class="resource-path">${escapeHtml(item.route || '')}</td><td>${escapeHtml(item.status ?? 'N/A')}</td><td title="${escapeHtml(item.warning_threshold_bytes == null ? 'No size warning' : `Configured threshold: ${formatBytes(item.warning_threshold_bytes)}`)}">${escapeHtml((item.size_categories || []).join(', ') || '—')}</td><td><span class="dimension-state ${resourceIsFailed(item) ? 'warning' : item.blocked_by_validator || item.lifecycle_status === 'INCOMPLETE' || item.lifecycle_status === 'CANCELED' ? 'not-tested' : 'pass'}" title="${escapeHtml(item.failure_reason || 'Passive browser observation')}">${escapeHtml(resourceObservationStatus(item))}</span></td></tr>`).join('') || '<tr><td colspan="11" class="empty-table">No observed resources match these filters.</td></tr>';
   refreshScrollSync();
 }
 
@@ -879,7 +903,7 @@ function activateSummary(action, value, button) {
   apiFailureOnly = action === 'api-failures';
   byId('api-failed-only').checked = apiFailureOnly;
   if (['business-apis','apis','api-failures'].includes(action)) {
-    ['api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-lifecycle-filter','api-response-filter'].forEach((id) => { byId(id).value = 'all'; });
+    ['api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-lifecycle-filter','api-response-filter','api-failure-type-filter'].forEach((id) => { byId(id).value = 'all'; });
     byId('api-search').value = '';
     byId('api-role-filter').value = action === 'business-apis' ? 'APPLICATION_API' : 'all';
   }
@@ -896,8 +920,55 @@ function terminationMessage(coverage) {
   const validated = Number(coverage.routes_validated || 0);
   const discovered = Number(coverage.routes_discovered || validated);
   const notTested = Number(coverage.routes_not_tested ?? coverage.routes_remaining ?? 0);
-  const reasons = {MAX_ROUTES_REACHED:'Maximum route limit reached.',SCAN_TIMEOUT:'Total scan time budget was exhausted.',USER_CANCELLED:'The scan was cancelled.',MAX_DEPTH_REACHED:'Maximum discovery depth was reached.',DISCOVERY_EXHAUSTED:'All eligible discovered routes were processed.',AUTHENTICATION_INCOMPLETE:'Authentication did not reach an authorized application page.',AUTH_REQUIRED:'Authentication is required before application coverage can be evaluated.',SESSION_EXPIRED:'The authenticated session expired.',ACCESS_RESTRICTED:'The target restricted browser access; application coverage is limited.',CHALLENGE_REQUIRED:'An access challenge limited application coverage; its cause was not established.',NAVIGATION_BLOCKED:'Navigation was blocked by policy.'};
+  const reasons = {MAX_ROUTES_REACHED:'Maximum route limit reached.',SCAN_TIMEOUT:'Total scan time budget was exhausted.',USER_CANCELLED:'The scan was cancelled.',MAX_DEPTH_REACHED:'Maximum discovery depth was reached.',DISCOVERY_EXHAUSTED:'All eligible discovered routes were processed.',AUTHENTICATION_INCOMPLETE:'Authentication did not reach an authorized application page.',AUTHENTICATION_BLOCKED:'The configured authentication policy blocked the flow before the application shell became ready.',AUTHENTICATION_REQUIRED:'An authorized application session is required.',AUTH_REQUIRED:'Authentication is required before application coverage can be evaluated.',SESSION_EXPIRED:'The authenticated session expired.',ACCESS_RESTRICTED:'The target restricted browser access; application coverage is limited.',CHALLENGE_REQUIRED:'An access challenge limited application coverage; its cause was not established.',NAVIGATION_BLOCKED:'Navigation was blocked by policy.'};
   return `${reasons[coverage.termination_reason] || coverage.termination_reason || 'Scan finished.'} ${validated} of ${discovered} discovered routes were validated. ${notTested} routes were not tested.`;
+}
+
+function renderNavigationCoverage(report) {
+  const summary = {...(report.coverage || {}),...(report.summary || {})};
+  const coverage = report.navigation_coverage || {};
+  const results = report.results || [];
+  const routes = report.route_inventory || results;
+  const fallback = {
+    controls_discovered:summary.navigation_controls_discovered,
+    safe_candidates:summary.routes_eligible,
+    visited_views:results.length,
+    validated_views:summary.application_routes_validated,
+    failed_views:summary.failed_pages,
+    skipped_unsafe_controls:summary.unsafe_actions_skipped,
+    unreachable_views:results.filter((item) => item.page_load_status === 'FAILED_TO_LOAD').length,
+    authentication_blocked_views:routes.filter((item) => authOutcomes.has(item.classification) || ['AUTHENTICATION_BLOCKED','AUTHENTICATION_REQUIRED'].includes(item.authentication_status)).length,
+    application_not_ready_views:results.filter((item) => item.application_ready === false).length,
+    not_tested_views:summary.routes_not_tested,
+    unresolved_controls:summary.navigation_controls_unresolved,
+  };
+  const metrics = [['controls_discovered','Discovered controls (observations)'],['safe_candidates','Safe route/view candidates'],['visited_views','Visited views'],['validated_views','Application views validated'],['failed_views','Failed views'],['skipped_unsafe_controls','Unsafe controls skipped'],['unreachable_views','Unreachable views'],['authentication_blocked_views','Authentication-blocked views'],['application_not_ready_views','Application not ready'],['not_tested_views','Not tested views'],['unresolved_controls','Unresolved controls']];
+  byId('navigation-coverage-metrics').innerHTML = metrics.map(([key,label]) => `<div class="resource-card"><strong data-navigation-metric="${key}">${escapeHtml(coverage[key] ?? fallback[key] ?? 'Not recorded')}</strong><span>${escapeHtml(label)}</span></div>`).join('');
+  const limitations = [...new Set((coverage.limitations || report.coverage?.coverage_reasons || summary.coverage_reasons || []).map((reason) => typeof reason === 'string' ? reason : reason.message || reason.code).filter(Boolean))];
+  byId('navigation-coverage-limitations').textContent = `Coverage limitations: ${limitations.join('; ') || 'No limits were reported for the observed reachable scope.'} Total application coverage remains unknown. Safe candidates are unique eligible route identities; discovered controls are observations across visited views.`;
+  const root = {groups:new Map(),routes:[]};
+  routes.forEach((route,index) => {
+    const name = route.route_name || route.route_label || route.display_path || 'Unnamed view';
+    const hierarchy = Array.isArray(route.navigation_hierarchy) ? route.navigation_hierarchy.filter((part) => typeof part === 'string' && part.trim()) : [];
+    if (hierarchy[hierarchy.length - 1] === name) hierarchy.pop();
+    if (!hierarchy.length && route.parent_route_name) hierarchy.push(route.parent_route_name);
+    let node = root;
+    hierarchy.slice(0, 12).forEach((label) => {
+      if (!node.groups.has(label)) node.groups.set(label,{groups:new Map(),routes:[]});
+      node = node.groups.get(label);
+    });
+    node.routes.push({route,index,name});
+  });
+  function renderNode(node) {
+    const groups = [...node.groups].map(([label,children]) => `<li><details><summary>${escapeHtml(label)}</summary><ul>${renderNode(children)}</ul></details></li>`).join('');
+    return groups + node.routes.map(({route,index,name}) => {
+      const ids = [route.route_id,route.normalized_route_identity,route.canonical_route,route.url].filter(Boolean);
+      const apis = (report.api_inventory || []).filter((api) => (api.routes_using_endpoint || []).some((id) => ids.includes(id)));
+      return `<li class="navigation-view"><button type="button" class="secondary" data-navigation-route="${index}" aria-expanded="false" aria-controls="route-inspector">${escapeHtml(name)}</button><span class="outcome-badge ${statusClass(route.classification)}">${escapeHtml(route.classification || 'NOT_TESTED')}</span>${apis.length ? `<details><summary>Associated APIs (${apis.length})</summary><ul>${apis.map((api) => `<li><code>${escapeHtml(api.method)} ${escapeHtml(api.host)}${escapeHtml(api.endpoint)}</code> <span>${escapeHtml(api.validation_outcome || api.observation_outcome || 'OBSERVED')}</span></li>`).join('')}</ul></details>` : '<small>No attributed API activity observed.</small>'}</li>`;
+    }).join('');
+  }
+  byId('navigation-tree').innerHTML = renderNode(root) || '<li>No navigation views were observed.</li>';
+  byId('navigation-tree').querySelectorAll('[data-navigation-route]').forEach((button) => button.addEventListener('click', () => showRouteInspector(routes[Number(button.dataset.navigationRoute)], button)));
 }
 
 function renderReport(report) {
@@ -932,7 +1003,7 @@ function renderReport(report) {
   byId('api-failed-only').checked = false;
   // A filter left over from a previous scan must not silently hide new POST
   // observations. Column/density preferences remain separate and persistent.
-  ['result-filter','navigation-filter','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','api-lifecycle-filter','api-response-filter','resource-type-filter','resource-route-filter','resource-status-filter'].forEach((id) => { if (byId(id)) byId(id).value = 'all'; });
+  ['result-filter','navigation-filter','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','api-lifecycle-filter','api-response-filter','api-failure-type-filter','resource-type-filter','resource-route-filter','resource-status-filter'].forEach((id) => { if (byId(id)) byId(id).value = 'all'; });
   ['result-search','api-search','resource-search'].forEach((id) => { byId(id).value = ''; });
   ['resource-failed-only','resource-large-only'].forEach((id) => { byId(id).checked = false; });
   updateApiMethodFilter(report.api_inventory || []);
@@ -941,6 +1012,7 @@ function renderReport(report) {
   renderApiInventory();
   renderResourceSummary();
   renderSecurityRecommendations();
+  renderNavigationCoverage(report);
   results.hidden = false;
   panelSizes['route-results'].apply();
   scrollAndFocus(results);
@@ -1058,12 +1130,14 @@ const resourceScope = document.createElement('p');
 resourceScope.id = 'resource-scope';
 resourceScope.className = 'inventory-scope';
 byId('resource-summary').before(resourceScope);
-for (const [id,label,option] of [['api-lifecycle-filter','Request lifecycle','All lifecycle states'],['api-response-filter','HTTP response','All HTTP responses']]) {
+for (const [id,label,option] of [['api-lifecycle-filter','Request lifecycle','All lifecycle states'],['api-response-filter','HTTP response','All HTTP responses'],['api-failure-type-filter','Failure type','All failure types']]) {
   const field = document.createElement('label');
   field.className = 'field';
   field.innerHTML = `<span>${label}</span><select id="${id}"><option value="all">${option}</option></select>`;
   document.querySelector('.api-tools').append(field);
 }
+byId('api-failure-type-filter').insertAdjacentHTML('beforeend', ['HTTP_4XX','HTTP_5XX','NETWORK_FAILURE','RESPONSE_BODY_FAILURE','POLICY_BLOCKED','CANCELED','INCOMPLETE'].map((value) => `<option value="${value}">${value.replaceAll('_', ' ')}</option>`).join(''));
+document.querySelector('#scan-timing-settings .field-grid').insertAdjacentHTML('beforeend', '<label class="field"><span>Per-route total timeout (ms)</span><input id="per-route-timeout" type="number" min="1000" max="120000" placeholder="Inherit maximum time / route"><small>Bounds the entire route lifecycle, including authentication, navigation and stabilization.</small></label>');
 for (const [key,label] of tableColumns.route.slice(13)) {
   const header = document.createElement('th');
   header.textContent = label;
@@ -1098,7 +1172,7 @@ authMode.addEventListener('change', renderAuthFields);
 byId('result-search').addEventListener('input', renderRows);
 byId('result-filter').addEventListener('change', renderRows);
 byId('navigation-filter').addEventListener('change', renderRows);
-['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','api-lifecycle-filter','api-response-filter','api-failed-only'].forEach((id) => byId(id)?.addEventListener(id === 'api-search' ? 'input' : 'change', () => { if (id === 'api-failed-only') apiFailureOnly = false; renderApiInventory(); }));
+['api-search','api-method-filter','api-status-filter','api-policy-filter','api-route-filter','api-role-filter','api-lifecycle-filter','api-response-filter','api-failure-type-filter','api-failed-only'].forEach((id) => byId(id)?.addEventListener(id === 'api-search' ? 'input' : 'change', () => { if (id === 'api-failed-only') apiFailureOnly = false; renderApiInventory(); }));
 byId('evidence-close').addEventListener('click', () => { byId('evidence-panel').hidden = true; });
 byId('route-inspector-close').addEventListener('click', () => closeRouteInspector());
 byId('route-inspector-fullscreen').addEventListener('click', toggleInspectorFullscreen);
