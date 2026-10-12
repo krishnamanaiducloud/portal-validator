@@ -1,3 +1,9 @@
+const FRONTEND_VERSION = '1.12.8';
+// The server pins this exact deferred script with SRI and a hash-versioned URL.
+// Capture currentScript now; it is unavailable in subsequent async callbacks.
+const frontendScript = document.currentScript;
+const loadedFrontendSha256 = frontendScript?.dataset.frontendSha256 || null;
+const loadedFrontendIntegrity = frontendScript?.integrity || null;
 const byId = (id) => document.getElementById(id);
 const form = byId('scan-form');
 const authMode = byId('auth-mode');
@@ -20,6 +26,9 @@ let activeScanId = null;
 let scrollSynchronizers = [];
 let inspectedRoute = null;
 let inspectTrigger = null;
+let buildIdentityMismatch = false;
+let buildIdentityCheck = null;
+let scanSubmissionPending = false;
 // Panel preferences contain dimensions only, never report or authentication data.
 const panelSizes = {};
 
@@ -139,9 +148,61 @@ const postDiagnosticFields = [
   ['post_requests_without_completed_responses','POST requests without completed responses'],
   ['unique_post_endpoints_reported','Unique POST endpoints reported'],
 ];
+
+function showBuildIdentity(metadata) {
+  const validSha = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+  const hashKnown = validSha(loadedFrontendSha256) && validSha(metadata.frontend_sha256);
+  const versionMismatch = typeof metadata.version === 'string' && metadata.version !== FRONTEND_VERSION;
+  const hashMismatch = hashKnown && loadedFrontendSha256 !== metadata.frontend_sha256;
+  const sourceStatus = metadata.source_integrity?.status || 'UNVERIFIED';
+  const integrityPinned = typeof loadedFrontendIntegrity === 'string' && loadedFrontendIntegrity.startsWith('sha256-');
+  const confirmedCompatible = metadata.version === FRONTEND_VERSION && hashKnown && !hashMismatch && sourceStatus !== 'MISMATCH';
+  buildIdentityMismatch = versionMismatch || hashMismatch || sourceStatus === 'MISMATCH' || (buildIdentityMismatch && !confirmedCompatible);
+  const frontendStatus = versionMismatch || hashMismatch ? 'MISMATCH' : hashKnown && integrityPinned ? 'MATCHED' : 'UNVERIFIED';
+  const sourceVerified = sourceStatus === 'VERIFIED';
+  const state = buildIdentityMismatch ? 'MISMATCH' : frontendStatus === 'MATCHED' && sourceVerified ? 'VERIFIED' : 'UNVERIFIED';
+  const commit = typeof metadata.git_commit === 'string' && /^[a-f0-9]{40}$/.test(metadata.git_commit) ? metadata.git_commit : null;
+  byId('build-identity').dataset.status = state;
+  byId('build-summary').textContent = `Build ${metadata.version || 'unknown'} · ${commit ? commit.slice(0, 12) : 'commit unknown'} · Frontend ${frontendStatus.toLowerCase()} · Source ${sourceStatus.toLowerCase()}`;
+  const fields = {
+    'Backend version':metadata.version || 'Unknown',
+    'Loaded frontend version':FRONTEND_VERSION,
+    'Git commit':commit || 'Unknown',
+    'Build timestamp':metadata.build_timestamp || 'Unknown',
+    'Image digest':metadata.image_digest || 'Unknown',
+    'Backend frontend SHA-256':metadata.frontend_sha256 || 'Unknown',
+    'Loaded frontend SHA-256':loadedFrontendSha256 || 'Unverified: no server hash marker',
+    'Browser integrity check':integrityPinned ? 'Pinned with SHA-256 SRI' : 'Unverified',
+    'Source integrity':metadata.source_integrity?.reason || 'No source verification information available.',
+  };
+  byId('build-details').innerHTML = Object.entries(fields).map(([label,value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('');
+  byId('build-mismatch').hidden = !buildIdentityMismatch;
+  if (buildIdentityMismatch || (!scanSubmissionPending && !activeScanId && progress.hidden)) runButton.disabled = buildIdentityMismatch;
+  return !buildIdentityMismatch;
+}
+
+async function verifyBuildIdentity() {
+  if (buildIdentityCheck) return buildIdentityCheck;
+  buildIdentityCheck = (async () => {
+    try {
+      return showBuildIdentity(await requestJson('/api/diagnostics/build', {cache:'no-store'}, 'Build identity request'));
+    } catch (_) {
+      // Missing metadata is visibly unverified. A previously confirmed mismatch
+      // remains blocked until a successful check establishes compatible files.
+      byId('build-identity').dataset.status = buildIdentityMismatch ? 'MISMATCH' : 'UNVERIFIED';
+      byId('build-summary').textContent = `Frontend ${FRONTEND_VERSION} · Build metadata unavailable; deployment identity unverified`;
+      return !buildIdentityMismatch;
+    } finally { buildIdentityCheck = null; }
+  })();
+  return buildIdentityCheck;
+}
 const apiLifecycleSummaryFields = [
   ['api_requests_observed','Requests observed'],
+  ['api_requests_allowed','Requests allowed'],
+  ['api_requests_sent','Requests sent'],
+  ['api_requests_responded','HTTP responses received'],
   ['api_responses_completed','Responses completed'],
+  ['api_http_failures','Confirmed HTTP failures'],
   ['api_requests_failed','Target request failures'],
   ['api_requests_blocked','Policy-blocked requests'],
   ['api_requests_canceled','Canceled requests'],
@@ -941,8 +1002,10 @@ function renderNavigationCoverage(report) {
     application_not_ready_views:results.filter((item) => item.application_ready === false).length,
     not_tested_views:summary.routes_not_tested,
     unresolved_controls:summary.navigation_controls_unresolved,
+    menus_expanded:summary.navigation_menus_expanded,
+    successful_views:summary.healthy_routes,
   };
-  const metrics = [['controls_discovered','Discovered controls (observations)'],['safe_candidates','Safe route/view candidates'],['visited_views','Visited views'],['validated_views','Application views validated'],['failed_views','Failed views'],['skipped_unsafe_controls','Unsafe controls skipped'],['unreachable_views','Unreachable views'],['authentication_blocked_views','Authentication-blocked views'],['application_not_ready_views','Application not ready'],['not_tested_views','Not tested views'],['unresolved_controls','Unresolved controls']];
+  const metrics = [['controls_discovered','Discovered controls (observations)'],['safe_candidates','Safe route/view candidates'],['menus_expanded','Menus expanded'],['visited_views','Visited views'],['validated_views','Application views validated'],['successful_views','Successful views'],['failed_views','Failed views'],['skipped_unsafe_controls','Unsafe controls skipped'],['unreachable_views','Unreachable views'],['authentication_blocked_views','Authentication-blocked views'],['application_not_ready_views','Application not ready'],['not_tested_views','Not tested views'],['unresolved_controls','Unresolved controls']];
   byId('navigation-coverage-metrics').innerHTML = metrics.map(([key,label]) => `<div class="resource-card"><strong data-navigation-metric="${key}">${escapeHtml(coverage[key] ?? fallback[key] ?? 'Not recorded')}</strong><span>${escapeHtml(label)}</span></div>`).join('');
   const limitations = [...new Set((coverage.limitations || report.coverage?.coverage_reasons || summary.coverage_reasons || []).map((reason) => typeof reason === 'string' ? reason : reason.message || reason.code).filter(Boolean))];
   byId('navigation-coverage-limitations').textContent = `Coverage limitations: ${limitations.join('; ') || 'No limits were reported for the observed reachable scope.'} Total application coverage remains unknown. Safe candidates are unique eligible route identities; discovered controls are observations across visited views.`;
@@ -969,6 +1032,17 @@ function renderNavigationCoverage(report) {
   }
   byId('navigation-tree').innerHTML = renderNode(root) || '<li>No navigation views were observed.</li>';
   byId('navigation-tree').querySelectorAll('[data-navigation-route]').forEach((button) => button.addEventListener('click', () => showRouteInspector(routes[Number(button.dataset.navigationRoute)], button)));
+}
+
+function renderCoverageDimensions(report) {
+  const dimensions = report.coverage_dimensions || {};
+  const labels = {execution:'Execution completeness',navigation:'Navigation coverage',authentication:'Authentication readiness',api:'API observation coverage'};
+  byId('coverage-dimensions').innerHTML = Object.entries(labels).map(([key,label]) => {
+    const dimension = dimensions[key] || {};
+    const status = dimension.status || 'UNKNOWN';
+    const reason = dimension.reason || 'This report did not record a separate assessment for this dimension.';
+    return `<section class="coverage-dimension" data-coverage-dimension="${key}"><h3>${label}</h3><strong>${escapeHtml(status)}</strong><p>${escapeHtml(reason)}</p></section>`;
+  }).join('');
 }
 
 function renderReport(report) {
@@ -1013,6 +1087,7 @@ function renderReport(report) {
   renderResourceSummary();
   renderSecurityRecommendations();
   renderNavigationCoverage(report);
+  renderCoverageDimensions(report);
   results.hidden = false;
   panelSizes['route-results'].apply();
   scrollAndFocus(results);
@@ -1203,6 +1278,11 @@ byId('cancel-button').addEventListener('click', async () => {
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
+  if (scanSubmissionPending || activeScanId) return;
+  scanSubmissionPending = true;
+  runButton.disabled = true;
+  try {
+  if (!await verifyBuildIdentity()) { notify('Dashboard and backend build identities differ. Reload the dashboard before starting a scan.', true); return; }
   if ([...document.querySelectorAll('.read-post-operation input[required]')].some((input) => !input.validity.valid)) byId('read-post-settings').open = true;
   if (!form.reportValidity()) return;
   let payload;
@@ -1229,7 +1309,8 @@ form.addEventListener('submit', async (event) => {
     const coverage = report.coverage || {};
     notify(`Execution finished · Coverage: ${coverage.coverage_status || coverage.scan_completeness || 'UNKNOWN'} · ${report.summary.routes_validated ?? report.pages} routes validated`);
   } catch (error) { notify(error.message || 'Validation failed', true); }
-  finally { stopProgress(); runButton.disabled = false; runButton.querySelector('span').textContent = 'Run validation'; }
+  finally { stopProgress(); runButton.disabled = buildIdentityMismatch; runButton.querySelector('span').textContent = 'Run validation'; }
+  } finally { scanSubmissionPending = false; runButton.disabled = buildIdentityMismatch || Boolean(activeScanId); }
 });
 
 byId('download-button').addEventListener('click', () => {
@@ -1238,6 +1319,7 @@ byId('download-button').addEventListener('click', () => {
 });
 
 setupScrollSync();
+verifyBuildIdentity();
 requestJson('/api/auth-profiles', {}, 'Authentication profile request').then((data) => {
   profileNames = data.profiles || [];
   refreshProfiles = new Set(data.refresh_enabled_profiles || []);

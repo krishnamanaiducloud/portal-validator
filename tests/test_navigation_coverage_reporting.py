@@ -25,6 +25,43 @@ def loaded(**changes):
     }
 
 
+def test_final_page_owned_diagnostics_remove_popup_errors_from_opener_only():
+    initial = classify_page_result(
+        url="https://portal.example/", status=200, error=None,
+        missing_security_headers=[], console_errors=["Popup initial warning"], page_errors=["Popup script warning"],
+        failed_resources=[], security_headers_tested=True,
+    )
+    assert initial["classification"] == "PASS_WITH_WARNINGS"
+    opener = refresh_route_api_health(initial, [], console_errors=[], page_errors=[])
+    assert opener["classification"] == "PASS"
+    assert opener["console_errors"] == opener["page_errors"] == []
+    assert opener["console_status"] == "PASS"
+    assert opener["warning_count"] == 0
+    popup = refresh_route_api_health(
+        loaded(), [], console_errors=["Popup initial warning"], page_errors=["Popup script warning"],
+    )
+    assert popup["classification"] == "PASS_WITH_WARNINGS"
+    assert popup["console_status"] == "WARNING"
+    assert {item["type"] for item in popup["finding_details"]} == {"CONSOLE_ERROR", "PAGE_SCRIPT_ERROR"}
+    assert popup["warning_count"] >= 1
+
+
+def test_final_diagnostic_reconciliation_preserves_main_document_and_security_evidence():
+    result = classify_page_result(
+        url="https://portal.example/", status=None, error="net::ERR_CONNECTION_RESET",
+        missing_security_headers=["x-frame-options"], console_errors=["Wrong page warning"],
+        failed_resources=[], security_headers_tested=False,
+    )
+    updated = refresh_route_api_health(result, [], console_errors=[], page_errors=["Owned script warning"])
+    assert updated["page_load_status"] == "FAILED_TO_LOAD"
+    assert updated["classification"] == result["classification"]
+    assert updated["passed"] is False
+    assert updated["console_errors"] == []
+    assert updated["page_errors"] == ["Owned script warning"]
+    assert "NAVIGATION_FAILURE" in {item["type"] for item in updated["finding_details"]}
+    assert "MISSING_SECURITY_HEADER" in {item["type"] for item in updated["finding_details"]}
+
+
 @pytest.mark.parametrize("status", [404, 502])
 def test_definitive_http_failure_remains_failed_when_transfer_incomplete(status):
     event = {

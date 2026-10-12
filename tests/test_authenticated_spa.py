@@ -213,6 +213,9 @@ async def test_authenticated_spa_all_safe_views_and_per_tab_api_health(authentic
     assert sum(role == "identity" and method == "POST" and path == "/saml/consume" for role, method, path in receipts) == 1
     assert "fixture-private" not in json.dumps(report)
     assert all(report["summary"]["counter_invariants"].values())
+    assert all(route["browser_lifecycle"]["state"] == "REPORT" for route in results)
+    assert all(route["browser_lifecycle"]["failed_stage"] is None for route in results)
+    assert all("APPLICATION_READY" in [event["state"] for event in route["browser_lifecycle"]["events"]] for route in results)
 
 
 @pytest.mark.asyncio
@@ -230,6 +233,8 @@ async def test_unapproved_authentication_stops_before_discovery(authenticated_sp
     assert len(report["results"]) == 1
     assert report["results"][0]["authentication_status"] == expected
     assert report["results"][0]["application_ready"] is False
+    assert report["results"][0]["browser_lifecycle"]["failed_stage"] == "AUTHENTICATING"
+    assert report["results"][0]["browser_lifecycle"]["failure_reason"] == expected
     assert not report["summary"]["coverage_complete"]
     assert not any(method == "POST" for _, method, _ in receipts)
 
@@ -240,6 +245,8 @@ async def test_missing_shell_readiness_never_starts_navigation_discovery(authent
     report = await scan_fixture(origins, readiness_selector="[data-nonexistent-shell]", readiness_timeout_ms=1000)
     assert len(report["results"]) == 1
     assert report["results"][0]["application_ready"] is False
+    assert report["results"][0]["browser_lifecycle"]["failed_stage"] == "APPLICATION_BOOTSTRAP"
+    assert report["results"][0]["browser_lifecycle"]["failure_reason"] == "APPLICATION_NOT_READY"
     assert not report["summary"]["coverage_complete"]
     assert report["results"][0]["navigation_controls_activated"] == 0
 

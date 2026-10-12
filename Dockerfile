@@ -97,7 +97,16 @@ COPY --from=builder --chown=0:0 /ms-playwright /ms-playwright
 COPY --chown=10001:10001 --chmod=0555 container-entrypoint.sh /app/container-entrypoint.sh
 COPY --chown=10001:10001 app ./app
 
-RUN python -c "from pathlib import Path; from playwright.sync_api import sync_playwright; manager = sync_playwright().start(); browser_path = Path(manager.chromium.executable_path); print(f'Playwright expected Chromium: {browser_path}'); assert browser_path.is_file(), f'Playwright Chromium missing: {browser_path}'; manager.stop(); print('Final runtime Playwright Chromium verified')" \
+# Source identity must not invalidate unchanged OS/venv/browser layers.
+ARG VCS_REF=""
+ARG BUILD_TIMESTAMP=""
+LABEL org.opencontainers.image.version="1.12.8" \
+    org.opencontainers.image.revision=$VCS_REF \
+    org.opencontainers.image.created=$BUILD_TIMESTAMP
+
+RUN python -m app.build_info --git-commit "$VCS_REF" --timestamp "$BUILD_TIMESTAMP" \
+    && python -c "from app.build_info import build_diagnostics; identity = build_diagnostics(); assert identity['source_integrity']['status'] != 'MISMATCH', identity; print('Final runtime build identity verified')" \
+    && python -c "from pathlib import Path; from playwright.sync_api import sync_playwright; manager = sync_playwright().start(); browser_path = Path(manager.chromium.executable_path); print(f'Playwright expected Chromium: {browser_path}'); assert browser_path.is_file(), f'Playwright Chromium missing: {browser_path}'; manager.stop(); print('Final runtime Playwright Chromium verified')" \
     && command -v certutil >/dev/null \
     && HOME=/tmp/portal-validator-build-home python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(headless=True); b.close(); b = p.chromium.launch(headless=True, channel='chromium'); b.close(); p.stop(); print('Final runtime Chromium launch verified')" \
     && rm -rf /tmp/portal-validator-build-home

@@ -17,7 +17,7 @@ from typing import Awaitable, Callable, Literal
 from urllib.parse import urldefrag, urlparse
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from playwright.async_api import BrowserContext, Error as PlaywrightError, Route, async_playwright
@@ -27,6 +27,7 @@ from app.authentication import (
     build_authentication_manager,
 )
 from app.logging_config import LOGGER, log_event
+from app.browser_lifecycle import BrowserLifecycle
 from app.discovery import (
     DOCUMENT_NAVIGATION,
     DOWNLOAD_OBSERVED,
@@ -91,6 +92,7 @@ from app.reporting import (
     aggregate_resource_events,
     aggregate_resource_inventory,
     aggregate_security_recommendations,
+    build_coverage_dimensions,
     classify_page_result,
     finding,
     refresh_route_api_health,
@@ -108,6 +110,8 @@ from app.security import (
     validate_http_url,
 )
 from app.trust import TrustStatus, inspect_trust_status
+from app.build_info import build_diagnostics, frontend_identity
+from app.version import VALIDATOR_VERSION
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -132,7 +136,6 @@ SECURITY_HEADERS = (
 COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
     "ac", "co", "com", "edu", "gov", "net", "org",
 })
-VALIDATOR_VERSION = "1.12.7"
 REPORT_SCHEMA_VERSION = "2.5"
 
 
@@ -266,7 +269,7 @@ class ScanRequest(BaseModel):
     render_settle_ms: int = Field(750, ge=0, le=5000)
     min_observation_ms: int = Field(500, ge=0, le=10000)
     network_quiet_ms: int = Field(300, ge=0, le=5000)
-    max_navigation_actions: int = Field(20, ge=0, le=50)
+    max_navigation_actions: int = Field(20, ge=0, le=1500)
     max_discovery_scrolls: int = Field(3, ge=0, le=20)
     authentication: Authentication = Field(default_factory=Authentication)
     allow_mutations: bool = False
@@ -691,7 +694,22 @@ def partition_links(
 
 @app.get("/", include_in_schema=False)
 async def home():
-    return FileResponse(STATIC_DIR / "index.html")
+    frontend_sha256, integrity = frontend_identity()
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    script = '<script src="/static/app.js" defer></script>'
+    if script not in html:
+        raise RuntimeError("Dashboard script identity marker is missing")
+    return HTMLResponse(html.replace(
+        script,
+        f'<script src="/static/app.js?v={frontend_sha256}" integrity="{integrity}" '
+        f'crossorigin="anonymous" data-frontend-sha256="{frontend_sha256}" defer></script>',
+        1,
+    ))
+
+
+@app.get("/api/diagnostics/build")
+async def application_build():
+    return build_diagnostics()
 
 
 @app.get("/healthz", include_in_schema=False)
@@ -967,6 +985,8 @@ async def execute_scan(
     queued_view_keys: dict[str, set[str]] = defaultdict(set)
     action_limited_routes: set[str] = set()
     route_locations: dict[str, str] = {requested_route: requested_route}
+    route_page_keys: dict[str, str] = {}
+    active_browser_page_key: str | None = None
     route_parent_ids: dict[str, str | None] = {requested_route: None}
     route_name_by_id: dict[str, str] = {requested_route: "Requested route"}
     route_metadata: dict[str, dict[str, object]] = {
@@ -1053,8 +1073,11 @@ async def execute_scan(
                 )
                 continue
             route_key = discovered_route_key(route, identity)
+            page_key = route.browser_page_key or active_browser_page_key
+            if page_key is not None:
+                route_page_keys.setdefault(route_key, page_key)
             route_locations[route_key] = identity
-            parent_route_id = active_route_id
+            parent_route_id = route.opener_route_id or active_route_id
             route_parent_ids.setdefault(route_key, parent_route_id)
             route_metadata.setdefault(route_key, {
                 "route_label": sanitize_text(route.label, limit=160) if route.label else "Discovered route",
@@ -1107,6 +1130,7 @@ async def execute_scan(
 
     total_timeout_reached = False
     cancellation_requested = False
+    late_navigation_observed = False
     document_evidence: dict[tuple[str, str, int | None], dict[str, object]] = {}
     scan_api_events: list[dict] = []
     scan_http_method_counts: Counter[str] = Counter()
@@ -1183,8 +1207,8 @@ async def execute_scan(
                     await context.add_init_script(script=api_timeout_init_script(req.api_timeout_ms))
                 await configure_cookies(context, req, root_host, approved_portal_hosts)
                 page = None
-                console_errors: list[str] = []
-                page_errors: list[str] = []
+                console_errors: list[dict] = []
+                page_errors: list[dict] = []
                 failed_resources: list[dict] = []
                 api_events: list[dict] = []
                 network_observer = PassiveNetworkObserver(api_events)
@@ -1220,6 +1244,94 @@ async def execute_scan(
                 navigation_policy_intervals: list[tuple[float, float]] = []
                 observation_phase = "AUTHENTICATION"
                 popup_origins = weakref.WeakKeyDictionary()
+                browser_pages: dict[str, object] = {}
+                browser_page_keys = weakref.WeakKeyDictionary()
+                page_document_responses = weakref.WeakKeyDictionary()
+                observed_document_responses = []
+                page_observations: dict[str, list[dict]] = defaultdict(list)
+                observation_page_keys: dict[int, str] = {}
+                request_page_keys = weakref.WeakKeyDictionary()
+                adopted_page_keys: set[str] = set()
+                popup_observation_failures = 0
+                accounted_popup_observation_failures = 0
+                primary_page = None
+
+                def remember_page_observation(owner_page, event):
+                    if owner_page is None:
+                        return
+                    register_browser_page(owner_page)
+                    page_key = browser_page_keys.get(request_identity(owner_page))
+                    if page_key is not None and id(event) not in observation_page_keys:
+                        observation_page_keys[id(event)] = page_key
+                        page_observations[page_key].append(event)
+
+                def remember_request_observation(request, event):
+                    try:
+                        owner_page = request.frame.page
+                    except PlaywrightError:
+                        return
+                    remember_page_observation(owner_page, event)
+                    request_page_keys[request_identity(request)] = browser_page_keys.get(request_identity(owner_page))
+
+                def adopt_page_observations(owner_page):
+                    """Assign a popup's own bootstrap to its independently validated view.
+
+                    Never match URLs: two windows can share an origin/URL but
+                    own different state. Later background requests retain the
+                    last actual activation of their source page.
+                    """
+                    page_key = browser_page_keys.get(request_identity(owner_page))
+                    if page_key is None or page_key in adopted_page_keys:
+                        return
+                    adopted_page_keys.add(page_key)
+                    for event in page_observations.get(page_key, []):
+                        event.setdefault("opener_route", event.get("initiating_route"))
+                        event.setdefault("opener_route_activation_id", event.get("route_activation_id"))
+                        event["initiating_route"] = active_route_id
+                        event["route_activation_id"] = active_route_activation_id
+                        if event.get("phase") not in {None, "AUTHENTICATION", "SESSION_REFRESH"}:
+                            event["phase"] = "APPLICATION_BOOTSTRAP"
+                            if event.get("importance") == "BACKGROUND":
+                                event["importance"] = "REQUIRED"
+                        if event.get("top_level_navigation"):
+                            event["main_document"] = True
+                    for key, source_page_key in tuple(request_page_keys.items()):
+                        if source_page_key != page_key:
+                            continue
+                        if key in request_routes:
+                            request_routes[key] = active_route_id
+                        if key in request_owners:
+                            request_owners[key] = (active_route_id, active_route_activation_id)
+                        if key in request_observation:
+                            prior_phase, prior_importance = request_observation[key]
+                            if prior_phase not in {"AUTHENTICATION", "SESSION_REFRESH"}:
+                                request_observation[key] = (
+                                    "APPLICATION_BOOTSTRAP", "REQUIRED" if prior_importance == "BACKGROUND" else prior_importance,
+                                )
+                        route_network_activity.reassign_request(key, active_route_id)
+
+                def document_response_for(owner_page):
+                    # Playwright may emit an initial popup Response before its
+                    # Frame has a Page. Correlate that same captured Response
+                    # after the frame is attached, never by URL alone.
+                    latest_response = None
+                    for response in reversed(observed_document_responses):
+                        try:
+                            if response.request.frame.page == owner_page:
+                                # The initial popup POST can be observed before
+                                # its Frame/Page exists. Retry that same request
+                                # identity now so its API occurrence participates
+                                # in this page's bootstrap adoption as well.
+                                ensure_api_observed(response.request)
+                                # Bind earlier redirecting POST documents too;
+                                # the final document may itself be a plain GET.
+                                if latest_response is None:
+                                    latest_response = response
+                        except PlaywrightError:
+                            continue
+                    if latest_response is not None:
+                        page_document_responses[request_identity(owner_page)] = latest_response
+                    return page_document_responses.get(request_identity(owner_page))
 
                 def route_activity_snapshot():
                     activity = route_network_activity.snapshot(active_route_id)
@@ -1228,12 +1340,20 @@ async def execute_scan(
                     activity["pending"] += sum(not task.done() for task in popup_tasks)
                     return activity
 
-                def record_console_error(message):
+                def record_console_error(message, owner_page):
                     if message.type in {"error", "warning"}:
-                        console_errors.append(sanitized_diagnostic(message.text))
+                        owner = ((active_route_id, active_route_activation_id, observation_phase)
+                                 if owner_page == page else popup_origins.get(request_identity(owner_page), (None, None, None)))
+                        event = {"message": sanitized_diagnostic(message.text), "initiating_route": owner[0], "route_activation_id": owner[1]}
+                        console_errors.append(event)
+                        remember_page_observation(owner_page, event)
 
-                def record_page_error(error):
-                    page_errors.append(sanitized_diagnostic(str(error)))
+                def record_page_error(error, owner_page):
+                    owner = ((active_route_id, active_route_activation_id, observation_phase)
+                             if owner_page == page else popup_origins.get(request_identity(owner_page), (None, None, None)))
+                    event = {"message": sanitized_diagnostic(str(error)), "initiating_route": owner[0], "route_activation_id": owner[1]}
+                    page_errors.append(event)
+                    remember_page_observation(owner_page, event)
 
                 def is_api_observation(request) -> bool:
                     return (
@@ -1243,7 +1363,10 @@ async def execute_scan(
 
                 def request_origin(request):
                     try:
-                        owner = popup_origins.get(request_identity(request.frame.page))
+                        source_page = request.frame.page
+                        if source_page == page:
+                            return active_route_id, active_route_activation_id, observation_phase
+                        owner = popup_origins.get(request_identity(source_page))
                     except Exception:
                         owner = None
                     return owner or (active_route_id, active_route_activation_id, observation_phase)
@@ -1325,6 +1448,7 @@ async def execute_scan(
                     )
                     if "_resource_timing_key" not in event:
                         event["_resource_timing_key"] = resource_timing_key(request.url)
+                    remember_request_observation(request, event)
                     return event
 
                 def record_request(request):
@@ -1378,6 +1502,7 @@ async def execute_scan(
                         }
                         resource_events.append(resource_event)
                         resource_observations[key] = resource_event
+                        remember_request_observation(request, resource_event)
                     if api_event is not None:
                         log_event(
                             logging.DEBUG,
@@ -1475,6 +1600,7 @@ async def execute_scan(
                     if existing is None:
                         failed_resources.append(details)
                         resource_failure_observations[key] = details
+                        remember_request_observation(request, details)
                     else:
                         existing.update(details)
 
@@ -1589,6 +1715,14 @@ async def execute_scan(
                     nonlocal latest_document_response
                     if network_observer.finalized:
                         return
+                    if is_main_navigation(response.request):
+                        observed_document_responses.append(response)
+                        try:
+                            page_document_responses[request_identity(response.request.frame.page)] = response
+                        except PlaywrightError:
+                            # The initial popup document can precede Frame
+                            # creation; record_popup resolves it after commit.
+                            pass
                     if is_primary_navigation(response.request):
                         latest_document_response = response
                         authentication_navigation.observe(response.url, method=response.request.method)
@@ -1604,6 +1738,7 @@ async def execute_scan(
                             response.status,
                         )
                         if api_event is not None:
+                            remember_request_observation(response.request, api_event)
                             api_event["content_type"] = content_type
                             log_event(
                                 logging.DEBUG,
@@ -1703,22 +1838,48 @@ async def execute_scan(
 
                 def record_frame_navigation(frame):
                     if frame.url.startswith(("http://", "https://")):
-                        frame_events.append({
+                        owner = ((active_route_id, active_route_activation_id, observation_phase)
+                                 if frame.page == page else popup_origins.get(request_identity(frame.page), (None, None, None)))
+                        event = {
                             "url": sanitized_url(frame.url),
-                            "main_frame": bool(page is not None and frame == page.main_frame),
-                        })
+                            "main_frame": frame == frame.page.main_frame,
+                            "initiating_route": owner[0], "route_activation_id": owner[1],
+                        }
+                        frame_events.append(event)
+                        remember_page_observation(frame.page, event)
 
                 async def record_popup(popup):
+                    nonlocal popup_observation_failures
                     try:
                         await popup.wait_for_load_state("domcontentloaded", timeout=max(1, min(req.timeout_ms, round((deadline - time.perf_counter()) * 1000))))
+                        await settle_authentication_navigation(
+                            popup,
+                            in_portal_scope=lambda candidate: url_in_scan_scope(
+                                candidate, root_host, req.allow_subdomains, approved_portal_hosts,
+                            ),
+                            is_approved_authentication_host=lambda host: host in req.authentication_hosts,
+                            detect_signals=detect_auth_signals,
+                            timeout_ms=max(1, min(
+                                req.authentication_timeout_ms or req.timeout_ms,
+                                round((deadline - time.perf_counter()) * 1000),
+                            )),
+                            flow_active=authentication_navigation.active,
+                            current_status=lambda: (
+                                document_response_for(popup).status
+                                if document_response_for(popup) is not None else None
+                            ),
+                        )
                         if popup.url.startswith(("http://", "https://")):
                             popup_routes.append(DiscoveredRoute(
                                 url=popup.url,
-                                label=sanitize_text(await popup.title(), limit=160) or "New window",
+                                label=sanitize_text(await retry_dom_operation(popup, popup.title), limit=160) or "New window",
                                 source="popup",
                                 navigation_mode=POPUP_NAVIGATION,
+                                browser_page_key=browser_page_keys.get(request_identity(popup)),
+                                opener_route_id=popup_origins.get(request_identity(popup), (None, None, None))[0],
                             ))
                     except Exception as exc:
+                        popup_observation_failures += 1
                         log_event(
                             logging.INFO,
                             "POPUP_OBSERVATION_FAILED",
@@ -2053,29 +2214,70 @@ async def execute_scan(
                 context.on("requestfailed", record_failed_request)
                 context.on("requestfinished", record_request_finished)
                 context.on("response", record_response)
+                def register_browser_page(owner_page):
+                    nonlocal browser_page_count
+                    key = request_identity(owner_page)
+                    if key in browser_page_keys:
+                        return
+                    browser_page_count += 1
+                    page_key = f"page-{browser_page_count}"
+                    browser_page_keys[key] = page_key
+                    browser_pages[page_key] = owner_page
+                    popup_origins[key] = (active_route_id, active_route_activation_id, observation_phase)
+                    owner_page.on("websocket", record_websocket)
+                    owner_page.on("download", record_download)
+                    owner_page.on("framenavigated", record_frame_navigation)
+
+                def schedule_popup(popup, owner=None):
+                    if getattr(popup, "_portal_validator_page_limit_blocked", False):
+                        return
+                    register_browser_page(popup)
+                    key = request_identity(popup)
+                    if getattr(popup, "_portal_validator_observed_popup", False):
+                        if owner is not None:
+                            popup_origins[key] = owner
+                        return
+                    popup._portal_validator_observed_popup = True
+                    popup_origins[key] = owner or (active_route_id, active_route_activation_id, observation_phase)
+                    task = asyncio.create_task(record_popup(popup))
+                    popup_tasks.add(task)
+                    task.add_done_callback(popup_tasks.discard)
+
+                def observe_context_page(owner_page):
+                    nonlocal popup_observation_failures
+                    if primary_page is not None and browser_page_count >= max(4, req.max_pages + 1):
+                        # Keep independent windows bounded by the configured
+                        # route ceiling, with minimal authentication headroom.
+                        owner_page._portal_validator_page_limit_blocked = True
+                        popup_observation_failures += 1
+                        task = asyncio.create_task(owner_page.close())
+                        popup_tasks.add(task)
+                        task.add_done_callback(popup_tasks.discard)
+                        log_event(logging.WARNING, "BROWSER_PAGE_LIMIT_REACHED", scan_id=scan_id,
+                                  maximum=max(4, req.max_pages + 1))
+                        return
+                    register_browser_page(owner_page)
+                    owner_page.on("popup", lambda child: schedule_popup(
+                        child, popup_origins.get(request_identity(owner_page)),
+                    ))
+                    # The very first context page is primary. Every later page
+                    # is discovered even when its opener event is unavailable.
+                    if primary_page is not None:
+                        schedule_popup(owner_page)
+
+                context.on("page", observe_context_page)
+                # Context observers see initial inline popup diagnostics before
+                # Playwright emits the Page event; per-page listeners are too late.
+                context.on("console", lambda message: record_console_error(message, message.page))
+                context.on("weberror", lambda error: record_page_error(error.error, error.page))
                 network_observation_started = time.perf_counter()
                 await context.route("**/*", route_guard)
                 page = await context.new_page()
+                primary_page = page
                 # CDP interception must be active before Chromium starts the
                 # first request. Installing it in a paused route misses that
                 # request's response and can deadlock frame-tree discovery.
                 await ensure_redirect_guard(page)
-                browser_page_count += 1
-                page.on("console", record_console_error)
-                page.on("pageerror", record_page_error)
-                page.on("websocket", record_websocket)
-                page.on("download", record_download)
-                page.on("framenavigated", record_frame_navigation)
-                def schedule_popup(popup, owner=None):
-                    nonlocal browser_page_count
-                    browser_page_count += 1
-                    owner = owner or (active_route_id, active_route_activation_id, observation_phase)
-                    popup_origins[request_identity(popup)] = owner
-                    popup.on("popup", lambda child: schedule_popup(child, owner))
-                    task = asyncio.create_task(record_popup(popup))
-                    popup_tasks.add(task)
-                    task.add_done_callback(popup_tasks.discard)
-                page.on("popup", schedule_popup)
                 if refresh_config is not None:
                     refresh_started = time.perf_counter()
                     current_tracker = NavigationTracker(req.max_redirects)
@@ -2134,6 +2336,9 @@ async def execute_scan(
                     active_route_id = route_key if view_control else sanitized_url(route_identity)
                     active_view_source = url if view_control else None
                     active_route_activation_id = f"activation-{len(results) + 1}"
+                    selected_page_key = route_page_keys.get(route_key)
+                    page = browser_pages.get(selected_page_key, primary_page)
+                    active_browser_page_key = browser_page_keys.get(request_identity(page))
                     await publish_progress(
                         "VALIDATING",
                         discovered=len(discovered_routes),
@@ -2156,23 +2361,26 @@ async def execute_scan(
                     navigation_hosts.clear()
                     # Session/authentication evidence belongs to the shared browser
                     # context, not a single tab. Do not erase it between SPA routes.
-                    latest_document_response = None
+                    latest_document_response = (
+                        document_response_for(page)
+                        if navigation_mode == POPUP_NAVIGATION else None
+                    )
                     observation_phase = (
                         "APPLICATION_BOOTSTRAP"
                         if not results and depth == 0
                         else "ROUTE_VALIDATION"
                     )
+                    popup_origins[request_identity(page)] = (
+                        active_route_id, active_route_activation_id, observation_phase,
+                    )
+                    adopt_page_observations(page)
                     requested_url = sanitized_url(url)
                     requested_host = normalized_host(urlparse(url).hostname or "")
                     final_url: str | None = None
                     final_raw_url = url
-                    console_start = len(console_errors)
-                    page_error_start = len(page_errors)
                     websocket_start = len(websocket_events)
                     event_stream_start = len(event_streams)
                     download_start = len(download_events)
-                    frame_event_start = len(frame_events)
-                    popup_start = len(popup_routes)
                     started = time.perf_counter()
                     route_deadline = min(deadline, started + (req.per_route_timeout_ms or req.timeout_ms) / 1000)
                     status: int | None = None
@@ -2192,6 +2400,8 @@ async def execute_scan(
                     application_ready = False
                     dom_target = page
                     auth_settle: dict[str, object] = {"stage": "NOT_TESTED", "completed": False}
+                    browser_lifecycle = BrowserLifecycle()
+                    browser_lifecycle.advance("INITIAL_NAVIGATION")
                     name_evidence = {"primary_heading": "", "breadcrumb": ""}
                     navigation_actions = {"activated": 0, "skipped": 0}
                     route_discovery_ms = 0
@@ -2205,6 +2415,7 @@ async def execute_scan(
                     if remaining_ms == 0:
                         error = "Total scan timeout exceeded"
                         error_classification = "TIMEOUT"
+                        browser_lifecycle.fail("TIMEOUT")
                     else:
                         log_event(
                             logging.INFO,
@@ -2223,6 +2434,12 @@ async def execute_scan(
                         try:
                             async with asyncio.timeout_at(route_deadline):
                                 dom_target = resolve_view_target(page, view_control)
+                                semantic_popup = None
+
+                                async def select_semantic_popup(popup):
+                                    nonlocal semantic_popup
+                                    semantic_popup = popup
+
                                 response, route_transition_succeeded, activation_method = await perform_route_navigation(
                                     page,
                                     url,
@@ -2231,10 +2448,26 @@ async def execute_scan(
                                     label=route_label,
                                     source=route_source,
                                     view_control=view_control,
+                                    on_popup=select_semantic_popup,
                                 )
+                                if semantic_popup is not None:
+                                    page = semantic_popup
+                                    dom_target = page
+                                    active_browser_page_key = browser_page_keys.get(request_identity(page))
+                                    route_page_keys[route_key] = active_browser_page_key
+                                    popup_origins[request_identity(page)] = (
+                                        active_route_id, active_route_activation_id, observation_phase,
+                                    )
+                                    latest_document_response = document_response_for(page)
+                                    adopt_page_observations(page)
+                                if navigation_mode == POPUP_NAVIGATION or semantic_popup is not None:
+                                    response = latest_document_response
+                                    if response is None:
+                                        raise RuntimeError("Observed popup has no captured main-document HTTP response")
                                 navigation_ms = round((time.perf_counter() - started) * 1000)
                                 navigation_policy_ms = navigation_policy_time_ms(started, time.perf_counter())
                                 navigation_duration_ms += navigation_ms
+                                browser_lifecycle.advance("AUTHENTICATING")
                                 auth_settle = await settle_authentication_navigation(
                                     page,
                                     in_portal_scope=lambda candidate: url_in_scan_scope(
@@ -2390,6 +2623,14 @@ async def execute_scan(
                                         final_url=final_raw_url,
                                     )
                                 log_event(logging.INFO, "PAGE_VALIDATION_STARTED", scan_id=scan_id, final_url=final_raw_url)
+                                if authentication_classification == "PASS":
+                                    # A stable scoped document plus absence of
+                                    # login/MFA evidence establishes the session;
+                                    # rendered application readiness is separate.
+                                    browser_lifecycle.advance("SESSION_ESTABLISHED")
+                                    browser_lifecycle.advance("APPLICATION_BOOTSTRAP")
+                                else:
+                                    browser_lifecycle.fail(authentication_classification or "AUTHENTICATION_INCOMPLETE")
                                 render_start_ms = round((time.perf_counter() - started) * 1000)
                                 readiness_started = time.perf_counter()
                                 readiness_deadline = min(
@@ -2433,6 +2674,7 @@ async def execute_scan(
                                     and application_shell_ready(render_health)
                                 )
                                 if application_ready:
+                                    browser_lifecycle.advance("APPLICATION_READY")
                                     # Bootstrap headings/titles may still describe a
                                     # loading surface immediately after navigation.
                                     # Name the rendered destination, not that placeholder.
@@ -2440,6 +2682,12 @@ async def execute_scan(
                                         await retry_dom_operation(dom_target, dom_target.title), limit=512,
                                     )
                                     name_evidence = await collect_route_name_evidence(dom_target)
+                                elif authentication_classification != "PASS":
+                                    browser_lifecycle.fail(
+                                        authentication_classification or "AUTHENTICATION_INCOMPLETE", stage="AUTHENTICATING",
+                                    )
+                                else:
+                                    browser_lifecycle.fail("APPLICATION_NOT_READY")
                                 log_event(
                                     logging.INFO if application_ready else logging.WARNING,
                                     "APPLICATION_SHELL_READY" if application_ready else "APPLICATION_SHELL_NOT_READY",
@@ -2493,6 +2741,7 @@ async def execute_scan(
                                     and application_ready
                                 ):
                                     observation_phase = "DISCOVERY"
+                                    browser_lifecycle.advance("ROUTE_DISCOVERY")
                                     discovery_started = time.perf_counter()
                                     await publish_progress(
                                         "DISCOVERING",
@@ -2569,7 +2818,7 @@ async def execute_scan(
                                                 on_routes_discovered=retain_panel_routes,
                                             )
                                             frame_routes = list(frame_actions.pop("routes", []))
-                                            for metric in ("activated", "skipped", "inspected", "remaining", "discovered", "unresolved", "view_controls"):
+                                            for metric in ("activated", "skipped", "inspected", "remaining", "discovered", "unresolved", "view_controls", "menus_expanded"):
                                                 navigation_actions[metric] = int(navigation_actions.get(metric, 0)) + int(frame_actions.get(metric, 0))
                                             navigation_actions["limit_reached"] = bool(
                                                 navigation_actions.get("limit_reached") or frame_actions.get("limit_reached")
@@ -2581,7 +2830,20 @@ async def execute_scan(
                                             navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + 1
                                             continue
                                         discovered.extend(frame_routes)
-                                    discovered.extend(popup_routes[popup_start:])
+                                    # A popup may finish after a route's early
+                                    # collection window. Retain every observed
+                                    # page; ordinary route deduplication applies.
+                                    if popup_tasks:
+                                        _, pending_popups = await asyncio.wait(
+                                            tuple(popup_tasks), timeout=max(0, route_deadline - time.perf_counter()),
+                                        )
+                                        if pending_popups:
+                                            navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + len(pending_popups)
+                                    discovered.extend(popup_routes)
+                                    new_popup_failures = popup_observation_failures - accounted_popup_observation_failures
+                                    accounted_popup_observation_failures = popup_observation_failures
+                                    navigation_actions["popup_observation_failures"] = new_popup_failures
+                                    navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + new_popup_failures
                                     unique_discovered: dict[str, DiscoveredRoute] = {}
                                     for route in discovered:
                                         identity = normalize_route_url(
@@ -2612,6 +2874,7 @@ async def execute_scan(
                                     observation_phase = "ROUTE_VALIDATION"
                         except Exception as exc:
                             if isinstance(exc, TimeoutError) and observation_phase == "DISCOVERY":
+                                browser_lifecycle.fail("DISCOVERY_TIMEOUT")
                                 # The document already loaded. Exhausting a
                                 # menu's observation budget is incomplete
                                 # discovery, not a main-document load failure.
@@ -2623,6 +2886,7 @@ async def execute_scan(
                                 log_event(logging.WARNING, "ROUTE_DISCOVERY_TIMEOUT", scan_id=scan_id,
                                           current_route=active_route_id, queued=len(queue))
                             elif isinstance(exc, PlaywrightError) and observation_phase == "DISCOVERY":
+                                browser_lifecycle.fail("DISCOVERY_FAILED")
                                 # The document loaded successfully. A persistent
                                 # browser/DOM discovery failure must be visible,
                                 # not silently healthy or a fabricated load failure.
@@ -2660,6 +2924,11 @@ async def execute_scan(
                                 )
                                 if active_route_activation_id in authentication_denials:
                                     authentication_classification = "AUTHENTICATION_BLOCKED"
+                                browser_lifecycle.fail(
+                                    authentication_classification
+                                    if authentication_classification not in {None, "PASS"}
+                                    else error_classification or "NAVIGATION_ERROR",
+                                )
                                 log_event(
                                     logging.ERROR,
                                     error_classification,
@@ -2685,6 +2954,8 @@ async def execute_scan(
                         )
 
                     health_validation_started = time.perf_counter()
+                    if browser_lifecycle.failed_stage is None:
+                        browser_lifecycle.advance("ROUTE_VALIDATION")
                     elapsed = round((time.perf_counter() - started) * 1000)
                     route_validation_ms = max(0, elapsed - route_discovery_ms)
                     performance_timing = route_performance_timing(
@@ -2695,10 +2966,12 @@ async def execute_scan(
                         render_start_ms=render_start_ms,
                     )
                     page_console = list(dict.fromkeys(
-                        console_errors[console_start:]
+                        event["message"] for event in console_errors
+                        if event.get("route_activation_id") == active_route_activation_id
                     )) if req.check_console else []
                     page_script_errors = list(dict.fromkeys(
-                        page_errors[page_error_start:]
+                        event["message"] for event in page_errors
+                        if event.get("route_activation_id") == active_route_activation_id
                     )) if req.check_console else []
                     page_failures = [
                         failure for failure in failed_resources
@@ -2733,7 +3006,7 @@ async def execute_scan(
                     page_websockets = websocket_events[websocket_start:] if req.check_resources else []
                     page_event_streams = event_streams[event_stream_start:] if req.check_resources else []
                     page_downloads = download_events[download_start:]
-                    page_frame_events = frame_events[frame_event_start:]
+                    page_frame_events = [event for event in frame_events if event.get("route_activation_id") == active_route_activation_id]
                     subresource_failures = sum(not failure["main_document"] for failure in page_failures)
                     unexpected_subresource_failures = sum(
                         not failure["main_document"] and not failure.get("blocked_by_validator")
@@ -2945,6 +3218,7 @@ async def execute_scan(
                     performance_timing["health_validation_ms"] = health_validation_ms
                     performance_timing["discovery_ms"] = route_discovery_ms
                     validation_duration_ms += route_validation_ms
+                    browser_lifecycle.advance("REPORT")
                     result = {
                         "route_id": active_route_id,
                         "view_type": "UI_TAB" if view_control else "URL_ROUTE",
@@ -3031,6 +3305,9 @@ async def execute_scan(
                             else "RENDER_NOT_READY"
                         ),
                         "authentication_observation": auth_settle,
+                        "browser_lifecycle": browser_lifecycle.snapshot(),
+                        "failed_lifecycle_stage": browser_lifecycle.failed_stage,
+                        "lifecycle_failure_reason": browser_lifecycle.failure_reason,
                         "slow": req.check_performance and int(performance_timing["application_load_ms"]) > req.slow_page_threshold_ms,
                         "discovery_ms": route_discovery_ms,
                         "validation_ms": route_validation_ms,
@@ -3087,6 +3364,19 @@ async def execute_scan(
                         "AUTH_FAILED", "AUTH_TIMEOUT", "MFA_REQUIRED",
                     } or (len(results) == 1 and not application_ready)):
                         break
+                    if not queue and popup_tasks and req.check_links:
+                        _, pending_popups = await asyncio.wait(
+                            tuple(popup_tasks), timeout=max(0, min(
+                                (req.authentication_timeout_ms or req.timeout_ms) / 1000,
+                                deadline - time.perf_counter(),
+                            )),
+                        )
+                        enqueue_discovered_routes(popup_routes, depth, final_raw_url)
+                        if pending_popups:
+                            navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + len(pending_popups)
+                            navigation_actions["popup_observation_pending"] = len(pending_popups)
+                            result["navigation_controls_unresolved"] += len(pending_popups)
+                            result["discovery_limitations"] += len(pending_popups)
                     if time.perf_counter() >= deadline:
                         total_timeout_reached = bool(queue)
                         break
@@ -3116,6 +3406,33 @@ async def execute_scan(
                     cancellation_requested = True
                 log_event(logging.INFO, "NETWORK_OBSERVATION_DRAIN_COMPLETED",
                           scan_id=scan_id, **network_drain)
+                # Pages created by a late background response must not be
+                # cancelled by teardown and then silently called full coverage.
+                # This bounded final window records real unvisited destinations;
+                # it does not extend the scan or replay their requests.
+                pending_popups = set()
+                if popup_tasks:
+                    _, pending_popups = await asyncio.wait(
+                        tuple(popup_tasks), timeout=max(0, min(
+                            (req.authentication_timeout_ms or req.timeout_ms) / 1000,
+                            deadline - time.perf_counter(),
+                        )),
+                    )
+                before_late_routes = len(discovered_routes)
+                if req.check_links and results:
+                    enqueue_discovered_routes(popup_routes, depth, final_raw_url)
+                late_count = len(discovered_routes) - before_late_routes
+                new_popup_failures = popup_observation_failures - accounted_popup_observation_failures
+                if pending_popups or late_count or new_popup_failures:
+                    late_navigation_observed = True
+                    if results:
+                        missing = len(pending_popups) + late_count + new_popup_failures
+                        results[-1]["navigation_controls_unresolved"] += missing
+                        results[-1]["discovery_limitations"] += missing
+                        results[-1]["navigation_actions"]["late_popup_observations"] = missing
+                        results[-1]["navigation_actions"]["popup_observation_failures"] = (
+                            int(results[-1]["navigation_actions"].get("popup_observation_failures", 0)) + new_popup_failures
+                        )
                 # Freeze before closing: context.close() aborts outstanding
                 # requests, which is not evidence of a target-side failure.
                 finalize_resource_observations()
@@ -3159,7 +3476,17 @@ async def execute_scan(
             resource_failures=[failure for failure in failed_resources
                                if failure.get("route_activation_id") == result.get("route_activation_id")]
             if req.check_resources else None,
+            console_errors=list(dict.fromkeys(
+                event["message"] for event in console_errors
+                if event.get("route_activation_id") == result.get("route_activation_id")
+            )) if req.check_console else None,
+            page_errors=list(dict.fromkeys(
+                event["message"] for event in page_errors
+                if event.get("route_activation_id") == result.get("route_activation_id")
+            )) if req.check_console else None,
         ))
+        result["frame_navigations"] = [event for event in frame_events
+                                       if event.get("route_activation_id") == result.get("route_activation_id")]
         canonical = str(result.get("route_id") or result.get("canonical_route") or "")
         provenance = route_provenance.get(canonical)
         if provenance:
@@ -3181,6 +3508,8 @@ async def execute_scan(
         termination_reason = "MAX_DEPTH_REACHED"
     elif action_limited_routes:
         termination_reason = "MAX_NAVIGATION_ACTIONS_REACHED"
+    elif late_navigation_observed:
+        termination_reason = "LATE_NAVIGATION_OBSERVED"
     else:
         termination_reason = "DISCOVERY_EXHAUSTED"
     if termination_reason != "DISCOVERY_EXHAUSTED":
@@ -3466,6 +3795,7 @@ async def execute_scan(
     report = {
         "report_schema_version": REPORT_SCHEMA_VERSION,
         "validator_version": VALIDATOR_VERSION,
+        "build_identity": build_diagnostics(),
         "scan_id": scan_id,
         "run_id": scan_id,
         "target": sanitized_url(req.target),
@@ -3474,6 +3804,7 @@ async def execute_scan(
         "results": results,
         "route_inventory": route_inventory,
         "navigation_coverage": navigation_coverage(results, summary, route_inventory),
+        "coverage_dimensions": build_coverage_dimensions(results, summary),
         "api_inventory": api_inventory,
         "api_request_occurrences": [
             {

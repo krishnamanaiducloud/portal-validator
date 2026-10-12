@@ -179,6 +179,18 @@ class RouteNetworkActivity:
         route_id = self._pending.pop(key)
         self._touch(route_id)
 
+    def reassign_request(self, request: Any, route_id: str | None) -> bool:
+        """Transfer pending popup bootstrap ownership without issuing traffic."""
+        key = request_identity(request)
+        if key not in self._pending:
+            return False
+        previous = self._pending[key]
+        if previous != route_id:
+            self._pending[key] = route_id
+            self._touch(previous)
+            self._touch(route_id)
+        return True
+
     def snapshot(self, route_id: str | None) -> dict[str, int | float]:
         return {
             "generation": self._generation.get(route_id, 0),
@@ -649,6 +661,10 @@ class PassiveNetworkObserver:
         # Weak object keys preserve identity without keeping raw Request objects
         # (which contain headers/bodies) alive for the duration of a scan.
         self._events_by_request: weakref.WeakKeyDictionary[Any, dict[str, Any]] = weakref.WeakKeyDictionary()
+        self._source_ids: dict[str, weakref.WeakKeyDictionary[Any, str]] = {
+            "page": weakref.WeakKeyDictionary(), "frame": weakref.WeakKeyDictionary(),
+        }
+        self._source_sequences = {"page": 0, "frame": 0}
         self._sequence = 0
         self._finalized = False
 
@@ -669,13 +685,17 @@ class PassiveNetworkObserver:
         key = self._request_key(request)
         existing = self._events_by_request.get(key)
         if existing is not None:
+            if not self._finalized:
+                self._enrich_source_ids(existing, request)
             return existing
         if self._finalized:
             raise RuntimeError("Network observation has been finalized")
         method = str(request.method).upper()
         self._sequence += 1
         safe_url, host, endpoint = safe_api_identity(str(request.url))
+        source_page_id = source_frame_id = None
         try:
+            source_frame_id = self._source_id("frame", request.frame)
             frame_identity = (
                 "MAIN_FRAME" if request.frame.parent_frame is None else "CHILD_FRAME"
             )
@@ -691,6 +711,12 @@ class PassiveNetworkObserver:
         except Exception:
             frame_identity = "UNKNOWN_FRAME"
             initiator = {"kind": "UNAVAILABLE", "origin": None}
+        try:
+            source_page_id = self._source_id("page", request.frame.page)
+        except Exception:
+            # Initial popup requests and service workers may have no frame yet.
+            # An unknown source is safer than assigning another page's identity.
+            pass
         event: dict[str, Any] = {
             "request_id": f"request-{self._sequence}",
             "url": safe_url,
@@ -725,6 +751,8 @@ class PassiveNetworkObserver:
             "serialized_to_report": False,
             "main_document": main_document,
             "frame_identity": frame_identity,
+            "source_page_id": source_page_id,
+            "source_frame_id": source_frame_id,
             "initiator": initiator,
             "request_classification": "SAFE_METHOD" if method in SAFE_HTTP_METHODS else "UNKNOWN",
             "policy_classification": "SAFE_METHOD" if method in SAFE_HTTP_METHODS else "UNKNOWN",
@@ -757,13 +785,17 @@ class PassiveNetworkObserver:
         if self._finalized:
             return None
         event = self._events_by_request.get(self._request_key(request))
-        if event is None:
+        if event is None or event.get("blocked_by_validator"):
             return None
         event["request_classification"] = classification
         event["policy_classification"] = public_policy_classification(classification)
         event["allowed_by_policy"] = True
-        event["lifecycle"] = "ALLOWED"
-        event["lifecycle_status"] = "ALLOWED"
+        # Policy callbacks can arrive after native redirect response callbacks.
+        # Enrich the decision without undoing response/terminal evidence.
+        if event.get("lifecycle") in {"REQUESTED", "ALLOWED"}:
+            event["lifecycle"] = "ALLOWED"
+        if event.get("lifecycle_status") in {"OBSERVED", "ALLOWED"}:
+            event["lifecycle_status"] = "ALLOWED"
         event.update(policy_evaluated=True, policy_decision="ALLOW", policy_reason=classification)
         if phase is not None:
             event["phase"] = phase
@@ -818,23 +850,32 @@ class PassiveNetworkObserver:
         event = self._events_by_request.get(self._request_key(request))
         if event is None or event.get("lifecycle") == "BLOCKED":
             return event
-        if event.get("lifecycle") == "RESPONSE":
+        self._enrich_source_ids(event, request)
+        if event.get("response_seen"):
             return event
         if event.get("request_classification") == "UNKNOWN":
             event["request_classification"] = "APPLICATION_REQUEST"
+        failed = bool(event.get("request_failed"))
+        completed = bool(event.get("request_finished_seen")) and not failed
         event.update({
             "status": int(status),
             "target_reached": True,
-            "lifecycle": "RESPONSE",
-            "lifecycle_status": "RESPONDED",
-            "duration_ms": self._duration(event),
+            "lifecycle": "FAILED" if failed else "RESPONSE",
+            "lifecycle_status": (
+                "CANCELED" if failed and event.get("request_canceled") else
+                "FAILED" if failed else "COMPLETED" if completed else "RESPONDED"
+            ),
+            "duration_ms": event.get("duration_ms") if completed else self._duration(event),
             "request_reached_network": True,
             # Native redirect hops bypass context.route(). Their response is
             # positive dispatch evidence, not a route-handler/policy approval.
             "request_dispatched": True,
             "response_seen": True,
             "response_status": int(status),
+            "response_completed": completed,
         })
+        if failed and not event.get("request_canceled"):
+            event["failure_category"] = "RESPONSE_BODY_FAILURE"
         event["post_classifications"] = classify_post_observation(event)
         return event
 
@@ -891,7 +932,7 @@ class PassiveNetworkObserver:
         if self._finalized:
             return
         event = self._events_by_request.get(self._request_key(request))
-        if event is None or not event.get("response_seen") or event.get("blocked_by_validator") or event.get("request_failed"):
+        if event is None or event.get("blocked_by_validator") or event.get("request_failed"):
             return
         try:
             response_end = request.timing.get("responseEnd")
@@ -901,6 +942,14 @@ class PassiveNetworkObserver:
             round(response_end) if isinstance(response_end, (int, float)) and response_end >= 0
             else self._duration(event)
         )
+        event["request_finished_seen"] = True
+        event["request_dispatched"] = True
+        if not event.get("response_seen"):
+            # Retain callback evidence if headers are delivered later. Do not
+            # fabricate a status or completed response before it is correlated.
+            if event.get("lifecycle_status") in {"OBSERVED", "ALLOWED"}:
+                event["lifecycle_status"] = "SENT"
+            return
         event["response_completed"] = True
         event["lifecycle_status"] = "COMPLETED"
 
@@ -933,6 +982,43 @@ class PassiveNetworkObserver:
         # request. The implementation's identity is stable throughout its
         # lifecycle; the weak key does not retain its sensitive raw contents.
         return request_identity(request)
+
+    def _source_id(self, kind: str, source: Any) -> str | None:
+        """Per-scan ordinals identify pages/frames without exposing their URLs."""
+        key = request_identity(source)
+        identities = self._source_ids[kind]
+        try:
+            existing = identities.get(key)
+            if existing is None:
+                self._source_sequences[kind] += 1
+                existing = f"{kind}-{self._source_sequences[kind]}"
+                identities[key] = existing
+            return existing
+        except TypeError:
+            # Lightweight adapters need not support weak references.
+            return None
+
+    def _enrich_source_ids(self, event: dict[str, Any], request: Any) -> None:
+        # The first popup document request may arrive before Playwright attaches
+        # a Frame/Page. Fill previously unknown source IDs when headers arrive;
+        # never overwrite an already established owner or retain raw objects.
+        try:
+            frame = request.frame
+            if event.get("source_frame_id") is None:
+                event["source_frame_id"] = self._source_id("frame", frame)
+            if event.get("frame_identity") == "UNKNOWN_FRAME":
+                event["frame_identity"] = "MAIN_FRAME" if frame.parent_frame is None else "CHILD_FRAME"
+            if event.get("source_page_id") is None:
+                event["source_page_id"] = self._source_id("page", frame.page)
+            if event.get("initiator", {}).get("kind") == "UNAVAILABLE":
+                origin = urlparse(str(frame.url))._replace(path="", params="", query="", fragment="")
+                event["initiator"] = {
+                    "kind": "BROWSER_FRAME",
+                    "origin": sanitize_url(origin.geturl(), include_path=False)
+                    if origin.scheme in {"http", "https"} else None,
+                }
+        except Exception:
+            pass
 
     @staticmethod
     def _duration(event: dict[str, Any]) -> int | None:

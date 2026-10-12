@@ -125,6 +125,9 @@ class DiscoveredRoute:
     accessible_name: str | None = None
     view_control: dict[str, str] | None = None
     navigation_hierarchy: tuple[str, ...] = ()
+    # Scan-local lookup only: never serialize a browser handle or profile state.
+    browser_page_key: str | None = None
+    opener_route_id: str | None = None
 
 
 def discovered_route_key(route: DiscoveredRoute, canonical_url: str) -> str:
@@ -583,6 +586,10 @@ async (maximumScrolls) => {
   const baselinePanels = window.__portalValidatorBaselinePanels || new Set();
   const rememberBaseline = !window.__portalValidatorBaselinePanels;
   window.__portalValidatorBaselinePanels = baselinePanels;
+  // A persistent global tab is one view even when a sibling hash route
+  // changes location. Recreated controls in another rendered route retain
+  // that route's own context; no random DOM identifier enters the identity.
+  window.__portalValidatorViewSourceUrls ||= new WeakMap();
   const collect = () => {
     for (const root of navigationRoots()) {
       // Panels are real UI views, not invented HTTP/hash routes. Discover
@@ -603,7 +610,9 @@ async (maximumScrolls) => {
         const key = 'view:' + panel;
         if (seen.has(key)) continue;
         seen.add(key);
-        values.push({url: window.location.href, label, source:'ui-tab',
+        if (!window.__portalValidatorViewSourceUrls.has(element))
+          window.__portalValidatorViewSourceUrls.set(element, window.location.href);
+        values.push({url: window.__portalValidatorViewSourceUrls.get(element), label, source:'ui-tab',
           accessibleName:ariaLabel, labelSource:ariaLabel ? 'aria-label' : 'visible-text',
           safetyLabel:[ariaLabel, element.textContent, element.getAttribute('title')].filter(Boolean).join(' '),
           navigationHierarchy:navigationParents(element), viewControl:view});
@@ -791,6 +800,11 @@ async def _expand_one_menu(page, reset: bool, timeout_ms: int) -> dict[str, Any]
             if not ((revealed["expanded"] and not before["expanded"]) or
                     (revealed["panelVisible"] and not before["panelVisible"])):
                 await element.click(timeout=timeout_ms)
+                revealed = await element.evaluate(MENU_REVEALED_SCRIPT)
+            result["menus_expanded"] = int(
+                (revealed["expanded"] and not before["expanded"]) or
+                (revealed["panelVisible"] and not before["panelVisible"])
+            )
         except Exception as error:
             if not context_replacement_error(error):
                 raise
@@ -922,8 +936,8 @@ async def expand_safe_navigation(
     prevents a slow lazy menu from being mistaken for an exhausted route set,
     without inventing a second timeout or weakening read-only interception.
     """
-    maximum = max(0, min(int(maximum), 50))
-    totals: dict[str, object] = {"activated": 0, "skipped": 0, "inspected": 0, "routes": []}
+    maximum = max(0, min(int(maximum), 1500))
+    totals: dict[str, object] = {"activated": 0, "skipped": 0, "inspected": 0, "menus_expanded": 0, "routes": []}
     routes: list[DiscoveredRoute] = []
     # Collect the initially open panel as well as every subsequently opened
     # panel. A final-document-only snapshot loses accordion/tab branches.
@@ -932,7 +946,7 @@ async def expand_safe_navigation(
         await on_routes_discovered(routes.copy())
     while int(totals["activated"]) < maximum and int(totals["inspected"]) < max(25, maximum * 5):
         result = await _expand_one_menu(page, reset=int(totals["inspected"]) == 0, timeout_ms=timeout_ms)
-        for key in ("activated", "skipped", "inspected"):
+        for key in ("activated", "skipped", "inspected", "menus_expanded"):
             totals[key] = int(totals[key]) + int(result.get(key, 0))
         transition_routes: list[DiscoveredRoute] = []
         for item in result.get("transitions", []):
@@ -1184,6 +1198,7 @@ async def perform_route_navigation(
     label: str | None = None,
     source: str | None = None,
     view_control: dict[str, str] | None = None,
+    on_popup: Callable[[Any], Awaitable[None]] | None = None,
 ):
     """Navigate a document or transition an existing SPA document.
 
@@ -1198,7 +1213,14 @@ async def perform_route_navigation(
             return None, True, "SAME_ORIGIN_FRAME_UI_CONTROL"
         response = None
         if normalize_route_url(page.url) != normalize_route_url(url):
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            current, target = urlsplit(page.url), urlsplit(url)
+            if (current.scheme, current.netloc, current.path, current.query) == (
+                target.scheme, target.netloc, target.path, target.query,
+            ):
+                await page.evaluate(SAME_DOCUMENT_TRANSITION_SCRIPT, {"target": url, "mode": HASH_ROUTE_TRANSITION})
+                await page.wait_for_function("target => location.href === target", arg=url, timeout=timeout_ms)
+            else:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             if response is not None:
                 # Returning from a history-based panel may reload the source
                 # document. Capture its initially selected panel BEFORE the
@@ -1209,22 +1231,103 @@ async def perform_route_navigation(
         return response, True, "UI_TAB_CONTROL"
     if mode == SEMANTIC_LINK_NAVIGATION:
         responses = []
+        popups = []
+        navigation_observed = asyncio.Event()
+        document_ready = asyncio.Event()
+        committed_response = None
+        ready_response = None
 
         def document_response(response):
             if response.request.is_navigation_request() and response.frame == page.main_frame:
                 responses.append(response)
+                document_ready.clear()
+                navigation_observed.set()
+
+        def observe_popup(popup):
+            popups.append(popup)
+            navigation_observed.set()
+
+        def document_committed(frame):
+            nonlocal committed_response
+            if frame == page.main_frame and responses:
+                committed_response = responses[-1]
+
+        def document_loaded():
+            nonlocal ready_response
+            # A second navigation can receive headers before the preceding
+            # document's DOMContentLoaded. Never reuse that older document's
+            # readiness for a response that has not committed yet.
+            if responses and committed_response is responses[-1]:
+                ready_response = committed_response
+                document_ready.set()
+
+        async def completed_document():
+            # Response headers precede document commit. Observe the NEW
+            # document's readiness rather than reading the old page's already
+            # satisfied load state. This also supports same-URL reloads.
+            deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+            try:
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise TimeoutError("Document readiness deadline expired")
+                    await asyncio.wait_for(document_ready.wait(), timeout=remaining)
+                    if ready_response is responses[-1]:
+                        return ready_response, False, "SEMANTIC_CONTROL"
+            except TimeoutError as exc:
+                raise RuntimeError("Semantic document navigation did not reach DOMContentLoaded") from exc
 
         page.on("response", document_response)
+        page.on("popup", observe_popup)
+        page.on("framenavigated", document_committed)
+        page.on("domcontentloaded", document_loaded)
         try:
             before_url = page.url
             activated = await activate_semantic_route(page, url, label=label, source=source, timeout_ms=timeout_ms)
             if activated:
                 # A real click preserves router handlers and their natural API
                 # traffic. Never replay a request or synthesize an HTTP status.
+                if not responses and not popups:
+                    # A popup event is delivered after its first response,
+                    # which can be later than click() returning. Waiting only
+                    # for the opener URL falsely times out successful windows.
+                    movement = asyncio.create_task(retry_dom_operation(
+                        page, lambda: page.wait_for_function(
+                            "previous => window.location.href !== previous",
+                            arg=before_url, timeout=timeout_ms,
+                        ), timeout_ms=timeout_ms,
+                    ))
+                    observed = asyncio.create_task(navigation_observed.wait())
+                    try:
+                        done, _ = await asyncio.wait(
+                            (movement, observed), timeout=timeout_ms / 1000,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if not done:
+                            raise TimeoutError("Semantic link produced no observed document, popup or route transition")
+                        if movement in done and not navigation_observed.is_set():
+                            movement.result()
+                    except TimeoutError as exc:
+                        # Both observer and DOM deadlines mean the same thing:
+                        # this single click produced no proven navigation. Do
+                        # not retry it or mislabel it as the outer route budget.
+                        raise RuntimeError(
+                            "Semantic link produced no observed document, popup or route transition"
+                        ) from exc
+                    finally:
+                        for task in (movement, observed):
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(movement, observed, return_exceptions=True)
                 if responses:
-                    return responses[-1], False, "SEMANTIC_CONTROL"
-                if before_url == url:
-                    raise RuntimeError("Semantic link did not produce a document or route transition")
+                    return await completed_document()
+                if popups:
+                    if len(popups) != 1 or on_popup is None:
+                        raise RuntimeError("Semantic navigation opened a window without a unique approved inspection target")
+                    popup = popups[0]
+                    await popup.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+                    await on_popup(popup)
+                    return None, False, "POPUP_DOCUMENT"
                 await page.wait_for_function(
                     # HTTP redirects may commit only the final URL, never the
                     # requested href. Wait for real movement, then retain any
@@ -1236,11 +1339,21 @@ async def perform_route_navigation(
                 if responses:
                     # A handler may schedule a real document navigation after
                     # click() returns. Preserve its observed HTTP/TLS evidence.
-                    await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-                    return responses[-1], False, "SEMANTIC_CONTROL"
+                    return await completed_document()
                 return None, True, "SEMANTIC_CONTROL"
         finally:
             page.remove_listener("response", document_response)
+            page.remove_listener("popup", observe_popup)
+            page.remove_listener("framenavigated", document_committed)
+            page.remove_listener("domcontentloaded", document_loaded)
+    if mode == POPUP_NAVIGATION:
+        # Its document was naturally opened by the application. Reloading it
+        # in the primary page loses window-local session/view state and can
+        # repeat authentication POSTs. The caller supplies the observed page.
+        if page.is_closed() or normalize_route_url(page.url) != normalize_route_url(url):
+            raise RuntimeError("Observed popup document is no longer available at its discovered destination")
+        await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        return None, False, "OBSERVED_POPUP_DOCUMENT"
     if mode in DOCUMENT_NAVIGATIONS:
         response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         if response is None:

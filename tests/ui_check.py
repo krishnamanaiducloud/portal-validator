@@ -25,6 +25,45 @@ async def main():
             if message.type == "error" else None,
         )
         await page.goto(base_url, wait_until="networkidle")
+        build_metadata = await page.evaluate("async () => (await fetch('/api/diagnostics/build', {cache:'no-store'})).json()")
+        assert build_metadata["version"] == "1.12.8"
+        assert await page.evaluate("loadedFrontendSha256") == build_metadata["frontend_sha256"]
+        assert await page.evaluate("loadedFrontendIntegrity.startsWith('sha256-')")
+        assert "Frontend matched" in await page.locator("#build-summary").text_content()
+        assert await page.locator("#build-mismatch").is_hidden()
+        await page.locator("#build-identity details > summary").click()
+        assert build_metadata["frontend_sha256"] in await page.locator("#build-details").text_content()
+        await page.evaluate("metadata => showBuildIdentity({...metadata, git_commit:null, build_timestamp:null, image_digest:null, source_integrity:{status:'UNVERIFIED',reason:'Local source metadata is unavailable.'}})", build_metadata)
+        assert "commit unknown" in await page.locator("#build-summary").text_content()
+        assert "Unknown" in await page.locator("#build-details").text_content()
+        assert await page.locator("#build-identity").get_attribute("data-status") == "UNVERIFIED"
+        await page.locator("#build-identity details > summary").click()
+        build_fixture = dict(build_metadata)
+
+        async def build_identity_fixture(route):
+            await route.fulfill(status=200, content_type="application/json", body=json.dumps(build_fixture))
+
+        await page.route("**/api/diagnostics/build", build_identity_fixture)
+        scan_attempts = []
+        page.on("request", lambda request: scan_attempts.append(request.url) if request.method == "POST" and request.url.endswith("/api/scans") else None)
+        await page.locator("#target").fill("portal.example.com")
+        for mismatch in ({"version": "0.0.0"}, {"frontend_sha256": "0" * 64}, {"source_integrity": {"status": "MISMATCH", "reason": "Synthetic source mismatch."}}):
+            build_fixture.clear()
+            build_fixture.update(build_metadata)
+            build_fixture.update(mismatch)
+            assert await page.evaluate("verifyBuildIdentity()") is False
+            assert await page.locator("#run-button").is_disabled()
+            assert await page.locator("#build-mismatch").is_visible()
+            await page.locator("#scan-form").evaluate("element => element.dispatchEvent(new Event('submit', {bubbles:true,cancelable:true}))")
+            await page.wait_for_function("() => buildIdentityCheck === null && !scanSubmissionPending")
+            assert scan_attempts == []
+            build_fixture.clear()
+            build_fixture.update(build_metadata)
+            assert await page.evaluate("verifyBuildIdentity()") is True
+            assert await page.locator("#run-button").is_enabled()
+        await page.unroute("**/api/diagnostics/build", build_identity_fixture)
+        await page.evaluate("verifyBuildIdentity()")
+        await page.locator("#target").fill("")
         assert await page.title() == "Portal Validator"
         assert await page.get_by_role(
             "heading", name="Know your portal. Route by route.",
@@ -39,6 +78,7 @@ async def main():
         assert await page.locator("#network-quiet").input_value() == "300"
         assert await page.locator("#slow-threshold").input_value() == "5000"
         assert await page.locator("#timeout").get_attribute("max") == "120000"
+        assert await page.locator("#navigation-actions").get_attribute("max") == "1500"
         assert await page.locator("#total-timeout").get_attribute("max") == "900000"
         assert await page.evaluate("phaseConfiguration()") == {}
         await page.locator("#scan-timing-settings > summary").click()
@@ -111,10 +151,12 @@ async def main():
                 post_requests_blocked:2,approved_read_only_post_endpoints:1,unverified_post_endpoints:2,
                 post_requests_without_completed_responses:3,unique_post_endpoints_reported:2},
               unique_apis:6,business_apis:1,security_recommendations:1,
-              api_requests_observed:15,api_responses_completed:10,api_requests_failed:1,
+              api_requests_observed:15,api_requests_allowed:10,api_requests_sent:10,api_requests_responded:10,api_responses_completed:10,api_http_failures:1,api_requests_failed:1,
               api_requests_blocked:5,api_requests_canceled:0,api_requests_incomplete:0,api_requests_not_actively_tested:15},
             coverage:{scan_completeness:'PARTIAL',termination_reason:'MAX_ROUTES_REACHED',routes_discovered:3,routes_validated:1,routes_not_tested:2,routes_remaining:2,
               navigation_controls_discovered:5,navigation_controls_activated:3,navigation_controls_unresolved:2,coverage_reasons:[{code:'NAVIGATION_CONTROLS_UNRESOLVED',count:2}]},
+            coverage_dimensions:{execution:{status:'COMPLETE',reason:'All admitted work finished.'},navigation:{status:'PARTIAL',reason:'Two controls could not be inspected.'},authentication:{status:'READY',reason:'The authorized application shell was rendered.'},api:{status:'PARTIAL',reason:'One observed request was blocked by policy.'}},
+            navigation_coverage:{menus_expanded:2,successful_views:1},
             api_inventory:[{method:'GET',host:'api.example.net',endpoint:'/health',calls:1,status_2xx:1,
               status_3xx:0,status_4xx:0,status_5xx:0,network_failures:0,route_count:1,
               allowed_calls:1,blocked_count:0,application_bootstrap_phase_count:1,authentication_phase_count:0,route_validation_phase_count:0,session_refresh_phase_count:0,
@@ -172,6 +214,13 @@ async def main():
         assert "total application coverage remains unknown" in await page.locator("#coverage").text_content()
         assert await page.locator('[data-navigation-metric="visited_views"]').text_content() == "1"
         assert await page.locator('[data-navigation-metric="unresolved_controls"]').text_content() == "2"
+        assert await page.locator('[data-navigation-metric="menus_expanded"]').text_content() == "2"
+        assert await page.locator('[data-navigation-metric="successful_views"]').text_content() == "1"
+        assert await page.locator('[data-coverage-dimension="execution"] strong').text_content() == "COMPLETE"
+        assert await page.locator('[data-coverage-dimension="navigation"] strong').text_content() == "PARTIAL"
+        assert await page.locator('[data-coverage-dimension="authentication"] strong').text_content() == "READY"
+        assert "blocked by policy" in await page.locator('[data-coverage-dimension="api"] p').text_content()
+        assert await page.locator("#api-lifecycle-api_http_failures").text_content() == "1"
         assert "NAVIGATION_CONTROLS_UNRESOLVED" in await page.locator("#navigation-coverage-limitations").text_content()
         await page.locator("#navigation-explorer > summary").click()
         assert "Operations" in await page.locator("#navigation-tree").text_content()
@@ -232,12 +281,16 @@ async def main():
           renderReport({...lastReport, route_inventory:[validated,
             {...validated,route_id:'queued-view',route_name:'Pending reports',classification:'NOT_TESTED',
               validation_status:'NOT_TESTED',page_load_status:'NOT_TESTED',status:null,
+              parent_route_name:'Reports',navigation_hierarchy:['Operations','Reports','Pending reports'],
               warning_reasons:[],failure_reason:'Maximum route limit reached before activation.'},
             {...validated,route_id:'skipped-view',route_name:'Skipped reports',classification:'SKIPPED',
               validation_status:'NOT_TESTED',page_load_status:'NOT_TESTED',status:null,
+              parent_route_name:'Reports',navigation_hierarchy:['Operations','Reports','Skipped reports'],
               warning_reasons:[],failure_reason:'Maximum discovery depth reached.'}]});
         }""")
         assert await page.locator("#result-list .route-row").count() == 3
+        assert await page.locator("#navigation-tree .navigation-view").count() == 3
+        assert await page.locator("#navigation-tree > li > details > ul > li:not(.navigation-view) > details > summary").all_text_contents() == ["Reports"]
         await page.locator("#result-filter").select_option("not-tested")
         assert await page.locator("#result-list .route-row").count() == 2
         assert "Maximum route limit reached" in await page.locator("#result-list").text_content()

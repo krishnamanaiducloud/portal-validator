@@ -13,35 +13,37 @@ from app.discovery import evaluate_dom
 RENDER_HEALTH_SCRIPT = r"""
 () => {
   const body = document.body;
-  const visible = body ? Array.from(body.querySelectorAll('*')).filter((element) => {
+  const roots = [document];
+  for (let index = 0; index < roots.length; index++) {
+    for (const element of roots[index].querySelectorAll('*')) {
+      if (element.shadowRoot) roots.push(element.shadowRoot);
+    }
+  }
+  const isVisible = (element) => {
     const style = getComputedStyle(element);
     const rect = element.getBoundingClientRect();
     return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
-  }) : [];
-  const text = (body?.innerText || '').replace(/\s+/g, ' ').trim();
-  const alertText = Array.from(document.querySelectorAll('[role="alert"], main h1, main h2'))
-    .filter((element) => {
-      const style = getComputedStyle(element);
-      return style.visibility !== 'hidden' && style.display !== 'none';
-    })
+  };
+  const all = (selector) => roots.flatMap(root => Array.from(root.querySelectorAll(selector)));
+  const visible = body ? all('*').filter(isVisible) : [];
+  // body.innerText alone omits open component shadow trees in Chromium.
+  // Only rendered component children contribute; hidden/script-only markup
+  // must not manufacture application readiness.
+  const text = [body?.innerText || '', ...roots.slice(1).flatMap(root =>
+    Array.from(root.children).filter(isVisible).map(element => element.innerText || ''))]
+    .join(' ').replace(/\s+/g, ' ').trim();
+  const alertText = all('[role="alert"], main h1, main h2')
+    .filter(isVisible)
     .map((element) => (element.textContent || '').replace(/\s+/g, ' ').trim())
     .join(' ').slice(0, 500);
-  const busy = Array.from(document.querySelectorAll('[aria-busy="true"], [role="progressbar"]'))
-    .filter((element) => {
-      const style = getComputedStyle(element);
-      return style.visibility !== 'hidden' && style.display !== 'none';
-    }).length;
-  const challenge = Array.from(document.querySelectorAll([
+  const busy = all('[aria-busy="true"], [role="progressbar"]').filter(isVisible).length;
+  const challenge = all([
     '[data-sitekey]',
     'iframe[src*="captcha" i]',
     'iframe[title*="captcha" i]',
     'iframe[title*="challenge" i]',
     '[aria-label*="captcha" i]'
-  ].join(','))).filter((element) => {
-    const style = getComputedStyle(element);
-    const rect = element.getBoundingClientRect();
-    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
-  }).length;
+  ].join(',')).filter(isVisible).length;
   return {
     ready_state: document.readyState,
     title: document.title.slice(0, 256),

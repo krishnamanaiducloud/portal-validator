@@ -1,5 +1,8 @@
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from playwright.async_api import ElementHandle, TimeoutError as PlaywrightTimeoutError, async_playwright
@@ -228,6 +231,145 @@ async def test_ambiguous_visible_tab_controls_fail_without_dispatching_a_click()
                 page, {"panel": "reports-panel", "label": "Reports"}, 1500,
             )
         assert await page.evaluate("window.activations || 0") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_url", [False, True])
+async def test_semantic_response_waits_for_new_document_even_on_same_url_reload(monkeypatch, same_url):
+    from app import discovery
+
+    listeners = {}
+    page = SimpleNamespace(
+        url="https://portal.example/",
+        main_frame=object(),
+        on=lambda event, callback: listeners.update({event: callback}),
+        remove_listener=lambda event, callback: listeners.pop(event),
+    )
+    response = SimpleNamespace(
+        request=SimpleNamespace(is_navigation_request=lambda: True),
+        frame=page.main_frame, status=200,
+    )
+    committed = False
+    readiness_task = None
+
+    async def activate(*args, **kwargs):
+        nonlocal readiness_task
+        listeners["response"](response)
+        ready_callback = listeners["domcontentloaded"]
+
+        async def commit_document():
+            nonlocal committed
+            await asyncio.sleep(0.02)
+            if not same_url:
+                page.url = "https://portal.example/final-document"
+            committed = True
+            listeners["framenavigated"](page.main_frame)
+            ready_callback()
+
+        readiness_task = asyncio.create_task(commit_document())
+        return True
+
+    activate_once = AsyncMock(side_effect=activate)
+    monkeypatch.setattr(discovery, "activate_semantic_route", activate_once)
+    try:
+        result = await perform_route_navigation(
+            page, "https://portal.example/reports", SEMANTIC_LINK_NAVIGATION, 1000,
+            label="Reports", source="a",
+        )
+        assert committed
+        assert result == (response, False, "SEMANTIC_CONTROL")
+        assert page.url == ("https://portal.example/" if same_url else "https://portal.example/final-document")
+        assert activate_once.await_count == 1
+        assert not listeners
+    finally:
+        if readiness_task is not None:
+            await readiness_task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_document_ready_before_headers", [False, True])
+async def test_semantic_successive_documents_cannot_reuse_earlier_readiness(monkeypatch, old_document_ready_before_headers):
+    from app import discovery
+
+    listeners = {}
+    page = SimpleNamespace(
+        url="https://portal.example/", main_frame=object(),
+        on=lambda event, callback: listeners.update({event: callback}),
+        remove_listener=lambda event, callback: listeners.pop(event),
+    )
+    responses = [SimpleNamespace(
+        request=SimpleNamespace(is_navigation_request=lambda: True),
+        frame=page.main_frame, status=200,
+    ) for _ in range(2)]
+    final_document_ready = False
+    readiness_task = None
+
+    async def activate(*args, **kwargs):
+        nonlocal readiness_task
+        listeners["response"](responses[0])
+        listeners["framenavigated"](page.main_frame)
+        if old_document_ready_before_headers:
+            listeners["domcontentloaded"]()
+        listeners["response"](responses[1])
+        if not old_document_ready_before_headers:
+            listeners["domcontentloaded"]()
+
+        async def commit_final_document():
+            nonlocal final_document_ready
+            await asyncio.sleep(0.02)
+            page.url = "https://portal.example/final-document"
+            listeners["framenavigated"](page.main_frame)
+            final_document_ready = True
+            listeners["domcontentloaded"]()
+
+        readiness_task = asyncio.create_task(commit_final_document())
+        return True
+
+    activate_once = AsyncMock(side_effect=activate)
+    monkeypatch.setattr(discovery, "activate_semantic_route", activate_once)
+    try:
+        result = await perform_route_navigation(
+            page, "https://portal.example/reports", SEMANTIC_LINK_NAVIGATION, 1000,
+            label="Reports", source="a",
+        )
+        assert final_document_ready
+        assert result == (responses[1], False, "SEMANTIC_CONTROL")
+        assert activate_once.await_count == 1
+        assert not listeners
+    finally:
+        if readiness_task is not None:
+            await readiness_task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deadline", ["observer", "movement"])
+async def test_semantic_no_transition_deadlines_share_single_click_failure_contract(monkeypatch, deadline):
+    from app import discovery
+
+    listeners = {}
+    page = SimpleNamespace(
+        url="https://portal.example/",
+        on=lambda event, callback: listeners.update({event: callback}),
+        remove_listener=lambda event, callback: listeners.pop(event),
+        wait_for_function=AsyncMock(side_effect=TimeoutError("DOM deadline expired")),
+    )
+    activate = AsyncMock(return_value=True)
+    monkeypatch.setattr(discovery, "activate_semantic_route", activate)
+    observed_tasks = []
+    if deadline == "observer":
+        async def observer_deadline(tasks, **kwargs):
+            observed_tasks.extend(tasks)
+            return set(), set(tasks)
+        monkeypatch.setattr(discovery.asyncio, "wait", observer_deadline)
+
+    with pytest.raises(RuntimeError, match="no observed document, popup or route transition"):
+        await perform_route_navigation(
+            page, "https://portal.example/reports", SEMANTIC_LINK_NAVIGATION, 1000,
+            label="Reports", source="a",
+        )
+    assert activate.await_count == 1
+    assert not listeners
+    assert all(task.done() for task in observed_tasks)
 
 
 @pytest.mark.asyncio

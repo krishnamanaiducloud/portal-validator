@@ -556,12 +556,14 @@ def classify_page_result(
 def refresh_route_api_health(
     result: dict[str, Any], events: list[dict[str, Any]],
     *, resource_failures: list[dict[str, Any]] | None = None,
+    console_errors: list[str] | None = None, page_errors: list[str] | None = None,
 ) -> dict[str, Any]:
     """Reconcile late responses onto their original route without re-navigation.
 
     Context-wide observation continues after one route's snapshot. Rebuild only
     its API findings from the final event stream; preserve document, auth, TLS,
-    render, resource and performance evidence exactly as originally evaluated.
+    render and performance evidence exactly as originally evaluated. Optional
+    final resource/console inputs replace only their corresponding findings.
     The caller supplies events attributed to this route activation, not a slice
     of requests that happened to finish while another route was being scanned.
     """
@@ -574,11 +576,13 @@ def refresh_route_api_health(
         item for item in result.get("finding_details", [])
         if not str(item.get("type") or "").startswith("API_")
         and (resource_failures is None or item.get("type") not in replaced_types)
+        and (console_errors is None or item.get("type") != "CONSOLE_ERROR")
+        and (page_errors is None or item.get("type") != "PAGE_SCRIPT_ERROR")
     ]
     final_resource_findings = build_findings(
         classification="PASS", status=None, error=None, missing_security_headers=[],
-        console_errors=[], page_errors=[], failed_resources=resource_failures,
-    ) if resource_failures is not None else []
+        console_errors=console_errors or [], page_errors=page_errors or [], failed_resources=resource_failures or [],
+    ) if any(value is not None for value in (resource_failures, console_errors, page_errors)) else []
     items = deduplicate_findings([
         *retained_findings,
         *final_resource_findings,
@@ -671,6 +675,15 @@ def refresh_route_api_health(
                 else "PASS" if loaded else "NOT_TESTED"
             ),
         })
+    if console_errors is not None:
+        updated["console_errors"] = list(console_errors)
+    if page_errors is not None:
+        updated["page_errors"] = list(page_errors)
+    if console_errors is not None or page_errors is not None:
+        updated["console_status"] = (
+            "WARNING" if any(item.get("type") in {"CONSOLE_ERROR", "PAGE_SCRIPT_ERROR"} for item in items)
+            else "PASS" if loaded else "NOT_TESTED"
+        )
     return updated
 
 
@@ -786,6 +799,14 @@ def aggregate_report(
     for event in api_events or []:
         observed_api_requests[event.get("request_id") or id(event)] = event
     api_evidence = [_api_execution_evidence(event) for event in observed_api_requests.values()]
+    lifecycle_counts = {
+        "COMPLETED": sum(item["completed"] for item in api_evidence),
+        "FAILED": sum(item["failed"] for item in api_evidence),
+        "BLOCKED": sum(item["blocked"] for item in api_evidence),
+        "CANCELED": sum(item["canceled"] and not item["blocked"] for item in api_evidence),
+        "INCOMPLETE": sum(item["incomplete"] for item in api_evidence),
+    }
+    lifecycle_counts["OBSERVED_ONLY"] = len(api_evidence) - sum(lifecycle_counts.values())
     incomplete_api_requests = sum(item["incomplete"] for item in api_evidence)
     if incomplete_api_requests:
         coverage_reasons["API_OBSERVATION_INCOMPLETE"] = incomplete_api_requests
@@ -873,10 +894,26 @@ def aggregate_report(
         "challenge_required_pages": classification_counts["CHALLENGE_REQUIRED"],
         "api_failures": sum(int(result.get("api_failures", 0)) for result in results),
         "api_requests_observed": len(api_evidence),
+        "api_request_lifecycle_counts": lifecycle_counts,
+        "api_requests_allowed": sum(
+            not evidence["blocked"] and (
+                event.get("policy_decision") == "ALLOW"
+                or event.get("policy_decision") is None and event.get("allowed_by_policy") is True
+            )
+            for event, evidence in zip(observed_api_requests.values(), api_evidence)
+        ),
+        "api_requests_sent": sum(bool(event.get("request_dispatched")) for event in observed_api_requests.values()),
+        "api_requests_responded": sum(item["responded"] for item in api_evidence),
         "api_responses_completed": sum(item["completed"] for item in api_evidence),
         "api_requests_blocked": sum(item["blocked"] for item in api_evidence),
         "api_requests_canceled": sum(item["canceled"] for item in api_evidence),
         "api_requests_incomplete": incomplete_api_requests,
+        "api_http_failures": sum(
+            not evidence["blocked"]
+            and isinstance(event.get("status"), int) and not isinstance(event.get("status"), bool)
+            and 400 <= event["status"] < 600
+            for event, evidence in zip(observed_api_requests.values(), api_evidence)
+        ),
         "api_requests_failed": sum(
             evidence["failed"] or (
                 not evidence["blocked"]
@@ -948,6 +985,7 @@ def aggregate_report(
         ),
     }
     invariants = {
+        "api_lifecycles_reconciled": sum(lifecycle_counts.values()) == len(api_evidence),
         "validated_not_above_eligible": validated_count <= eligible_count,
         "eligible_reconciled": (
             validated_count + not_tested_count + skipped_count == eligible_count
@@ -1020,6 +1058,12 @@ def navigation_coverage(
         }
         for result in inventory
     )
+    menu_counts = [
+        result.get("navigation_actions", {}).get("menus_expanded")
+        for result in results
+        if isinstance(result.get("navigation_actions"), dict)
+    ]
+    recorded_menu_counts = [count for count in menu_counts if isinstance(count, int) and not isinstance(count, bool)]
     return {
         "scope": "OBSERVED_REACHABLE_SCOPE",
         "total_application_coverage": "UNKNOWN",
@@ -1028,6 +1072,12 @@ def navigation_coverage(
         "safe_candidates": summary.get("routes_eligible", len(inventory)),
         "visited_views": len(results),
         "validated_views": summary.get("application_routes_validated", 0),
+        "successful_views": sum(
+            bool(result.get("passed")) and result.get("classification") in PASS_OUTCOMES
+            and result.get("application_ready") is not False
+            for result in results
+        ),
+        "menus_expanded": sum(recorded_menu_counts) if recorded_menu_counts else None,
         "failed_views": summary.get("failed_pages", 0),
         "skipped_unsafe_controls": summary.get("unsafe_actions_skipped", 0),
         "unreachable_views": sum(result.get("page_load_status") == "FAILED_TO_LOAD" for result in results),
@@ -1038,6 +1088,99 @@ def navigation_coverage(
         "limitations": summary.get("coverage_reasons", []),
         "control_count_basis": "OBSERVATIONS_ACROSS_VISITED_VIEWS",
         "candidate_count_basis": "UNIQUE_ELIGIBLE_ROUTE_IDENTITIES",
+    }
+
+
+def build_coverage_dimensions(
+    results: list[dict[str, Any]], summary: dict[str, Any],
+) -> dict[str, dict[str, str]]:
+    """Keep execution, navigation, session readiness and passive APIs independent.
+
+    Reasons are generated from counters/enums rather than raw authentication
+    errors. Completing observed requests never proves that every API exists in
+    the inventory, and processing a queue never proves login succeeded.
+    """
+    execution_status = str(summary.get("execution_status") or "UNKNOWN")
+    if execution_status not in {"COMPLETE", "CANCELLED", "TIMED_OUT", "FAILED"}:
+        execution_status = "UNKNOWN"
+    execution_reason = {
+        "COMPLETE": "The configured scan execution finished; this does not establish complete portal coverage.",
+        "CANCELLED": "The scan was canceled before normal completion.",
+        "TIMED_OUT": "The overall scan deadline was reached.",
+        "FAILED": "The scan terminated with an execution failure.",
+        "UNKNOWN": "Execution completion evidence was not recorded.",
+    }[execution_status]
+
+    navigation_status = str(summary.get("discovery_status") or "UNKNOWN")
+    if navigation_status not in {"COMPLETE", "PARTIAL", "LIMITED"}:
+        navigation_status = "UNKNOWN"
+    navigation_codes = {
+        str(item.get("code")) for item in summary.get("coverage_reasons", [])
+        if isinstance(item, dict) and item.get("code") in {
+            "AUTHENTICATION_INCOMPLETE", "APPLICATION_NOT_READY", "ACCESS_RESTRICTED", "CHALLENGE_REQUIRED",
+            "NAVIGATION_FAILED", "NAVIGATION_CONTROLS_UNRESOLVED", "DISCOVERY_LIMITATION", "NO_APPLICATION_ROUTES",
+            "ROUTES_NOT_TESTED", "ROUTES_SKIPPED", "MAX_ROUTES_REACHED", "SCAN_TIMEOUT", "USER_CANCELLED",
+        }
+    }
+    navigation_reason = (
+        "Observed reachable navigation was processed; total application coverage remains unknown."
+        if navigation_status == "COMPLETE" else
+        "Navigation coverage is limited by: " + ", ".join(sorted(navigation_codes)) + "."
+        if navigation_codes else "No complete navigation-discovery evidence was recorded."
+    )
+
+    auth_states = {
+        str(result.get(field) or "")
+        for result in results for field in ("authentication_status", "classification")
+    }
+    if "AUTHENTICATION_BLOCKED" in auth_states:
+        authentication_status, authentication_reason = (
+            "BLOCKED", "The configured authentication policy blocked a required authentication transition.",
+        )
+    elif "SESSION_EXPIRED" in auth_states:
+        authentication_status, authentication_reason = (
+            "SESSION_EXPIRED", "The supplied browser session no longer grants access to the application.",
+        )
+    elif auth_states & {"AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "MFA_REQUIRED"}:
+        authentication_status, authentication_reason = (
+            "REQUIRED", "Authorized authentication or user action is required before protected-route discovery.",
+        )
+    elif auth_states & {"AUTH_FAILED", "AUTH_TIMEOUT"}:
+        authentication_status, authentication_reason = (
+            "FAILED", "Authentication did not complete within the configured workflow and limits.",
+        )
+    else:
+        session_evidence = [
+            any(event.get("state") == "SESSION_ESTABLISHED" for event in lifecycle.get("events", [])
+                if isinstance(event, dict))
+            for result in results
+            if isinstance(lifecycle := result.get("browser_lifecycle"), dict)
+        ]
+        authentication_status, authentication_reason = (
+            ("READY", "Browser session/navigation checks completed; application-shell readiness is evaluated separately.")
+            if session_evidence and all(session_evidence) and len(session_evidence) == len(results) else
+            ("UNKNOWN", "No explicit session-establishment lifecycle evidence was recorded; HTTP 200 alone is insufficient.")
+        )
+
+    observed = int(summary.get("api_requests_observed", 0))
+    incomplete = int(summary.get("api_requests_incomplete", 0))
+    canceled = int(summary.get("api_requests_canceled", 0))
+    blocked = int(summary.get("api_requests_blocked", 0))
+    api_status = (
+        "NOT_OBSERVED" if not observed else
+        "PARTIAL" if incomplete or canceled else "POLICY_LIMITED" if blocked else "OBSERVED"
+    )
+    api_reason = (
+        "No API requests were observed; this is not evidence that the portal has no APIs."
+        if not observed else
+        f"Passive observation recorded {observed} requests, {incomplete} unfinished, {canceled} canceled and {blocked} policy-blocked. "
+        "API health is reported separately; unobserved endpoints and total API coverage remain unknown."
+    )
+    return {
+        "execution": {"status": execution_status, "reason": execution_reason},
+        "navigation": {"status": navigation_status, "reason": navigation_reason},
+        "authentication": {"status": authentication_status, "reason": authentication_reason},
+        "api": {"status": api_status, "reason": api_reason},
     }
 
 
@@ -1147,7 +1290,9 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
                 ] += 1
             elif evidence["incomplete"]:
                 item["validation_reasons"][
-                    "RESPONSE_BODY_NOT_COMPLETED" if evidence["responded"] else "RESPONSE_NOT_OBSERVED"
+                    "RESPONSE_BODY_NOT_COMPLETED" if evidence["responded"] else
+                    "NOT_DISPATCHED_BEFORE_SCAN_END" if event.get("request_dispatched") is False else
+                    "NO_RESPONSE_BEFORE_SCAN_END"
                 ] += 1
             elif not evidence["completed"]:
                 item["validation_reasons"]["REQUEST_OBSERVED_ONLY"] += 1
@@ -1268,6 +1413,8 @@ def aggregate_api_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any
             "RESPONSE_BODY_FAILURE": "HTTP response headers arrived, but the response failed before completion.",
             "RESPONSE_BODY_NOT_COMPLETED": "HTTP response headers arrived; response completion was not observed.",
             "RESPONSE_NOT_OBSERVED": "No HTTP response was observed before the observation cutoff.",
+            "NO_RESPONSE_BEFORE_SCAN_END": "The request was observed, but no HTTP response arrived before the observation cutoff.",
+            "NOT_DISPATCHED_BEFORE_SCAN_END": "The request was observed, but transmission was not confirmed before the observation cutoff.",
             "REQUEST_OBSERVED_ONLY": "Only the request was observed; completed response evidence is unavailable.",
         }
         reasons = [

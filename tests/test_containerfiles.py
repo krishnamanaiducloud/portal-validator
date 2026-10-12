@@ -36,3 +36,19 @@ def test_runtime_uses_signed_exact_apk_transaction_and_debug_adds_only_delta():
     assert "COPY --from" not in debugfile
     assert "python -m pip uninstall -y pip setuptools" in debugfile
     assert "USER 10001:10001" in debugfile
+
+
+def test_final_runtime_records_exact_source_identity_after_copy_and_before_non_root():
+    from app.version import VALIDATOR_VERSION
+
+    runtime = (REPO / "Dockerfile").read_text().split("FROM runtime-base\n", 1)[1]
+    assert 'ARG VCS_REF=""' in runtime
+    assert 'ARG BUILD_TIMESTAMP=""' in runtime
+    assert f'org.opencontainers.image.version="{VALIDATOR_VERSION}"' in runtime
+    assert "org.opencontainers.image.revision=$VCS_REF" in runtime
+    assert runtime.index("COPY --chown=10001:10001 app ./app") < runtime.index("python -m app.build_info")
+    assert runtime.index('ARG VCS_REF=""') > runtime.index("COPY --from=builder --chown=0:0 /ms-playwright /ms-playwright")
+    assert runtime.index("python -m app.build_info") < runtime.index("USER 10001:10001")
+    assert 'build_diagnostics' in runtime
+    assert f"PRODUCTION_IMAGE=mohankrishna999/portal-validator:{VALIDATOR_VERSION}" in (REPO / "Dockerfile-debug").read_text()
+    assert f"FRONTEND_VERSION = '{VALIDATOR_VERSION}'" in (REPO / "app/static/app.js").read_text()

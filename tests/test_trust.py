@@ -448,4 +448,5 @@ def test_uvicorn_access_log_filter_redacts_sensitive_query_values():
     rendered = record.msg % record.args
     assert "secret-code" not in rendered
     assert "secret-state" not in rendered
-    assert "[REDACTED]" in rendered
+    assert '"GET /callback HTTP/1.1"' in rendered
+    assert "?" not in rendered and "code=" not in rendered and "state=" not in rendered
