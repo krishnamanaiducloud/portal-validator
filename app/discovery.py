@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
 
 DOCUMENT_NAVIGATION = "DOCUMENT_NAVIGATION"
 SEMANTIC_LINK_NAVIGATION = "SEMANTIC_LINK_NAVIGATION"
@@ -458,7 +460,9 @@ NAVIGATION_DOM_HELPERS = r"""
     '[role="menuitem"]', '[role="link"]', 'button', '[role="button"]', 'nav button',
     '[role="navigation"] button', 'nav [aria-controls]',
     '[role="navigation"] [aria-controls]', '[role="navigation"] [role="button"]',
-    'mat-nav-list mat-list-item', 'mat-nav-list [mat-list-item]'
+    'mat-nav-list mat-list-item', 'mat-nav-list [mat-list-item]',
+    '[aria-haspopup="menu"]', '[aria-haspopup="true"]',
+    '[mat-menu-trigger-for]', '[matmenutriggerfor]', '.mat-menu-trigger', '.mat-mdc-menu-trigger'
   ].join(',');
   const navigationRoots = () => {
     const values = [document];
@@ -491,7 +495,8 @@ NAVIGATION_DOM_HELPERS = r"""
   };
   const isNavigationControl = element => element.matches(
     '[role="tab"],[role="menuitem"],[role="link"],[data-bs-toggle="tab"],[data-toggle="tab"],'+
-    '[data-tab-target],[data-bs-target],[data-target],mat-nav-list mat-list-item,mat-nav-list [mat-list-item]'
+    '[data-tab-target],[data-bs-target],[data-target],mat-nav-list mat-list-item,mat-nav-list [mat-list-item],'+
+    '[aria-haspopup="menu"],[aria-haspopup="true"],[mat-menu-trigger-for],[matmenutriggerfor],.mat-menu-trigger,.mat-mdc-menu-trigger'
   ) || (!!composedClosest(element, 'nav,[role="navigation"]') &&
     element.matches('button,[role="button"],[aria-controls]'));
   const unsafeAction = element => {
@@ -524,7 +529,8 @@ NAVIGATION_DOM_HELPERS = r"""
     const role = element.getAttribute('role');
     if (role === 'tab' || element.matches('[data-bs-toggle="tab"],[data-toggle="tab"]')) return false;
     if (element.hasAttribute('aria-expanded') || ['menu','true','tree','listbox'].includes(element.getAttribute('aria-haspopup')) ||
-        element.matches('[data-bs-toggle="collapse"],[data-bs-toggle="dropdown"],[data-toggle="collapse"],[data-toggle="dropdown"]')) return true;
+        element.matches('[data-bs-toggle="collapse"],[data-bs-toggle="dropdown"],[data-toggle="collapse"],[data-toggle="dropdown"],'+
+          '[mat-menu-trigger-for],[matmenutriggerfor],.mat-menu-trigger,.mat-mdc-menu-trigger')) return true;
     const panel = controlledPanel(element);
     const target = panel && element.getRootNode().querySelector('#' + CSS.escape(panel));
     return !!target && (target.matches('nav,[role="navigation"],[role="menu"],[role="menubar"]') ||
@@ -549,6 +555,49 @@ NAVIGATION_DOM_HELPERS = r"""
     }
     return names;
   };
+  const menuPanels = () => navigationRoots().flatMap(root => Array.from(root.querySelectorAll(
+    '[role="menu"],mat-menu,.mat-menu-panel,.mat-mdc-menu-panel'
+  )));
+  const bindNavigationPanel = (element, panel, opening) => {
+    if (!panel || panel === element || panel.contains(element)) return;
+    window.__portalValidatorPanelOpeners ||= new WeakMap();
+    window.__portalValidatorPanelOpeners.set(panel, opening || {
+      label:controlLabel(element), ancestors:navigationParents(element)
+    });
+    window.__portalValidatorControlPanels ||= new WeakMap();
+    window.__portalValidatorControlPanels.set(element, panel);
+  };
+  const associatedMenuPanel = element => {
+    const panel = controlledPanel(element);
+    const explicit = panel && element.getRootNode().querySelector('#' + CSS.escape(panel));
+    if (explicit) return explicit;
+    const known = window.__portalValidatorControlPanels?.get(element);
+    if (known?.isConnected && visibleControl(known)) return known;
+    const labelled = element.id && menuPanels().filter(candidate => visibleControl(candidate) &&
+      (candidate.getAttribute('aria-labelledby') || '').split(/\s+/).includes(element.id));
+    if (labelled?.length === 1) return labelled[0];
+    const opening = window.__portalValidatorMenuOpenings?.get(element);
+    const revealed = opening && menuPanels().filter(candidate =>
+      visibleControl(candidate) && !opening.panels.has(candidate));
+    // CDK portals may be unrelated DOM siblings with no aria-controls. Only
+    // associate one newly revealed semantic menu, never an arbitrary region.
+    return revealed?.length === 1 ? revealed[0] : null;
+  };
+  const menuRevealed = (element, prepare) => {
+    if (prepare) {
+      window.__portalValidatorMenuOpenings ||= new WeakMap();
+      window.__portalValidatorMenuOpenings.set(element, {
+        panels:new Set(menuPanels().filter(visibleControl)),
+        label:controlLabel(element), ancestors:navigationParents(element)
+      });
+      window.__portalValidatorPendingMenuOpener = element;
+    }
+    const target = associatedMenuPanel(element);
+    if (target) bindNavigationPanel(element, target, window.__portalValidatorMenuOpenings?.get(element));
+    return {expanded:element.getAttribute('aria-expanded') === 'true',
+      collapsed:element.getAttribute('aria-expanded') === 'false',
+      panelVisible:!!target && visibleControl(target)};
+  };
   const describeView = element => {
     if (!isNavigationControl(element) || !visibleControl(element) || composedClosest(element, 'form') || element.hasAttribute('disabled') ||
         element.getAttribute('aria-disabled') === 'true' || element.hasAttribute('download') ||
@@ -559,8 +608,10 @@ NAVIGATION_DOM_HELPERS = r"""
     if (!label) return null;
     const panel = controlledPanel(element);
     const target = panel && element.getRootNode().querySelector('#' + CSS.escape(panel));
-    // A broken explicit target is unresolved navigation, not a speculative view.
-    if (panel && !target) return null;
+    // Semantic tabs may lazily create their aria-controls panel on activation.
+    // Retain that evidenced tab; the activation path must still verify the
+    // expected panel became visible, not merely that its click was dispatched.
+    if (panel && !target && element.getAttribute('role') !== 'tab') return null;
     if (!target && !isNavigationControl(element)) return null;
     const region = composedClosest(element, 'nav,[role="navigation"],[role="menu"],[role="tablist"]');
     const regionLabel = region && (region.getAttribute('aria-label') ||
@@ -572,7 +623,7 @@ NAVIGATION_DOM_HELPERS = r"""
     const scope = rootScope(element.getRootNode()) + (regionIdentity ? '|' + regionIdentity : '');
     // Framework-generated DOM IDs remain locators, not stable view identity.
     const identity = JSON.stringify([navigationParents(element), label, element.getAttribute('role') || 'navigation']);
-    return {panel:panel || ('navigation:' + label), identity, label, id:element.id || '', kind:target ? 'panel' : 'navigation',
+    return {panel:panel || ('navigation:' + label), identity, label, id:element.id || '', kind:panel ? 'panel' : 'navigation',
       scope, ancestors:JSON.stringify(navigationParents(element))};
   };
 """
@@ -591,6 +642,11 @@ async (maximumScrolls) => {
   // that route's own context; no random DOM identifier enters the identity.
   window.__portalValidatorViewSourceUrls ||= new WeakMap();
   const collect = () => {
+    // A remote menu may publish aria-expanded before its async panel arrives.
+    // Refresh only the most recently observed opener after caller-controlled
+    // readiness, not every stale opener from previously closed overlays.
+    const pending = window.__portalValidatorPendingMenuOpener;
+    if (pending?.isConnected) menuRevealed(pending, false);
     for (const root of navigationRoots()) {
       // Panels are real UI views, not invented HTTP/hash routes. Discover
       // them without clicking: the normal validation loop owns activation,
@@ -720,7 +776,9 @@ EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
       }
     };
     visit(document);
-    return values;
+    // Explore the visible child overlay before another top-level opener can
+    // destroy it. DOM order alone visits body-appended CDK menus too late.
+    return values.sort((left,right) => navigationParents(right).length - navigationParents(left).length);
   };
   let activated = 0;
   let skipped = 0;
@@ -751,8 +809,7 @@ EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
       Array.from(dangerous).some(word =>
         (' ' + normalizedLabel.replace(/[^a-z0-9]+/g, ' ').trim() + ' ').includes(' ' + word + ' '));
     if (unsafe) { skipped += 1; continue; }
-    const panel = controlledPanel(element);
-    const targetPanel = panel && element.getRootNode().querySelector('#' + CSS.escape(panel));
+    const targetPanel = associatedMenuPanel(element);
     if (targetPanel) {
       window.__portalValidatorPanelOpeners ||= new WeakMap();
       window.__portalValidatorPanelOpeners.set(targetPanel, {label, ancestors:navigationParents(element)});
@@ -770,14 +827,78 @@ EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
 
 
 MENU_REVEALED_SCRIPT = r"""
-(element) => {
+(element, prepare) => {
   /* NAVIGATION_DOM_HELPERS */
-  const panel = controlledPanel(element);
-  const target = panel && element.getRootNode().querySelector('#' + CSS.escape(panel));
-  return {expanded:element.getAttribute('aria-expanded') === 'true',
-    panelVisible:!!target && visibleControl(target)};
+  return menuRevealed(element, prepare);
 }
 """.replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
+
+
+MENU_READY_SCRIPT = r"""
+(element) => {
+  /* NAVIGATION_DOM_HELPERS */
+  const state = menuRevealed(element, false);
+  const expectsMenu = ['menu','true'].includes(element.getAttribute('aria-haspopup')) ||
+    element.matches('[mat-menu-trigger-for],[matmenutriggerfor],.mat-menu-trigger,.mat-mdc-menu-trigger');
+  // Framework triggers can set aria-expanded synchronously while fetching
+  // their overlay. Do not move to another top-level menu before it exists.
+  return expectsMenu ? state.panelVisible : state.expanded || state.panelVisible;
+}
+""".replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
+
+
+CDK_MENU_DISMISSAL_SCRIPT = r"""
+(element) => {
+  /* NAVIGATION_DOM_HELPERS */
+  if (navigationParents(element).length || composedClosest(element, '[role="menu"]')) return 0;
+  const pending = window.__portalValidatorPendingMenuOpener;
+  if (pending === element) return 0;
+  const owned = menuPanels().filter(panel => visibleControl(panel) &&
+    window.__portalValidatorPanelOpeners?.has(panel) && composedClosest(panel, '.cdk-overlay-container,.cdk-overlay-pane'));
+  if (!owned.length) return 0;
+  const backdrops = navigationRoots().flatMap(root => Array.from(root.querySelectorAll('.cdk-overlay-backdrop')))
+    .filter(visibleControl).length;
+  return backdrops ? Math.max(backdrops, owned.length) : 0;
+}
+""".replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
+
+
+async def _reveal_navigation_menu(page, element, timeout_ms: int) -> tuple[bool, bool]:
+    """Reveal one evidenced menu, retaining a lazily created portal's opener."""
+    deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+
+    def remaining_ms() -> int:
+        remaining = int((deadline - asyncio.get_running_loop().time()) * 1000)
+        if remaining <= 0:
+            raise RuntimeError("Safe navigation menu exceeded its configured timeout")
+        return remaining
+
+    # Material backdrops intercept clicks on other top-level openers. Close
+    # only this evidenced menu overlay with Escape; never force-click through
+    # it, remove DOM nodes, or activate an unrelated application control.
+    backdrops = await element.evaluate(CDK_MENU_DISMISSAL_SCRIPT)
+    if backdrops:
+        keyboard = getattr(page, "keyboard", None) or page.page.keyboard
+        for _ in range(backdrops):
+            if not await element.evaluate(CDK_MENU_DISMISSAL_SCRIPT):
+                break
+            await keyboard.press("Escape")
+        await page.wait_for_function(
+            "element => !(" + CDK_MENU_DISMISSAL_SCRIPT + ")(element)",
+            arg=element, timeout=remaining_ms(),
+        )
+    before = await element.evaluate(MENU_REVEALED_SCRIPT, True)
+    if before["panelVisible"] and not before["collapsed"]:
+        return False, False
+    await element.hover(timeout=remaining_ms())
+    revealed = await element.evaluate(MENU_REVEALED_SCRIPT)
+    if not ((revealed["expanded"] and not before["expanded"]) or
+            (revealed["panelVisible"] and not before["panelVisible"])):
+        await element.click(timeout=remaining_ms())
+    await page.wait_for_function(MENU_READY_SCRIPT, arg=element, timeout=remaining_ms())
+    revealed = await element.evaluate(MENU_REVEALED_SCRIPT)
+    return True, bool((revealed["expanded"] and not before["expanded"]) or
+                      (revealed["panelVisible"] and not before["panelVisible"]))
 
 
 async def _expand_one_menu(page, reset: bool, timeout_ms: int) -> dict[str, Any]:
@@ -794,22 +915,14 @@ async def _expand_one_menu(page, reset: bool, timeout_ms: int) -> dict[str, Any]
         # Hover-first supports CSS/JS dropdowns without an unnecessary click.
         # Neither action is retried after dispatch, even if it navigates away.
         try:
-            before = await element.evaluate(MENU_REVEALED_SCRIPT)
-            await element.hover(timeout=timeout_ms)
-            revealed = await element.evaluate(MENU_REVEALED_SCRIPT)
-            if not ((revealed["expanded"] and not before["expanded"]) or
-                    (revealed["panelVisible"] and not before["panelVisible"])):
-                await element.click(timeout=timeout_ms)
-                revealed = await element.evaluate(MENU_REVEALED_SCRIPT)
-            result["menus_expanded"] = int(
-                (revealed["expanded"] and not before["expanded"]) or
-                (revealed["panelVisible"] and not before["panelVisible"])
-            )
+            activated, revealed = await _reveal_navigation_menu(page, element, timeout_ms)
+            result["menus_expanded"] = int(revealed)
         except Exception as error:
             if not context_replacement_error(error):
                 raise
             await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-        result["activated"] = 1
+            activated = True
+        result["activated"] = int(activated)
         after = page.url
         if after != result.get("before"):
             result["transitions"] = [{
@@ -1069,14 +1182,13 @@ RESTORE_MENU_ANCESTOR_SCRIPT = r"""
   const matches = navigationRoots().flatMap(root => Array.from(root.querySelectorAll(
     viewSelector + ',[aria-expanded][aria-controls],[aria-haspopup="menu"]'
   ))).filter(element => visibleControl(element) && controlLabel(element) === label &&
-    isMenuExpander(element) && !unsafeAction(element) && !composedClosest(element, 'form') &&
-    !element.hasAttribute('disabled') && element.getAttribute('aria-disabled') !== 'true' && !routeAttribute(element));
+    (isMenuExpander(element) || describeView(element)) && !unsafeAction(element) && !composedClosest(element, 'form') &&
+    !element.hasAttribute('disabled') && element.getAttribute('aria-disabled') !== 'true' &&
+    (!routeAttribute(element) || /^#(?!\/|!\/)/.test(routeAttribute(element))));
   if (matches.length !== 1) return null;
-  const element = matches[0], panel = controlledPanel(element);
-  const target = panel && element.getRootNode().querySelector('#' + CSS.escape(panel));
-  if (element.getAttribute('aria-expanded') === 'true' && target &&
-      !composedClosest(target, '[hidden],[inert],[aria-hidden="true"]') &&
-      getComputedStyle(target).display !== 'none' && getComputedStyle(target).visibility !== 'hidden') return 'open';
+  const element = matches[0], target = associatedMenuPanel(element);
+  if (target && visibleControl(target) && (isMenuExpander(element) ||
+      element.getAttribute('aria-selected') === 'true' || ['page','true'].includes(element.getAttribute('aria-current')))) return 'open';
   return element;
 }
 """.replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
@@ -1109,22 +1221,49 @@ NAVIGATION_VIEW_COMPLETED_SCRIPT = r"""
 
 async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> None:
     """Activate one evidenced navigation view and verify a real UI transition."""
+    deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+
+    def remaining_ms() -> int:
+        remaining = int((deadline - asyncio.get_running_loop().time()) * 1000)
+        if remaining <= 0:
+            raise RuntimeError("Discovered UI view activation exceeded its configured timeout")
+        return remaining
+
+    async def wait_for_control(script, value, message):
+        try:
+            return await retry_dom_operation(
+                page, lambda: page.wait_for_function(script, arg=value, timeout=remaining_ms()),
+                timeout_ms=remaining_ms(),
+            )
+        except (PlaywrightTimeoutError, TimeoutError) as error:
+            raise RuntimeError(message) from error
+
     for label in json.loads(control.get("ancestors", "[]")):
-        opener_handle = await evaluate_dom(page, RESTORE_MENU_ANCESTOR_SCRIPT, label, handle=True, timeout_ms=timeout_ms)
+        opener_handle = await wait_for_control(
+            RESTORE_MENU_ANCESTOR_SCRIPT, label,
+            "Discovered UI view's parent menu is not uniquely and safely activatable",
+        )
         try:
             opener = opener_handle.as_element()
             if opener is not None:
-                before = await opener.evaluate(MENU_REVEALED_SCRIPT)
-                await opener.hover(timeout=timeout_ms)
-                revealed = await opener.evaluate(MENU_REVEALED_SCRIPT)
-                if not ((revealed["expanded"] and not before["expanded"]) or
-                        (revealed["panelVisible"] and not before["panelVisible"])):
-                    await opener.click(timeout=timeout_ms)
+                parent_view = await opener.evaluate(
+                    "element => {" + NAVIGATION_DOM_HELPERS + "return describeView(element);}",
+                )
+                if parent_view:
+                    await activate_ui_view(page, parent_view, remaining_ms())
+                else:
+                    await _reveal_navigation_menu(page, opener, remaining_ms())
             elif await opener_handle.json_value() != "open":
                 raise RuntimeError("Discovered UI view's parent menu is not uniquely and safely activatable")
         finally:
             await opener_handle.dispose()
-    handle = await evaluate_dom(page, UI_VIEW_CONTROL_SCRIPT, control, handle=True, timeout_ms=timeout_ms)
+    # Restoring a hash route may asynchronously insert its remote view controls.
+    # Wait for the already observed unique safe control, never click a fallback
+    # or replay an activation after it has been dispatched.
+    handle = await wait_for_control(
+        UI_VIEW_CONTROL_SCRIPT, control,
+        "Discovered UI tab is not uniquely and safely activatable",
+    )
     try:
         element = handle.as_element()
         if element is None:
@@ -1137,10 +1276,10 @@ async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> No
             raise RuntimeError("Discovered UI tab has an unsafe action label")
         if control.get("kind") == "navigation":
             evidence = await page.evaluate(NAVIGATION_VIEW_EVIDENCE_SCRIPT, element)
-            await element.click(timeout=timeout_ms)
+            await element.click(timeout=remaining_ms())
             await page.wait_for_function(
                 NAVIGATION_VIEW_COMPLETED_SCRIPT,
-                arg={"element": element, "previous": evidence}, timeout=timeout_ms,
+                arg={"element": element, "previous": evidence}, timeout=remaining_ms(),
             )
             return
         evidence = await element.evaluate(r"""(e, panel) => {
@@ -1151,7 +1290,7 @@ async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> No
             wasHidden:!p || !!p.closest('[hidden],[inert],[aria-hidden="true"]') ||
               style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0};
         }""", control["panel"])
-        await element.click(timeout=timeout_ms)
+        await element.click(timeout=remaining_ms())
         await page.wait_for_function(r"""({element, panel, requiresSelection, wasHidden, panelText}) => {
           if (!element.isConnected) return false;
           const target = element.getRootNode().querySelector('#' + CSS.escape(panel));
@@ -1161,7 +1300,12 @@ async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> No
           if (target.innerText && target.innerText !== panelText) return true;
           return requiresSelection ? element.getAttribute('aria-selected') === 'true' :
             wasHidden || element.classList.contains('active') || element.parentElement?.classList.contains('active');
-        }""", arg={"element": element, **control, **evidence}, timeout=timeout_ms)
+        }""", arg={"element": element, **control, **evidence}, timeout=remaining_ms())
+        await element.evaluate(
+            "element => {" + NAVIGATION_DOM_HELPERS +
+            "const panel=controlledPanel(element);const target=panel && element.getRootNode().querySelector('#'+CSS.escape(panel));"
+            "if(target && visibleControl(target)) bindNavigationPanel(element,target);}",
+        )
     finally:
         await handle.dispose()
 

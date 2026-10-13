@@ -12,6 +12,7 @@ import weakref
 from collections import Counter, defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Literal
 from urllib.parse import urldefrag, urlparse
@@ -97,6 +98,7 @@ from app.reporting import (
     finding,
     refresh_route_api_health,
     navigation_coverage,
+    unvisited_route_reason,
 )
 from app.session import RuntimeSessionStore, load_refresh_config, refresh_browser_session, scope_storage_state
 from app.resources import build_resource_report, enrich_resource_timings, large_resource_findings, resource_timing_key, safe_content_type
@@ -1137,6 +1139,7 @@ async def execute_scan(
     scan_resource_events: list[dict] = []
     network_drain: dict[str, object] | None = None
     session_expired = False
+    discovery_stop_reason: str | None = None
     active_route_identity: str | None = None
     network_observer: PassiveNetworkObserver | None = None
     popup_tasks: set[asyncio.Task] = set()
@@ -1491,6 +1494,8 @@ async def execute_scan(
                     if api_event is None and request.resource_type not in {"document", "eventsource"}:
                         resource_event = {
                             "url": sanitized_url(request.url),
+                            "method": request.method.upper(),
+                            "observed_at": datetime.now(UTC).isoformat(timespec="milliseconds"),
                             "_resource_timing_key": resource_timing_key(request.url),
                             "resource_type": request.resource_type,
                             "status": None, "error": None,
@@ -2734,6 +2739,30 @@ async def execute_scan(
                                     for frame in page.frames
                                     if frame.url.startswith(("http://", "https://"))
                                 ]
+                                if req.check_links and final_in_scope and not application_ready:
+                                    # Readiness gates activation, not passive evidence.
+                                    # Preserve already rendered in-scope destinations
+                                    # without opening menus, clicking tabs, scrolling,
+                                    # following login links or sending extra requests.
+                                    observation_phase = "DISCOVERY"
+                                    discovery_started = time.perf_counter()
+                                    passive_routes = await discover_page_routes(page, 0)
+                                    external_links[:] = sorted(set(external_links).union(
+                                        enqueue_discovered_routes(passive_routes, depth, final_raw_url),
+                                    ))
+                                    navigation_actions["passive_routes_observed"] = len(passive_routes)
+                                    navigation_actions["activation_block_reason"] = (
+                                        authentication_classification
+                                        if authentication_classification != "PASS" else "APPLICATION_NOT_READY"
+                                    )
+                                    route_discovery_ms = round((time.perf_counter() - discovery_started) * 1000)
+                                    discovery_duration_ms += route_discovery_ms
+                                    observation_phase = "ROUTE_VALIDATION"
+                                    log_event(
+                                        logging.INFO, "PASSIVE_NAVIGATION_RETAINED", scan_id=scan_id,
+                                        routes_observed=len(passive_routes), routes_discovered=len(discovered_routes),
+                                        reason=navigation_actions["activation_block_reason"],
+                                    )
                                 if (
                                     req.check_links
                                     and final_in_scope
@@ -3363,6 +3392,11 @@ async def execute_scan(
                         "AUTHENTICATION_BLOCKED", "AUTHENTICATION_REQUIRED", "AUTH_REQUIRED",
                         "AUTH_FAILED", "AUTH_TIMEOUT", "MFA_REQUIRED",
                     } or (len(results) == 1 and not application_ready)):
+                        discovery_stop_reason = (
+                            "SESSION_EXPIRED" if session_expired else
+                            authentication_classification if authentication_classification not in {None, "PASS"} else
+                            browser_lifecycle.failure_reason or error_classification or "APPLICATION_NOT_READY"
+                        )
                         break
                     if not queue and popup_tasks and req.check_links:
                         _, pending_popups = await asyncio.wait(
@@ -3502,6 +3536,8 @@ async def execute_scan(
         termination_reason = "SESSION_EXPIRED"
     elif total_timeout_reached:
         termination_reason = "SCAN_TIMEOUT"
+    elif discovery_stop_reason:
+        termination_reason = discovery_stop_reason
     elif remaining_routes and len(results) >= req.max_pages:
         termination_reason = "MAX_ROUTES_REACHED"
     elif depth_limited_routes:
@@ -3553,13 +3589,7 @@ async def execute_scan(
     route_inventory = list(results)
     for result in results:
         route_name_by_id[str(result["route_id"])] = str(result["route_name"])
-    unvisited_reason = (
-        "NOT_TESTED_MAX_ROUTES" if termination_reason == "MAX_ROUTES_REACHED" else
-        "NOT_TESTED_TIMEOUT" if termination_reason == "SCAN_TIMEOUT" else
-        "NOT_TESTED_CANCELLED" if termination_reason == "USER_CANCELLED" else
-        "NOT_TESTED_SESSION_EXPIRED" if termination_reason == "SESSION_EXPIRED" else
-        "NOT_TESTED"
-    )
+    unvisited_reason = unvisited_route_reason(termination_reason)
     for route_key in sorted(remaining_routes | depth_limited_routes | action_limited_routes):
         route_url = sanitized_url(route_locations[route_key])
         route_fields = route_identity_fields(

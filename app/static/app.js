@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = '1.12.8';
+const FRONTEND_VERSION = '1.12.9';
 // The server pins this exact deferred script with SRI and a hash-versioned URL.
 // Capture currentScript now; it is unavailable in subsequent async callbacks.
 const frontendScript = document.currentScript;
@@ -939,6 +939,56 @@ function renderResourceSummary() {
   renderResourceDetails();
 }
 
+function renderFailedEndpoints() {
+  // Reuse passive, sanitized aggregates. An unfinished transfer may still
+  // contain a definitive HTTP failure; policy blocks alone are not failures.
+  const positive = value => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
+  const httpFailures = item => Object.entries(item.response_status_counts || {})
+    .reduce((total,[status,count]) => total + (Number(status) >= 400 && Number(status) < 600 ? positive(count) : 0), 0);
+  const routes = lastReport?.route_inventory || lastReport?.results || [];
+  const routeNames = identities => (identities || []).map(identity => {
+    const route = routes.find(item => [item.route_id,item.normalized_route_identity,item.canonical_route,item.url].includes(identity));
+    return route?.route_name || route?.route_label || identity;
+  }).join(', ') || 'Not recorded';
+  const rows = [];
+  for (const item of lastReport?.api_inventory || []) {
+    const http = Math.max(httpFailures(item), positive(item.status_4xx) + positive(item.status_5xx));
+    const network = positive(item.network_failures), body = positive(item.response_body_failures);
+    if (!http && !network && !body) continue;
+    rows.push({item, kind:'API', method:item.method || 'Not recorded', endpoint:item.endpoint || '',
+      routes:item.routes_using_endpoint, affected:positive(item.failure_count ?? item.target_failure_count) || http + network + body,
+      categories:[...(http ? ['HTTP_FAILURE'] : []),...(network ? ['NETWORK_FAILURE'] : []),...(body ? ['RESPONSE_BODY_FAILURE'] : [])]});
+  }
+  for (const item of lastReport?.resource_inventory || []) {
+    const http = httpFailures(item), failures = positive(item.failures);
+    if (!http && !failures) continue;
+    const types = item.failure_type_counts || {};
+    const network = positive(types.NETWORK_FAILURE), body = positive(types.RESPONSE_BODY_FAILURE);
+    const categories = [...(http ? ['HTTP_FAILURE'] : []),...(network ? ['RESOURCE_NETWORK_FAILURE'] : []),
+      ...(body ? ['RESPONSE_BODY_FAILURE'] : [])];
+    rows.push({item, kind:`Resource: ${item.type || 'OTHER'}`, method:item.method || 'Not recorded', endpoint:item.path || '',
+      routes:item.routes_using_resource, affected:failures || http,
+      categories:categories.length ? categories : ['RESOURCE_FAILURE']});
+  }
+  byId('failed-endpoint-count').textContent = `${rows.length} failed endpoint/resource identities; affected calls are counted per row, not unique routes.`;
+  byId('failed-endpoint-list').innerHTML = rows.map((row,index) => {
+    const statuses = Object.entries(row.item.response_status_counts || {}).filter(([status]) => Number(status) >= 400 && Number(status) < 600)
+      .map(([status,count]) => `${status} (${count})`).join(', ') || (row.categories.includes('HTTP_FAILURE') ? '4xx / 5xx (exact code not recorded)' : 'No HTTP error recorded');
+    return `<tr><td>${escapeHtml(row.kind)}</td><td>${escapeHtml(row.method)}</td><td class="resource-path"><strong>${escapeHtml(row.item.host || '')}</strong><code>${escapeHtml(row.endpoint)}</code></td><td>${escapeHtml(routeNames(row.routes))}</td><td>${escapeHtml(statuses)}</td><td>${escapeHtml(row.categories.join(', '))}</td><td>${escapeHtml(row.affected)}</td><td>${escapeHtml(row.item.first_seen || 'Not recorded')}</td><td>${escapeHtml(row.item.last_seen || 'Not recorded')}</td><td><button type="button" class="secondary" data-failed-endpoint="${index}">Inspect failure</button></td></tr>`;
+  }).join('') || '<tr><td colspan="10" class="empty-table">No target HTTP, network, or response-body failures were observed. Policy-blocked and unresolved requests remain in their inventories.</td></tr>';
+  byId('failed-endpoint-list').querySelectorAll('[data-failed-endpoint]').forEach(button => button.addEventListener('click', () => {
+    const row = rows[Number(button.dataset.failedEndpoint)], item = row.item;
+    showEvidence(`${row.method} ${item.host || ''}${row.endpoint}`, {
+      kind:row.kind, method:row.method, host:item.host, endpoint:row.endpoint,
+      routes:row.routes || [], failure_classification:row.categories, affected_calls:row.affected,
+      first_seen:item.first_seen || null, last_seen:item.last_seen || null,
+      response_status_counts:item.response_status_counts || {}, failure_classifications:item.failure_classifications || {},
+      failure_type_counts:item.failure_type_counts || {}, lifecycle_status_counts:item.lifecycle_status_counts || {},
+      validation_reasons:item.validation_reasons || [], validation_status:item.validation_status || null,
+    });
+  }));
+}
+
 function renderSecurityRecommendations() {
   const recommendations = lastReport?.security_recommendations || [];
   byId('security-list').innerHTML = recommendations.map((item) => `<article class="recommendation"><div><span>${escapeHtml(item.severity || 'RECOMMENDATION')}</span><strong>${escapeHtml(item.header || item.type)}</strong></div><p>Recommended content security protection is missing from ${escapeHtml(item.affected_document_count || 0)} document${item.affected_document_count === 1 ? '' : 's'}.</p><dl><dt>Impact</dt><dd>${escapeHtml(item.impact || 'NON_BLOCKING')}</dd><dt>Affected documents</dt><dd>${escapeHtml(item.affected_document_count || 0)}</dd></dl></article>`).join('') || '<p class="empty-detail">No document-level security recommendations were observed.</p>';
@@ -1085,6 +1135,7 @@ function renderReport(report) {
   renderRows();
   renderApiInventory();
   renderResourceSummary();
+  renderFailedEndpoints();
   renderSecurityRecommendations();
   renderNavigationCoverage(report);
   renderCoverageDimensions(report);

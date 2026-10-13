@@ -72,6 +72,9 @@
 @media(max-width:760px) {.build-identity>details {margin-left:0}.coverage-dimensions {grid-template-columns:1fr 1fr}.build-identity dl>div {grid-template-columns:1fr;gap:3px}}
 @media(max-width:480px) {.coverage-dimensions {grid-template-columns:1fr}}
 .api-tools .table-controls {grid-column:1 / -1}
+.failed-endpoint-table {max-height:360px;overflow:auto}
+.failed-endpoint-table td {max-width:340px;overflow-wrap:anywhere}
+.failed-endpoint-table td code {display:block;white-space:normal}
 .api-tools .columns-panel {left:0;right:auto}
 .inspect-content pre {white-space:pre-wrap;overflow-wrap:anywhere;font:500 12px/1.65 ui-monospace,monospace;color:#bdd0c7;margin:0}
 .inspect-raw {margin-top:18px}

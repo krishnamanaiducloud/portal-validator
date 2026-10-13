@@ -19,6 +19,35 @@ RENDER_HEALTH_SCRIPT = r"""
       if (element.shadowRoot) roots.push(element.shadowRoot);
     }
   }
+  // Counts/text alone miss a remote component replacing one navigation tree
+  // with another of the same size. Observe semantics, not animation styles,
+  // and retain only a generation counter in the report.
+  let activity = window.__portalValidatorRenderActivity;
+  if (!activity) {
+    activity = {generation: 0, roots: new Set(), url: location.href};
+    activity.observer = new MutationObserver(() => { activity.generation += 1; });
+    window.__portalValidatorRenderActivity = activity;
+  }
+  if (activity.url !== location.href) {
+    activity.url = location.href;
+    activity.generation += 1;
+  }
+  if (roots.length !== activity.roots.size || roots.some(root => !activity.roots.has(root))) {
+    // Disconnect removed shadow roots so a long scan does not retain detached
+    // microfrontend trees. A new document gets its own observation state.
+    activity.observer.disconnect();
+    activity.roots = new Set(roots);
+    for (const root of roots) activity.observer.observe(root, {
+      subtree: true, childList: true, characterData: true, attributes: true,
+      attributeFilter: ['href', 'routerlink', 'ng-reflect-router-link', 'hidden',
+        'aria-hidden', 'aria-busy', 'aria-selected', 'aria-expanded', 'aria-controls',
+        'role', 'aria-label', 'aria-labelledby', 'aria-current', 'aria-haspopup',
+        'disabled', 'aria-disabled', 'inert', 'title', 'data-href', 'data-url',
+        'data-route', 'data-tab-target', 'data-target', 'data-bs-target',
+        'data-toggle', 'data-bs-toggle', 'mat-menu-trigger-for', 'matmenutriggerfor']
+    });
+    activity.generation += 1;
+  }
   const isVisible = (element) => {
     const style = getComputedStyle(element);
     const rect = element.getBoundingClientRect();
@@ -52,6 +81,8 @@ RENDER_HEALTH_SCRIPT = r"""
     busy_indicators: busy,
     challenge_indicators: challenge,
     alert_text: alertText,
+    dom_generation: activity.generation,
+    document_epoch: performance.timeOrigin,
   };
 }
 """
@@ -80,6 +111,8 @@ async def capture_render_health(page) -> dict[str, Any]:
         "busy_indicators": max(0, int(result.get("busy_indicators", 0))),
         "challenge_indicators": max(0, int(result.get("challenge_indicators", 0))),
         "alert_text": str(result.get("alert_text") or "")[:500],
+        "dom_generation": max(0, int(result.get("dom_generation", 0))),
+        "document_epoch": result.get("document_epoch"),
     }
 
 
@@ -230,6 +263,8 @@ async def wait_for_render_settle(
             latest["challenge_indicators"],
             latest["title"],
             latest.get("configured_readiness_met", True),
+            latest.get("dom_generation", 0),
+            latest.get("document_epoch"),
         )
         activity = network_activity() if network_activity is not None else {}
         generation = int(activity.get("generation", 0))

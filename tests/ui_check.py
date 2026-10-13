@@ -26,7 +26,7 @@ async def main():
         )
         await page.goto(base_url, wait_until="networkidle")
         build_metadata = await page.evaluate("async () => (await fetch('/api/diagnostics/build', {cache:'no-store'})).json()")
-        assert build_metadata["version"] == "1.12.8"
+        assert build_metadata["version"] == "1.12.9"
         assert await page.evaluate("loadedFrontendSha256") == build_metadata["frontend_sha256"]
         assert await page.evaluate("loadedFrontendIntegrity.startsWith('sha256-')")
         assert "Frontend matched" in await page.locator("#build-summary").text_content()
@@ -221,6 +221,56 @@ async def main():
         assert await page.locator('[data-coverage-dimension="authentication"] strong').text_content() == "READY"
         assert "blocked by policy" in await page.locator('[data-coverage-dimension="api"] p').text_content()
         assert await page.locator("#api-lifecycle-api_http_failures").text_content() == "1"
+        assert await page.locator("#failed-endpoint-list tr").count() == 1
+        assert "/query" in await page.locator("#failed-endpoint-list").text_content()
+        assert "/blocked/" not in await page.locator("#failed-endpoint-list").text_content()
+        await page.evaluate("""() => {
+          window.failureInventoryOriginal = {apis:lastReport.api_inventory, resources:lastReport.resource_inventory};
+          lastReport.api_inventory = [...lastReport.api_inventory,
+            {method:'GET',host:'api.example.net',endpoint:'/remote<configuration>.json',status_5xx:1,
+              response_status_counts:{502:1},failure_count:1,network_failures:0,response_body_failures:0,
+              observation_outcome:'FAILED',lifecycle_status_counts:{INCOMPLETE:1},
+              routes_using_endpoint:['/health'],first_seen:'2026-10-12T14:00:00Z',last_seen:'2026-10-12T14:00:01Z',
+              validation_status:'FAILED',validation_reasons:[{code:'HTTP_502',message:'The endpoint returned HTTP 502.'}],
+              ignored_private_payload:'synthetic-private-value'},
+            {method:'POST',host:'api.example.net',endpoint:'/unfinished',response_status_counts:{},incomplete_calls:1,
+              network_failures:0,status_4xx:0,status_5xx:0,response_body_failures:0},
+            {method:'GET',host:'api.example.net',endpoint:'/transport',response_status_counts:{},network_failures:1,
+              failure_count:1,routes_using_endpoint:['/health']}];
+          lastReport.resource_inventory = [
+            {host:'assets.example.net',path:'/remote.js',type:'SCRIPT',calls:1,failures:1,
+              response_status_counts:{503:1},failure_type_counts:{HTTP_5XX:1},routes_using_resource:['/health']},
+            {host:'assets.example.net',path:'/interrupted.js',type:'SCRIPT',method:'GET',calls:1,failures:1,
+              response_status_counts:{200:1},failure_type_counts:{RESPONSE_BODY_FAILURE:1},routes_using_resource:['/health']},
+            {host:'assets.example.net',path:'/policy-blocked.js',type:'SCRIPT',calls:1,failures:0,
+              validator_blocks:1,response_status_counts:{},failure_type_counts:{POLICY_BLOCKED:1}},
+            {host:'assets.example.net',path:'/pending.js',type:'SCRIPT',calls:1,failures:0,
+              response_status_counts:{},failure_type_counts:{INCOMPLETE:1}}];
+          renderFailedEndpoints();
+        }""")
+        assert await page.locator("#failed-endpoint-list tr").count() == 5
+        failed_text = await page.locator("#failed-endpoint-list").text_content()
+        for evidence in ("502 (1)", "503 (1)", "HTTP_FAILURE", "NETWORK_FAILURE", "Health",
+                         "2026-10-12T14:00:00Z", "2026-10-12T14:00:01Z", "Not recorded"):
+            assert evidence in failed_text, evidence
+        for excluded in ("/blocked/", "/unfinished", "/policy-blocked.js", "/pending.js", "synthetic-private-value"):
+            assert excluded not in failed_text, excluded
+        assert await page.locator("#failed-endpoint-list configuration").count() == 0
+        interrupted_row = page.locator("#failed-endpoint-list tr").filter(has_text="/interrupted.js")
+        assert await interrupted_row.locator("td").nth(5).text_content() == "RESPONSE_BODY_FAILURE"
+        gateway_row = page.locator("#failed-endpoint-list tr").filter(has_text="/remote<configuration>.json")
+        assert await gateway_row.locator("td").nth(6).text_content() == "1"
+        await gateway_row.get_by_role("button", name="Inspect failure").click()
+        failure_evidence = await page.locator("#evidence-content").text_content()
+        assert '"502": 1' in failure_evidence and '"INCOMPLETE": 1' in failure_evidence
+        assert "synthetic-private-value" not in failure_evidence
+        await page.locator("#evidence-close").click()
+        await page.evaluate("""() => {
+          lastReport.api_inventory = window.failureInventoryOriginal.apis;
+          lastReport.resource_inventory = window.failureInventoryOriginal.resources;
+          delete window.failureInventoryOriginal;
+          renderFailedEndpoints();
+        }""")
         assert "NAVIGATION_CONTROLS_UNRESOLVED" in await page.locator("#navigation-coverage-limitations").text_content()
         await page.locator("#navigation-explorer > summary").click()
         assert "Operations" in await page.locator("#navigation-tree").text_content()
@@ -578,17 +628,24 @@ async def main():
         assert await page.locator("#route-inspector-expand").text_content() == "Collapse"
         assert await page.locator("#route-inspector").evaluate("element => element.clientHeight") > initial_height
         assert await page.locator("#route-inspector").evaluate("element => getComputedStyle(element).resize") == "vertical"
-        # Opening Inspect intentionally smooth-scrolls the outer document. Stop
-        # that still-running animation before testing inner-scroll isolation;
-        # separate CDP round trips must not mistake animation progress for an
-        # outer scroll caused by the inspector's own scrollTop assignment.
-        await page.evaluate("window.scrollTo({top: window.scrollY, behavior: 'instant'})")
-        initial_scroll = await page.evaluate("window.scrollY")
-        assert await page.locator("#route-inspector-content").evaluate("""element => {
+        # Cancel the intentional outer smooth scroll and let panel resize/layout
+        # callbacks settle. Measure inner-scroll isolation in one browser task,
+        # including subsequent rendering frames, not separate CDP round trips
+        # that can mistake pre-existing animation/layout for scroll coupling.
+        scroll_isolation = await page.locator("#route-inspector-content").evaluate("""async element => {
+          const frame = () => new Promise(resolve => requestAnimationFrame(resolve));
+          window.scrollTo({top: window.scrollY, behavior: 'instant'});
+          await frame();
+          await frame();
+          const before = window.scrollY;
           element.scrollTop = 300;
-          return element.scrollTop > 0 && element.scrollHeight > element.clientHeight;
+          const innerScrolled = element.scrollTop > 0 && element.scrollHeight > element.clientHeight;
+          await frame();
+          await frame();
+          return {before, after:window.scrollY, innerScrolled};
         }""")
-        assert await page.evaluate("window.scrollY") == initial_scroll
+        assert scroll_isolation["innerScrolled"], scroll_isolation
+        assert scroll_isolation["after"] == scroll_isolation["before"], scroll_isolation
         await page.locator("#route-inspector-copy").click()
         copied = await page.evaluate("window.copiedRouteDiagnostics")
         assert "[REDACTED]" in copied or "%5BREDACTED%5D" in copied
@@ -956,7 +1013,7 @@ async def main():
             if "Cross-Origin-Opener-Policy header has been ignored" not in error
         ]
         assert not actionable_errors, actionable_errors
-        print("UI_SMOKE_PASSED: phase controls, traffic roles/lifecycle, POST form contract/counters, actual scan duration, blocked methods, columns/persistence, density, warnings, pointer/keyboard panel resizing and session persistence, expandable/fullscreen sanitized diagnostic copy/export, long diagnostics, independent scrolling/sticky headers/keyboard focus, resource filters, synchronized scrolling, 44 routes, 52 paginated routes, 1000 paginated API records, mobile layouts, strict CSP")
+        print("UI_SMOKE_PASSED: phase controls, traffic roles/lifecycle, definitive HTTP/network/resource failure table with timestamps and blocked/incomplete exclusion, POST form contract/counters, actual scan duration, blocked methods, columns/persistence, density, warnings, pointer/keyboard panel resizing and session persistence, expandable/fullscreen sanitized diagnostic copy/export, long diagnostics, independent scrolling/sticky headers/keyboard focus, resource filters, synchronized scrolling, 44 routes, 52 paginated routes, 1000 paginated API records, mobile layouts, strict CSP")
         await browser.close()
 
 

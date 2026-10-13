@@ -723,6 +723,25 @@ def _api_execution_evidence(event: dict[str, Any]) -> dict[str, bool]:
     }
 
 
+def unvisited_route_reason(termination_reason: str) -> str:
+    """Use the same explicit stop reason in inventory rows and counters."""
+    return {
+        "MAX_ROUTES_REACHED": "NOT_TESTED_MAX_ROUTES",
+        "SCAN_TIMEOUT": "NOT_TESTED_TIMEOUT",
+        "USER_CANCELLED": "NOT_TESTED_CANCELLED",
+        "SESSION_EXPIRED": "NOT_TESTED_SESSION_EXPIRED",
+        "APPLICATION_NOT_READY": "NOT_TESTED_APPLICATION_NOT_READY",
+        "AUTHENTICATION_BLOCKED": "NOT_TESTED_AUTHENTICATION_BLOCKED",
+        "AUTH_REQUIRED": "NOT_TESTED_AUTHENTICATION_REQUIRED",
+        "AUTHENTICATION_REQUIRED": "NOT_TESTED_AUTHENTICATION_REQUIRED",
+        "MFA_REQUIRED": "NOT_TESTED_AUTHENTICATION_REQUIRED",
+        "AUTH_FAILED": "NOT_TESTED_AUTHENTICATION_FAILED",
+        "AUTH_TIMEOUT": "NOT_TESTED_AUTHENTICATION_TIMEOUT",
+        "ACCESS_RESTRICTED": "NOT_TESTED_ACCESS_RESTRICTED",
+        "CHALLENGE_REQUIRED": "NOT_TESTED_CHALLENGE_REQUIRED",
+    }.get(termination_reason, "NOT_TESTED")
+
+
 def aggregate_report(
     results: list[dict[str, Any]],
     *,
@@ -748,12 +767,7 @@ def aggregate_report(
     validated_count = len(results)
     skipped_count = min(max(0, routes_skipped), max(0, eligible_count - validated_count))
     not_tested_count = max(0, eligible_count - validated_count - skipped_count)
-    not_tested_reason = {
-        "MAX_ROUTES_REACHED": "NOT_TESTED_MAX_ROUTES",
-        "SCAN_TIMEOUT": "NOT_TESTED_TIMEOUT",
-        "USER_CANCELLED": "NOT_TESTED_CANCELLED",
-        "SESSION_EXPIRED": "NOT_TESTED_SESSION_EXPIRED",
-    }.get(termination_reason, "NOT_TESTED")
+    not_tested_reason = unvisited_route_reason(termination_reason)
     not_tested_reason_counts = (
         {not_tested_reason: not_tested_count} if not_tested_count else {}
     )
@@ -1541,12 +1555,22 @@ def aggregate_resource_inventory(results: list[dict[str, Any]]) -> list[dict[str
                 "calls": 0,
                 "failures": 0,
                 "validator_blocks": 0,
+                "methods": Counter(),
+                "first_seen": None,
+                "last_seen": None,
                 "response_status_counts": Counter(),
                 "failure_type_counts": Counter(),
                 "lifecycle_status_counts": Counter(),
                 "routes": set(),
             })
             item["calls"] += 1
+            method = event.get("method")
+            if isinstance(method, str) and method:
+                item["methods"][method.upper()] += 1
+            observed_at = event.get("observed_at")
+            if observed_at:
+                item["first_seen"] = item["first_seen"] or observed_at
+                item["last_seen"] = observed_at
             status = event.get("status")
             if isinstance(status, int) and not isinstance(status, bool) and 100 <= status < 600:
                 item["response_status_counts"][str(status)] += 1
@@ -1564,8 +1588,11 @@ def aggregate_resource_inventory(results: list[dict[str, Any]]) -> list[dict[str
     output: list[dict[str, Any]] = []
     for item in inventory.values():
         routes = sorted(item.pop("routes"))
+        methods = dict(item.pop("methods"))
         failure_types = dict(item["failure_type_counts"])
         item.update({
+            "method": next(iter(methods)) if len(methods) == 1 else "MULTIPLE" if methods else None,
+            "method_counts": methods,
             "routes_using_resource": routes,
             "route_count": len(routes),
             "health": (

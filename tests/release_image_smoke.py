@@ -93,7 +93,7 @@ for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
     assert os.environ[name] == expected_bundle
 identity = build_diagnostics()
 print("BUILD_IDENTITY=" + json.dumps(identity), flush=True)
-assert identity["version"] == "1.12.8"
+assert identity["version"] == "1.12.9"
 assert identity["source_integrity"]["status"] == "VERIFIED"
 print("PLAYWRIGHT_VERSION=" + m.version("playwright"), flush=True)
 assert m.version("playwright") == "1.63.0"
