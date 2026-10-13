@@ -113,24 +113,49 @@ organization-specific route is included.
 
 ## Build and verification
 
-### Executed checks and publication limitation
+### Executed checks and published images
 
 The Windows source-suite run collected 778 tests. All 777 runnable tests passed
 after updating the legacy resource-inventory expectation for the new optional
 method/timestamp fields. The ConfigMap symlink-layout test was skipped because
-this Windows environment could not create its fixture symlinks; it still needs
-Linux execution. The full browser dashboard smoke also passed, including the
-Failed Endpoints cases, diagnostic isolation, independent scrolling, table
+this Windows environment could not create its fixture symlinks. That test
+subsequently passed in Linux. The full browser dashboard smoke also passed,
+including the Failed Endpoints cases, diagnostic isolation, independent scrolling, table
 performance and mobile layouts. Inspector scroll assertions allow pending
 resize/render callbacks to settle before measuring scroll isolation.
 
-Both versioned images built locally with final-runtime source-identity,
-matching Chromium executable and browser-launch checks before WSL became
-unavailable. Windows subsequently reported `WslService` as `STOP_PENDING`.
-Final committed-image checks, current vulnerability scans and Docker Hub pushes
-have not completed. Restore WSL/Docker, rebuild with the published commit's
-identity, run the checks below, and publish only `1.12.9` and `1.12.9-debug`.
-No OpenShift rollout or private-portal validation was performed.
+After a user-approved WSL service recovery, both images were rebuilt from
+application commit `5694dc3873457bbc5c5c5468a2e56cfa93c176b6` at
+`2026-10-13T14:33:30Z`. Final-runtime source identity, matching Chromium
+executable and browser launch checks passed. Both images retain
+Playwright 1.63.0 / Chromium revision 1243 and glibc 2.44-r8.
+
+Twenty-four focused Linux regressions passed in the final debug image with
+zero failures or skips, including the ConfigMap symlink-layout test. All
+application imports came from `/app`, not a mounted source tree. Both final
+images passed the release smoke under UID `1000820000`, with a read-only root
+filesystem, dropped capabilities and no-new-privileges. Strict local Python
+TLS, Chromium NSS TLS, Google HTTPS (HTTP 200), application startup, redacted
+access logging, graceful SIGTERM and repeated entrypoint initialization passed.
+
+Trivy 0.72.0 found zero vulnerabilities at every severity in both final images
+using the database updated `2026-10-13T13:06:33Z`. This is a time-specific
+scanner result, not a guarantee about future findings or other scanners.
+
+Only these versioned Docker Hub tags were published on October 13, 2026:
+
+| Tag | Manifest digest |
+| --- | --- |
+| `mohankrishna999/portal-validator:1.12.9` | `sha256:f47f3d92ea2eb19133c527aeabcc96305c4c40534fe486ffd3514908b86d831a` |
+| `mohankrishna999/portal-validator:1.12.9-debug` | `sha256:4cca3d8ee2783feb3ce971219ac17b79a89cf2bfd3caee483acbaa656496b672` |
+
+Independent registry inspection verified both manifest/config digests,
+`linux/amd64`, version/revision labels, user `10001:10001`, Docker schema 2
+manifests and exclusively gzip-compressed Docker layers.
+
+No OpenShift rollout or private-portal validation was performed. This
+publication record is documentation-only; the images identify the application
+commit above, rather than the later documentation commit.
 
 Run the full suite against the final committed source and final image:
 
