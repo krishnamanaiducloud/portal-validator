@@ -1536,8 +1536,16 @@ async def perform_route_navigation(
                 """sourceUrl => {
                   const baseline = (window.__portalValidatorObservedRoutes || []).find(
                     item => item && item.mode === 'document' && typeof item.url === 'string');
-                  if (!baseline) return null;
-                  const actual = new URL(baseline.url), expected = new URL(sourceUrl);
+                  const httpDocument = value => {
+                    try {
+                      const candidate = new URL(value);
+                      return ['http:', 'https:'].includes(candidate.protocol) ? candidate : null;
+                    } catch (_) { return null; }
+                  };
+                  const actual = httpDocument(baseline?.url) ||
+                    httpDocument(performance.getEntriesByType('navigation')[0]?.name);
+                  if (!actual) return null;
+                  const expected = new URL(sourceUrl);
                   return actual.origin === expected.origin && actual.pathname === expected.pathname &&
                     actual.search === expected.search;
                 }""",
@@ -1550,6 +1558,8 @@ async def perform_route_navigation(
         # Unrelated SPAs can visit identical history URLs; those observations
         # cannot establish shared document ownership. Ignore an initial hash
         # when comparing the baseline with its fragment-free HTTP response.
+        # Initial popup globals can retain an about:blank observer baseline;
+        # Navigation Timing identifies its actual document in that case.
         # Restore a displaced source through normal guarded GET navigation,
         # preserving context cookies and actual HTTP/TLS response evidence.
         if not source_is_current_document:

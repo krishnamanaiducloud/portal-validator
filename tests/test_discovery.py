@@ -286,6 +286,53 @@ async def test_synthetic_spa_routes_render_without_additional_document_requests(
 
 
 @pytest.mark.asyncio
+async def test_popup_about_blank_baseline_uses_actual_document_timing_without_reload():
+    workspace = "https://portal.example/workspace"
+    document_requests = []
+    async with async_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).is_file():
+            pytest.skip("matching Playwright Chromium is not installed on this host")
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context()
+            await context.add_init_script(script=ROUTE_OBSERVER_SCRIPT)
+
+            async def document(route):
+                document_requests.append(route.request.url)
+                body = '''<title>Popup workspace</title><main id="content">Workspace overview</main>
+                  <a href="#/reports">Reports</a><script>addEventListener('hashchange', () => {
+                    document.querySelector('#content').textContent = 'Reports application content';
+                  });</script>''' if route.request.url == workspace else '<main>Portal home</main>'
+                await route.fulfill(content_type="text/html", body=body)
+
+            await context.route("https://portal.example/**", document)
+            opener = await context.new_page()
+            await opener.goto("https://portal.example/")
+            async with opener.expect_popup() as opened:
+                await opener.evaluate("window.open('/workspace', '_blank')")
+            popup = await opened.value
+            await popup.wait_for_load_state("domcontentloaded")
+            # Chromium can retain the initial popup's about:blank globals.
+            # Force that observed state so the regression also covers engines
+            # that currently initialize the observer after document commit.
+            await popup.evaluate("""() => {
+              window.__portalValidatorObservedRoutes = [{url:'about:blank', mode:'document'}];
+            }""")
+            response, transitioned, _activation = await perform_route_navigation(
+                popup, workspace + "#/reports", HASH_ROUTE_TRANSITION, 5000,
+                label="Reports", source="a", source_document_url=workspace,
+                source_route_url=workspace,
+            )
+            assert response is None
+            assert transitioned is True
+            assert document_requests.count(workspace) == 1
+            assert await popup.opener() == opener
+            assert await popup.locator("#content").inner_text() == "Reports application content"
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("route_mode", [HASH_ROUTE_TRANSITION, SPA_ROUTE_TRANSITION])
 @pytest.mark.parametrize("overlapping_history", [False, True])
 async def test_queued_spa_route_restores_its_source_document_and_api_context(

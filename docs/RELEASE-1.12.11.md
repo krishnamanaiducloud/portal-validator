@@ -27,6 +27,9 @@ authentication, SSRF, TLS or read-only execution.
   authentication/business POST documents are never replayed.
   A sibling application independently visiting the same history URL still
   restores the correct source document instead of inheriting the wrong DOM.
+  A popup whose observer started at `about:blank` uses its actual Navigation
+  Timing document identity instead; this preserves the original window,
+  avoids duplicate tabs and does not accept unrelated history observations.
 - Completed-progress authenticated fixture: one loaded page, two retained but
   untested routes and `APPLICATION_NOT_READY` before; three rendered, ready,
   passing routes afterward.
