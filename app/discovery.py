@@ -340,7 +340,12 @@ def normalize_route_url(
     query_policy: str = "ignore",
     allowed_query_parameters: set[str] | None = None,
 ) -> str | None:
-    """Return a deterministic HTTP(S) route identity without auth/tracking secrets."""
+    """Return a deterministic HTTP(S) route identity without auth/tracking secrets.
+
+    The default query policy ignores the document's HTTP query. Logical SPA
+    fragments retain their route parameters so separate views cannot collapse
+    into the landing route. An explicit allowlist also bounds those parameters.
+    """
     try:
         parsed = urlsplit(urljoin(base_url or value, value))
         hostname = (parsed.hostname or "").strip().rstrip(".").lower()
@@ -380,7 +385,11 @@ def normalize_route_url(
     else:
         fragment_path, separator, fragment_query = fragment.partition("?")
         fragment_items: list[tuple[str, str]] = []
-        if separator and query_policy != "ignore":
+        # SPA fragment parameters identify client-side views and are not sent
+        # in the document request. Preserve their known-working identity under
+        # the default policy, while retaining all secret/tracking exclusions
+        # and the caller's explicit allowlist.
+        if separator:
             for key, item_value in parse_qsl(fragment_query, keep_blank_values=True):
                 lowered = key.lower()
                 if (
@@ -1342,6 +1351,8 @@ async def perform_route_navigation(
     label: str | None = None,
     source: str | None = None,
     view_control: dict[str, str] | None = None,
+    source_document_url: str | None = None,
+    source_route_url: str | None = None,
     on_popup: Callable[[Any], Awaitable[None]] | None = None,
 ):
     """Navigate a document or transition an existing SPA document.
@@ -1505,6 +1516,42 @@ async def perform_route_navigation(
         return response, False, "DOCUMENT"
     if mode not in SAME_DOCUMENT_NAVIGATIONS:
         raise RuntimeError("Unsupported navigation mode")
+    restored_response = None
+    if source_route_url or source_document_url:
+        current = urlsplit(page.url)
+        source_document = urlsplit(source_document_url or source_route_url)
+        target = urlsplit(url)
+        source_origin = (source_document.scheme, source_document.hostname, source_document.port)
+        if source_origin != (target.scheme, target.hostname, target.port):
+            raise RuntimeError("Same-document route transition crossed an origin boundary")
+        if (current.scheme, current.netloc, current.path, current.query) != (
+            source_document.scheme, source_document.netloc,
+            source_document.path, source_document.query,
+        ):
+            source_is_current_document = await evaluate_dom(
+                page,
+                "sourceUrls => (window.__portalValidatorObservedRoutes || []).some(item => "
+                "sourceUrls.includes(typeof item === 'string' ? item : item.url))",
+                [value for value in (source_document_url, source_route_url) if value],
+                timeout_ms=timeout_ms,
+            )
+            # Breadth-first traversal can replace the originating SPA with a
+            # sibling document. History mutation alone would then change its
+            # URL while inspecting the sibling's DOM and missing the SPA's API
+            # traffic. Restore the observed source through normal guarded
+            # navigation, preserving the shared context and actual HTTP/TLS
+            # evidence, before dispatching the transition exactly once.
+            # The document-local history observer survives sibling SPA paths
+            # but resets on a real document navigation. Its source observation
+            # avoids unnecessary reloads when only browser history moved.
+            if not source_is_current_document:
+                if source_document_url is None:
+                    raise RuntimeError("Displaced SPA source document has no observed GET restoration target")
+                restored_response = await page.goto(
+                    source_document_url, wait_until="domcontentloaded", timeout=timeout_ms,
+                )
+                if restored_response is None:
+                    raise RuntimeError("Source document restoration completed without an HTTP response")
     activated = await activate_semantic_route(
         page,
         url,
@@ -1528,4 +1575,4 @@ async def perform_route_navigation(
         raise RuntimeError("Same-document route transition did not reach the requested route") from exc
     if page.is_closed():
         raise RuntimeError("Browser page closed during same-document route transition")
-    return None, True, "SEMANTIC_CONTROL" if activated else "SYNTHETIC_FALLBACK"
+    return restored_response, True, "SEMANTIC_CONTROL" if activated else "SYNTHETIC_FALLBACK"

@@ -1,4 +1,4 @@
-ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.10
+ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.11
 FROM ${PRODUCTION_IMAGE}
 
 ENV MAX_CONCURRENT_SCANS=1

@@ -1,11 +1,13 @@
 # Portal Validator
 
-Portal Validator 1.12.10 is a read-only browser health validator with optional authentication for public,
+Portal Validator 1.12.11 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
 results without disabling certificate verification.
 
+See [1.12.11 regression verification](docs/RELEASE-1.12.11.md) for the
+known-good discovery comparison, SPA fragment identity and source-document restoration.
 See [1.12.10 release verification](docs/RELEASE-1.12.10.md) for authentication
 configuration diagnostics, scoped view readiness and correlated API failures.
 See [1.12.9 release verification](docs/RELEASE-1.12.9.md) for lazy Material/CDK
@@ -310,10 +312,10 @@ Build versioned tags only:
 ```bash
 docker build --build-arg VCS_REF="$(git rev-parse HEAD)" \
   --build-arg BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -t mohankrishna999/portal-validator:1.12.10 .
+  -t mohankrishna999/portal-validator:1.12.11 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.10 \
-  -t mohankrishna999/portal-validator:1.12.10-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.11 \
+  -t mohankrishna999/portal-validator:1.12.11-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -328,7 +330,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.12.10
+  mohankrishna999/portal-validator:1.12.11
 ```
 
 ## OpenShift
@@ -425,6 +427,14 @@ distinct routes. A failed validation also includes `failure_dimension`,
 `failure_reason`, and sanitized supporting findings while retaining document
 HTTP status as independent evidence. Client-only transitions display
 `N/A (SPA)` rather than fabricating an HTTP response.
+
+The default query policy ignores ordinary document query parameters but retains
+non-sensitive SPA fragment parameters: `#/workspace?view=reports` and
+`#/workspace?view=activity` remain different destinations. Authentication and
+tracking parameters are always excluded. The explicit parameter allowlist also
+applies to fragment parameters. Same-document routes retain their source
+document; if another queued destination replaces it, the source is restored
+through the existing guarded navigation before activating the SPA route.
 
 The portal-health summary reports discovered, eligible, queued, validated,
 skipped, and not-tested routes. `coverage_grade` is `COMPLETE`, `PARTIAL`,

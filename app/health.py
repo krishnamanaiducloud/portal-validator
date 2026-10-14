@@ -91,7 +91,22 @@ RENDER_HEALTH_SCRIPT = r"""
     .filter(isVisible)
     .map((element) => (element.textContent || '').replace(/\s+/g, ' ').trim())
     .join(' ').slice(0, 500);
-  const busy = healthAll('[aria-busy="true"], [role="progressbar"]').filter(isVisible).length;
+  const completedProgressbar = (element) => {
+    if (element.getAttribute('role') !== 'progressbar') return false;
+    const numberAttribute = (name, fallback) => {
+      const value = element.getAttribute(name);
+      return value === null ? fallback : value.trim() ? Number(value) : NaN;
+    };
+    const minimum = numberAttribute('aria-valuemin', 0);
+    const maximum = numberAttribute('aria-valuemax', 100);
+    const value = numberAttribute('aria-valuenow', NaN);
+    return Number.isFinite(minimum) && Number.isFinite(maximum) && Number.isFinite(value)
+      && maximum > minimum && value >= maximum;
+  };
+  // A completed determinate bar is rendered status, not an active loader.
+  // Explicit busy state remains authoritative, including on the same bar.
+  const busy = healthAll('[aria-busy="true"], [role="progressbar"]').filter(isVisible)
+    .filter(element => element.getAttribute('aria-busy') === 'true' || !completedProgressbar(element)).length;
   const challenge = healthAll([
     '[data-sitekey]',
     'iframe[src*="captcha" i]',

@@ -1023,6 +1023,7 @@ async def execute_scan(
     action_limited_routes: set[str] = set()
     route_locations: dict[str, str] = {requested_route: requested_route}
     route_page_keys: dict[str, str] = {}
+    route_document_sources: dict[str, str | None] = {}
     active_browser_page_key: str | None = None
     route_parent_ids: dict[str, str | None] = {requested_route: None}
     route_name_by_id: dict[str, str] = {requested_route: "Requested route"}
@@ -1113,6 +1114,18 @@ async def execute_scan(
             page_key = route.browser_page_key or active_browser_page_key
             if page_key is not None:
                 route_page_keys.setdefault(route_key, page_key)
+            if route.navigation_mode in SAME_DOCUMENT_NAVIGATIONS:
+                source_page = browser_pages.get(page_key)
+                source_response = document_response_for(source_page) if source_page is not None else None
+                # A history URL may have no server document route. Retain the
+                # actual document GET separately; never replay a POST that
+                # established an authentication/application document.
+                route_document_sources.setdefault(
+                    route_key,
+                    source_response.url
+                    if source_response is not None and source_response.request.method.upper() == "GET"
+                    else None,
+                )
             route_locations[route_key] = identity
             parent_route_id = route.opener_route_id or active_route_id
             route_parent_ids.setdefault(route_key, parent_route_id)
@@ -2517,6 +2530,8 @@ async def execute_scan(
                                     label=route_label,
                                     source=route_source,
                                     view_control=view_control,
+                                    source_document_url=route_document_sources.get(route_key),
+                                    source_route_url=discovered_from,
                                     on_popup=select_semantic_popup,
                                 )
                                 if semantic_popup is not None:

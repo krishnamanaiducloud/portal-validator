@@ -21,7 +21,7 @@ from app.discovery import (
     route_identity_fields,
     safe_navigation_control,
 )
-from app.main import partition_links, url_in_scan_scope
+from app.main import ScanRequest, execute_scan, partition_links, url_in_scan_scope
 
 
 @pytest.mark.parametrize(("value", "policy", "allowed", "expected"), [
@@ -196,6 +196,21 @@ async def test_same_document_transition_that_never_completes_fails():
 
 
 @pytest.mark.asyncio
+async def test_displaced_spa_without_observed_get_source_is_not_replayed():
+    class DisplacedPage(_TransitionFailurePage):
+        url = "https://portal.example.com/other"
+
+        async def evaluate(self, _script, _argument):
+            return False
+
+    with pytest.raises(RuntimeError, match="no observed GET restoration target"):
+        await perform_route_navigation(
+            DisplacedPage(), "https://portal.example.com/reports", SPA_ROUTE_TRANSITION, 50,
+            source_route_url="https://portal.example.com/post-authenticated-shell",
+        )
+
+
+@pytest.mark.asyncio
 async def test_synthetic_spa_routes_render_without_additional_document_requests():
     class Handler(BaseHTTPRequestHandler):
         document_requests = 0
@@ -253,6 +268,7 @@ async def test_synthetic_spa_routes_render_without_additional_document_requests(
                 ):
                     response, transitioned, activation = await perform_route_navigation(
                         page, target, mode, 5000,
+                        source_document_url=f"{origin}/reports",
                     )
                     assert response is None
                     assert transitioned is True
@@ -261,6 +277,112 @@ async def test_synthetic_spa_routes_render_without_additional_document_requests(
                 assert Handler.document_requests == 1
             finally:
                 await browser.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route_mode", [HASH_ROUTE_TRANSITION, SPA_ROUTE_TRANSITION])
+async def test_queued_spa_route_restores_its_source_document_and_api_context(monkeypatch, route_mode):
+    """A prior document branch must not receive a sibling SPA's history update."""
+    from app import main, security
+
+    hash_route = route_mode == HASH_ROUTE_TRANSITION
+
+    class Handler(BaseHTTPRequestHandler):
+        report_cookies = []
+
+        def do_GET(self):
+            if self.path == "/api/report-data":
+                type(self).report_cookies.append(self.headers.get("Cookie", ""))
+                body = b'{"message":"Rendered reports application data"}'
+                content_type = "application/json"
+            elif self.path == "/other":
+                body = b"<title>Other document</title><main><h1>Unrelated document contents</h1></main>"
+                content_type = "text/html"
+            elif self.path == "/index":
+                navigation = '<a href="#/reports">Reports</a>' if hash_route else ""
+                observe_history = "" if hash_route else (
+                    "history.pushState({}, '', '/reports'); history.replaceState({}, '', '/workspace');"
+                )
+                route_event = "hashchange" if hash_route else "popstate"
+                body = ('''<!doctype html><title>Original SPA workspace</title><main>
+                  <h1 id="heading">Original SPA workspace content</h1><nav>
+                  <a href="/other">Other document</a>''' + navigation + '''</nav>
+                  <output id="data">Home view data</output></main><script>
+                  document.cookie = 'scan_session=retained; path=/';
+                  ''' + observe_history + '''
+                  function render() {
+                    if (!(location.hash === '#/reports' || location.pathname === '/reports')) return;
+                    document.title = 'Reports application workspace';
+                    document.querySelector('#heading').textContent = 'Reports application content';
+                    fetch('/api/report-data').then(response => response.json()).then(data => {
+                      document.querySelector('#data').textContent = data.message;
+                    });
+                  }
+                  addEventListener("''' + route_event + '''", render);
+                  </script>''').encode()
+                content_type = "text/html"
+            else:
+                self.send_error(404, "History routes have no server document fallback")
+                return
+            self.send_response(200)
+            if self.path == "/other":
+                self.send_header("Set-Cookie", "sibling_session=retained; Path=/")
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    origin = f"http://127.0.0.1:{server.server_port}"
+    monkeypatch.setattr(security, "ALLOWED_PORTS", {*security.ALLOWED_PORTS, server.server_port})
+    original_resolver = main.resolve_and_validate
+
+    async def fixture_destination(host, allow_private):
+        if host == "127.0.0.1":
+            return ["127.0.0.1"]
+        return await original_resolver(host, allow_private)
+
+    monkeypatch.setattr(main, "resolve_and_validate", fixture_destination)
+    try:
+        async with async_playwright() as playwright:
+            if not Path(playwright.chromium.executable_path).is_file():
+                pytest.skip("matching Playwright Chromium is not installed on this host")
+        report = await execute_scan(ScanRequest(
+            target=origin + "/index", allow_private_networks=True, max_pages=3, max_depth=2,
+            timeout_ms=5000, total_timeout_ms=20000, max_discovery_scrolls=0,
+            min_observation_ms=100, network_quiet_ms=50, render_settle_ms=100,
+            check_security_headers=False,
+        ))
+        target = origin + ("/index#/reports" if hash_route else "/reports")
+        assert [item["requested_url"] for item in report["results"]] == [
+            origin + "/index", origin + "/other", target,
+        ]
+        route = report["results"][-1]
+        assert route["title"] == "Reports application workspace"
+        assert route["navigation_type"] == route_mode
+        assert route["status"] == 200
+        assert route["application_ready"] is True
+        assert route["render_health"]["text_length"] >= len("Rendered reports application data")
+        events = [event for event in route["api_requests"] if event["url"] == origin + "/api/report-data"]
+        assert len(events) == 1
+        assert events[0]["status"] == 200
+        assert events[0]["route_activation_id"] == route["route_activation_id"]
+        assert events[0]["initiating_route"] == route["route_id"]
+        assert len(Handler.report_cookies) == 1
+        assert set(Handler.report_cookies[0].split("; ")) == {
+            "scan_session=retained", "sibling_session=retained",
+        }
+        assert all(report["summary"]["counter_invariants"].values())
     finally:
         server.shutdown()
         server.server_close()
