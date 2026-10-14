@@ -90,7 +90,7 @@ async def test_bootstrap_readiness_event_is_document_scoped_and_payload_free():
             content_type="text/html", body=documents[route.request.url],
         ))
         await page.goto("https://portal.example/ready")
-        options = dict(settle_ms=0, maximum_ms=200, minimum_observation_ms=0,
+        options = dict(settle_ms=0, maximum_ms=1000, minimum_observation_ms=0,
                        network_quiet_ms=0, readiness_selector="[data-ready]", readiness_event="workspace:ready")
         ready = await health.wait_for_render_settle(page, **options)
         assert health.application_shell_ready(ready)
@@ -135,7 +135,7 @@ async def test_selected_panel_requires_its_own_rendered_content(content, expecte
             this.setAttribute('aria-selected','true');document.querySelector('#report').hidden=false">
             Reports</button></nav><section id="report" hidden style="height:100px">''' + content + '</section></main>')
         view = next(route for route in await discover_page_routes(page, 0) if route.view_control)
-        await activate_ui_view(page, view.view_control, 1000)
+        await activate_ui_view(page, view.view_control, 5000)
         result = await health.wait_for_render_settle(
             page, view_control=view.view_control, settle_ms=0, maximum_ms=150,
             minimum_observation_ms=0, network_quiet_ms=0,

@@ -103,9 +103,55 @@ case; its final-source readiness/resource/Material suite passed all 46 cases.
 Final collection contains 826 cases. The integrated dashboard smoke passed,
 including actual form-to-API host/event submission, authentication guidance,
 safe correlated occurrence diagnostics, failure filtering, 1,000-record API
-pagination, mobile layout and strict CSP. The symlink case still requires
-Linux execution. Final-image checks, current vulnerability scans and registry
-verification remain publication gates, not assumed successes.
+pagination, mobile layout and strict CSP.
+
+The final debug image passed 48 focused Linux cases with zero failures/skips,
+including the ConfigMap symlink test, seven-view Material scan, and all new
+authentication/readiness/configuration/API taxonomy cases. Source identity was
+VERIFIED before and after, and all application imports came from `/app`, not
+a host-source mount. Two synthetic test-only budgets were adjusted after
+container timing exposed an unsupported 200 ms positive-readiness assumption
+and a short activation budget. All assertions and production limits remained
+unchanged; the adjusted host cases also passed. Prior failed-run logs were
+preserved rather than counted as successful runs.
+
+Both images passed release smoke under arbitrary UID `1000820000`, read-only
+root, dropped capabilities and no-new-privileges. Strict Python and Chromium
+local/NSS TLS, Google HTTP 200, application/debug startup, source identity,
+redacted access logging, graceful SIGTERM, and repeated trust initialization
+passed. The first debug public-navigation check hit a transport timeout; its
+unchanged full retry passed without altering TLS checks or timeouts.
+
+Completed Trivy 0.72.0 scans found zero vulnerabilities at every severity in
+both final images, using the database updated `2026-10-13T13:06:33Z`. The
+initial production analysis timed out; serial analysis (`--parallel 1`,
+10-minute limit) completed successfully for both. Scan scheduling changed,
+not vulnerability policies or TLS settings. No Java artifacts were detected.
+These are time-specific scanner results, not guarantees about future findings.
+
+### Published artifacts
+
+Both `linux/amd64` images were built from application commit
+`1b1b301046cf30f76074c637c78bfd401c3df6f1` at `2026-10-14T04:19:30Z`
+and pushed to Docker Hub on October 14, 2026 UTC. Runtime Playwright 1.63.0,
+Chromium revision 1243 and glibc 2.44-r8 remain aligned with the working build.
+
+| Tag | Manifest digest |
+| --- | --- |
+| `mohankrishna999/portal-validator:1.12.10` | `sha256:90d457e19c38705af5b255cbb0146e63b940560744904d193255cb77d318ec0e` |
+| `mohankrishna999/portal-validator:1.12.10-debug` | `sha256:a9e5f8d7a4c69cbfc0fde27b905b60d0060bd82b05f1651bece1a6e633cfa286` |
+
+Independent Docker Hub registry HTTPS checks verified both manifest digests
+against their downloaded bytes and verified the referenced config digests.
+Both remote images use Docker schema 2 with gzip layers (18 production,
+20 debug), report `linux/amd64`, user `10001:10001`, version `1.12.10`, and
+the application revision above. No TLS verification was disabled for these
+registry checks.
+
+No `latest` or `prod-*` tags were created. Subsequent publication records and
+test-only fixture-budget adjustments do not change application source inside
+these images; their embedded revision intentionally identifies the application
+commit above. No cluster rollout or live private-portal validation was performed.
 
 ```sh
 python -m pytest -q --tb=short --show-capture=no tests
