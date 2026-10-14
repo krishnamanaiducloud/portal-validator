@@ -18,7 +18,8 @@ from typing import Awaitable, Callable, Literal
 from urllib.parse import urldefrag, urlparse
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from playwright.async_api import BrowserContext, Error as PlaywrightError, Route, async_playwright
@@ -55,7 +56,9 @@ from app.health import (
     api_health_findings,
     assess_page_health,
     application_shell_ready,
+    configured_readiness_conditions,
     document_navigation_timing,
+    readiness_event_init_script,
     realtime_health_findings,
     route_performance_timing,
     wait_for_render_settle,
@@ -162,6 +165,35 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.exception_handler(RequestValidationError)
+async def invalid_scan_configuration(request: Request, exc: RequestValidationError):
+    # FastAPI's default response includes rejected input, which may contain
+    # credentials. Return schema metadata only, never values or exception text.
+    known_fields = set(ScanRequest.model_fields) | set(Authentication.model_fields) | set(CookieInput.model_fields)
+    errors = []
+    for error in exc.errors():
+        location = error.get("loc", ())
+        field = ".".join(
+            str(part) if part == "body" or isinstance(part, int) or part in known_fields else "[field]"
+            for part in location
+        )
+        code = error.get("type", "invalid_configuration")
+        message = (
+            "Unrecognized configuration field; use the documented request fields."
+            if code == "extra_forbidden" else
+            "Use exact authentication hostnames or IP addresses, without URLs, ports or wildcards."
+            if "authentication_hosts" in location else
+            "Required configuration field is missing."
+            if code == "missing" else
+            "Configuration value is invalid or outside its allowed limits."
+        )
+        errors.append({"field": field, "code": code, "message": message})
+    log_event(logging.WARNING, "SCAN_CONFIGURATION_REJECTED", error_count=len(errors))
+    return JSONResponse(status_code=422, content={
+        "detail": "Invalid scan configuration. Check the indicated fields.", "errors": errors,
+    })
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
@@ -191,6 +223,7 @@ class CookieInput(BaseModel):
 
 
 class Authentication(BaseModel):
+    model_config = {"extra": "forbid"}
     mode: Literal["none", "basic", "bearer", "headers", "cookies", "storage_state"] = "none"
     username: str | None = Field(default=None, max_length=512)
     password: SecretStr | None = None
@@ -231,7 +264,7 @@ class ApprovedReadPostOperation(BaseModel):
 
 
 class ScanRequest(BaseModel):
-    model_config = {"frozen": True}
+    model_config = {"frozen": True, "extra": "forbid"}
     target: str = Field(min_length=1, max_length=4096)
     # Keep the safe default conservative while allowing large portals to opt in
     # to the full bounded discovery budget from the UI/API.
@@ -246,6 +279,7 @@ class ScanRequest(BaseModel):
     readiness_timeout_ms: int | None = Field(None, ge=1000, le=120000)
     api_timeout_ms: int | None = Field(None, ge=1000, le=120000)
     readiness_selector: str | None = Field(None, max_length=512)
+    readiness_event: str | None = Field(None, max_length=128, pattern=r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
     concurrency_limit: int = Field(MAX_CONCURRENT_SCANS, ge=1, le=MAX_CONCURRENT_SCANS)
     check_links: bool = True
     check_console: bool = True
@@ -962,6 +996,7 @@ async def execute_scan(
     discovery_duration_ms = 0
     validation_duration_ms = 0
     results: list[dict] = []
+    authentication_diagnostics: list[dict] = []
     requested_route = normalize_route_url(
         requested_target,
         query_policy=req.query_parameter_policy,
@@ -1206,6 +1241,8 @@ async def execute_scan(
                 browser_startup_duration_ms = round((time.perf_counter() - browser_started) * 1000)
                 browser_context_count += 1
                 await context.add_init_script(script=ROUTE_OBSERVER_SCRIPT)
+                if req.readiness_event:
+                    await context.add_init_script(script=readiness_event_init_script(req.readiness_event))
                 if req.api_timeout_ms is not None:
                     await context.add_init_script(script=api_timeout_init_script(req.api_timeout_ms))
                 await configure_cookies(context, req, root_host, approved_portal_hosts)
@@ -1546,17 +1583,44 @@ async def execute_scan(
                         auth_body = request.post_data
                     except PlaywrightError:
                         auth_body = None
-                    # Denied protocol traffic is an authentication limitation,
-                    # not proof that an anonymous shell has full app coverage.
-                    if authentication_navigation.identifies_authentication_attempt(
+                    try:
+                        source_frame = request.frame
+                        while source_frame.parent_frame is not None and not source_frame.url.startswith(("http://", "https://")):
+                            source_frame = source_frame.parent_frame
+                        source_url = source_frame.url
+                    except PlaywrightError:
+                        source_url = ""
+                    # Diagnose concrete protocol attempts even when the missing
+                    # identity-host approval prevented an active flow. Diagnosis
+                    # cannot authorize a request or retain credential payloads.
+                    auth_diagnostic = authentication_navigation.diagnose_blocked_request(
                         request.method, request.url, auth_body,
                         resource_type=request.resource_type,
                         document_navigation=request.is_navigation_request(),
                         portal_scoped=url_in_scan_scope(
                             request.url, root_host, req.allow_subdomains, approved_portal_hosts,
                         ),
-                    ):
-                        authentication_denials.add(request_origin(request)[1])
+                        source_url=source_url,
+                        source_portal_scoped=url_in_scan_scope(
+                            source_url, root_host, req.allow_subdomains, approved_portal_hosts,
+                        ),
+                    )
+                    if auth_diagnostic is not None:
+                        route_id, activation_id, phase = request_origin(request)
+                        auth_diagnostic.update({
+                            "route_id": route_id, "route_activation_id": activation_id,
+                            "phase": phase, "policy_reason": reason.upper(),
+                        })
+                        if auth_diagnostic not in authentication_diagnostics:
+                            authentication_diagnostics.append(auth_diagnostic)
+                        if auth_diagnostic["affects_authentication"]:
+                            authentication_denials.add(activation_id)
+                        if api_event is not None:
+                            api_event["authentication_diagnostic"] = dict(auth_diagnostic)
+                        log_event(logging.WARNING, "AUTHENTICATION_REQUEST_BLOCKED", scan_id=scan_id,
+                                  hostname=auth_diagnostic["destination_host"],
+                                  classification=auth_diagnostic["reason"],
+                                  route_activation_id=activation_id)
                     if api_event is not None:
                         public_reason = (
                             "READ_ONLY_MUTATION_BLOCKED"
@@ -2602,8 +2666,7 @@ async def execute_scan(
                                 )
                                 if auth_settle["timed_out"]:
                                     authentication_classification = "AUTH_TIMEOUT"
-                                if (active_route_activation_id in authentication_denials
-                                    and authentication_classification != "PASS"):
+                                if active_route_activation_id in authentication_denials:
                                     authentication_classification = "AUTHENTICATION_BLOCKED"
                                 log_event(
                                     logging.INFO,
@@ -2650,14 +2713,28 @@ async def execute_scan(
                                     minimum_observation_ms=req.min_observation_ms,
                                     network_quiet_ms=req.network_quiet_ms,
                                     readiness_selector=req.readiness_selector if dom_target == page else None,
+                                    readiness_event=req.readiness_event if dom_target == page else None,
+                                    view_control=view_control,
                                 ) if authentication_classification == "PASS" else None
-                                if dom_target != page and render_health is not None and req.readiness_selector:
+                                if dom_target != page and render_health is not None and (req.readiness_selector or req.readiness_event):
                                     # The configured application-shell selector lives
                                     # in the parent; child views must additionally
                                     # satisfy their own visible render readiness.
-                                    render_health["configured_readiness_met"] = await retry_dom_operation(
-                                        page, page.locator(req.readiness_selector).first.is_visible,
-                                    )
+                                    render_health["configured_readiness_met"] = False
+                                    parent_readiness_ms = max(0, round((readiness_deadline - time.perf_counter()) * 1000))
+                                    if parent_readiness_ms:
+                                        try:
+                                            render_health.update(await configured_readiness_conditions(
+                                                page, readiness_selector=req.readiness_selector,
+                                                readiness_event=req.readiness_event,
+                                                timeout_ms=parent_readiness_ms,
+                                                wait_until_met=True,
+                                            ))
+                                        except TimeoutError:
+                                            # Exhausting a readiness observation does
+                                            # not turn a completed view activation into
+                                            # an invented document-navigation timeout.
+                                            pass
                                 readiness_duration_ms += round((time.perf_counter() - readiness_started) * 1000)
                                 # Authentication observation precedes render settling.
                                 # A delayed client redirect/login must not be mistaken
@@ -2674,6 +2751,8 @@ async def execute_scan(
                                         final_url=final_raw_url, target_in_scope=final_in_scope,
                                         error_classification=None, password_form=password_form, mfa_form=mfa_form,
                                     )
+                                if active_route_activation_id in authentication_denials:
+                                    authentication_classification = "AUTHENTICATION_BLOCKED"
                                 application_ready = bool(
                                     authentication_classification == "PASS" and final_in_scope
                                     and application_shell_ready(render_health)
@@ -2697,7 +2776,7 @@ async def execute_scan(
                                     logging.INFO if application_ready else logging.WARNING,
                                     "APPLICATION_SHELL_READY" if application_ready else "APPLICATION_SHELL_NOT_READY",
                                     scan_id=scan_id, hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
-                                    configured_readiness=bool(req.readiness_selector),
+                                    configured_readiness=bool(req.readiness_selector or req.readiness_event),
                                     authentication_status=authentication_classification,
                                 )
                                 if application_ready and navigation_mode == DOCUMENT_NAVIGATION:
@@ -2784,9 +2863,9 @@ async def execute_scan(
                                             enqueue_discovered_routes(routes, depth, final_raw_url),
                                         ))
 
-                                    async def observe_discovery_panel():
+                                    async def observe_discovery_panel(target=page):
                                         return await wait_for_render_settle(
-                                            page,
+                                            target,
                                             settle_ms=req.render_settle_ms,
                                             maximum_ms=max(0, round((route_deadline - time.perf_counter()) * 1000)),
                                             network_activity=route_activity_snapshot,
@@ -2843,7 +2922,7 @@ async def execute_scan(
                                                     round((route_deadline - time.perf_counter()) * 1000),
                                                 )),
                                                 maximum_scrolls=req.max_discovery_scrolls,
-                                                wait_after_action=observe_discovery_panel,
+                                                wait_after_action=lambda target=frame: observe_discovery_panel(target),
                                                 on_routes_discovered=retain_panel_routes,
                                             )
                                             frame_routes = list(frame_actions.pop("routes", []))
@@ -2967,6 +3046,12 @@ async def execute_scan(
                                     error=error,
                                 )
 
+                    # Discovery may itself reveal a delayed sign-in exchange.
+                    # Reconcile that evidence before classifying this route.
+                    if active_route_activation_id in authentication_denials:
+                        authentication_classification = "AUTHENTICATION_BLOCKED"
+                        application_ready = False
+                        browser_lifecycle.fail("AUTHENTICATION_BLOCKED", stage="AUTHENTICATING")
                     if (
                         authentication_classification == "AUTH_REQUIRED"
                         and req.authentication.mode != "none"
@@ -3081,7 +3166,7 @@ async def execute_scan(
                         if not render_health.get("configured_readiness_met", True):
                             health_findings.append(finding(
                                 "READINESS_NOT_REACHED", "ERROR",
-                                "The configured visible readiness condition was not reached within its budget.",
+                                "The configured readiness selector or event was not reached within its budget.",
                                 blocking=True,
                             ))
                         elif not application_ready and authentication_classification == "PASS":
@@ -3334,6 +3419,10 @@ async def execute_scan(
                             else "RENDER_NOT_READY"
                         ),
                         "authentication_observation": auth_settle,
+                        "authentication_diagnostics": [
+                            item for item in authentication_diagnostics
+                            if item.get("route_activation_id") == active_route_activation_id
+                        ],
                         "browser_lifecycle": browser_lifecycle.snapshot(),
                         "failed_lifecycle_stage": browser_lifecycle.failed_stage,
                         "lifecycle_failure_reason": browser_lifecycle.failure_reason,
@@ -3498,6 +3587,33 @@ async def execute_scan(
     )
     finalization_started = time.perf_counter()
     for result in results:
+        result["authentication_diagnostics"] = [
+            item for item in authentication_diagnostics
+            if item.get("route_activation_id") == result.get("route_activation_id")
+        ]
+        if (
+            any(item["affects_authentication"] for item in result["authentication_diagnostics"])
+            and result.get("authentication_status") == "PASS"
+        ):
+            # A late protocol denial belongs to its initiating activation even
+            # after the page snapshot. Final drain evidence cannot leave an
+            # anonymous shell counted as authenticated application coverage.
+            result["authentication_status"] = "AUTHENTICATION_BLOCKED"
+            result["application_ready"] = False
+            if result.get("classification") in {"PASS", "PASS_WITH_WARNINGS"}:
+                result["classification"] = "AUTHENTICATION_BLOCKED"
+                result["render_status"] = "NOT_TESTED"
+                result["failed_lifecycle_stage"] = "AUTHENTICATING"
+                result["lifecycle_failure_reason"] = "AUTHENTICATION_BLOCKED"
+                result["browser_lifecycle"].update({
+                    "failed_stage": "AUTHENTICATING", "failure_reason": "AUTHENTICATION_BLOCKED",
+                })
+                result["finding_details"].append(finding(
+                    "AUTHENTICATION_BLOCKED", "INFO",
+                    "A required authentication request was blocked during browser observation. "
+                    "Review the authentication diagnostics before evaluating protected application coverage.",
+                    user_action_required=True,
+                ))
         # Continuous observation can complete a request after its initiating
         # route snapshot. Reconcile that route, never the currently active one.
         route_events = [event for event in scan_api_events
@@ -3795,6 +3911,7 @@ async def execute_scan(
     })
     scan_configuration["authentication_mode"] = req.authentication.mode
     scan_configuration["readiness_selector_configured"] = bool(req.readiness_selector)
+    scan_configuration["readiness_event_configured"] = bool(req.readiness_event)
     scan_configuration["authentication_host_count"] = len(req.authentication_hosts)
     scan_configuration["route_concurrency"] = 1
     scan_configuration["maximum_concurrent_scans"] = MAX_CONCURRENT_SCANS
@@ -3836,6 +3953,7 @@ async def execute_scan(
         "navigation_coverage": navigation_coverage(results, summary, route_inventory),
         "coverage_dimensions": build_coverage_dimensions(results, summary),
         "api_inventory": api_inventory,
+        "authentication_diagnostics": authentication_diagnostics,
         "api_request_occurrences": [
             {
                 **event,
@@ -4006,6 +4124,11 @@ async def create_scan(req: ScanRequest):
         validate_http_url(req.target.strip())
     except DestinationError as exc:
         raise HTTPException(400, exc.public_message) from exc
+    # Reject unusable submitted credentials/profiles before queueing a scan.
+    # A profile never implicitly approves any identity-provider destination.
+    auth_headers(req.authentication)
+    if req.authentication.mode == "storage_state":
+        storage_state_path(req.authentication.storage_profile)
     scan_id = str(uuid.uuid4())
     try:
         job = SCAN_REGISTRY.create(scan_id)

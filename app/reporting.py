@@ -1017,11 +1017,11 @@ def aggregate_report(
 def classify_api_status(status: int | None, error: str | None) -> str:
     if error:
         upper = error.upper()
-        if "CERT" in upper or "TLS" in upper:
+        if "CERT" in upper or "TLS" in upper or "ERR_SSL_" in upper:
             return "API_TLS_FAILURE"
         if "NAME_NOT_RESOLVED" in upper:
             return "API_DNS_FAILURE"
-        if "TIMEOUT" in upper:
+        if any(marker in upper for marker in ("TIMEOUT", "TIMED_OUT", "TIMED OUT")):
             return "API_TIMEOUT"
         return "API_NETWORK_FAILURE"
     if status is None:

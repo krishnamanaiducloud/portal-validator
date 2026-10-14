@@ -26,7 +26,7 @@ async def main():
         )
         await page.goto(base_url, wait_until="networkidle")
         build_metadata = await page.evaluate("async () => (await fetch('/api/diagnostics/build', {cache:'no-store'})).json()")
-        assert build_metadata["version"] == "1.12.9"
+        assert build_metadata["version"] == "1.12.10"
         assert await page.evaluate("loadedFrontendSha256") == build_metadata["frontend_sha256"]
         assert await page.evaluate("loadedFrontendIntegrity.startsWith('sha256-')")
         assert "Frontend matched" in await page.locator("#build-summary").text_content()
@@ -97,23 +97,29 @@ async def main():
         for control in ("navigation-timeout", "authentication-timeout", "api-timeout", "readiness-timeout", "per-route-timeout"):
             await page.locator(f"#{control}").fill("12345")
         await page.locator("#readiness-selector").fill("[data-app-ready]")
+        await page.locator("#readiness-event").fill("portal:ready")
         await page.locator("#authentication-hosts").fill("login.example.net, identity.example.org")
         assert await page.evaluate("phaseConfiguration()") == {
             "navigation_timeout_ms": 12345, "authentication_timeout_ms": 12345,
             "api_timeout_ms": 12345, "readiness_timeout_ms": 12345,
             "per_route_timeout_ms": 12345,
             "readiness_selector": "[data-app-ready]",
+            "readiness_event": "portal:ready",
             "authentication_hosts": ["login.example.net", "identity.example.org"],
         }
         await page.locator("#api-timeout").fill("1")
         assert "integer between" in await page.evaluate("""() => {
           try { phaseConfiguration(); return ''; } catch (error) { return error.message; }
         }""")
-        for control in ("navigation-timeout", "authentication-timeout", "api-timeout", "readiness-timeout", "per-route-timeout", "readiness-selector", "authentication-hosts"):
+        for control in ("navigation-timeout", "authentication-timeout", "api-timeout", "readiness-timeout", "per-route-timeout", "readiness-selector", "readiness-event", "authentication-hosts"):
             await page.locator(f"#{control}").fill("")
         await page.locator("#scan-timing-settings > summary").click()
         await page.locator("#auth-mode").select_option("storage_state")
         assert await page.get_by_text("Mounted SSO profile", exact=True).is_visible()
+        assert "No authentication hosts approved" in await page.locator("#authentication-configuration-note").inner_text()
+        assert "Choose a valid mounted SSO profile" in await page.evaluate("""() => {
+          try { authenticationPayload(); return ''; } catch (error) { return error.message; }
+        }""")
         await page.locator("#read-post-settings > summary").click()
         await page.locator("#add-read-post").click()
         await page.locator("#add-read-post").click()
@@ -224,6 +230,28 @@ async def main():
         assert await page.locator("#failed-endpoint-list tr").count() == 1
         assert "/query" in await page.locator("#failed-endpoint-list").text_content()
         assert "/blocked/" not in await page.locator("#failed-endpoint-list").text_content()
+        await page.evaluate("""() => {
+          window.authDiagnosticOriginalReport = lastReport;
+          renderReport({...lastReport, scan_configuration:{authentication_host_count:0},
+            authentication_diagnostics:[{reason:'AUTHENTICATION_HOSTS_REQUIRED',protocol:'OAUTH_TOKEN',
+              destination_host:'identity.example',source_host:'portal.example',source_approved:true,
+              destination_approved:false,flow_active:false,affects_authentication:true,
+              policy_reason:'THIRD_PARTY_RESOURCE_POLICY',body:'do-not-export-auth-secret',
+              authorization:'do-not-export-auth-secret',source_url:'https://portal.example/?code=do-not-export-auth-secret'}]});
+        }""")
+        auth_diagnostic_text = await page.locator("#authentication-diagnostics").inner_text()
+        assert "AUTHENTICATION_HOSTS_REQUIRED" in auth_diagnostic_text
+        assert "0 explicitly configured hosts" in auth_diagnostic_text
+        assert "profile does not approve" in auth_diagnostic_text
+        assert "do-not-export-auth-secret" not in auth_diagnostic_text
+        await page.locator("[data-authentication-diagnostic]").first.click()
+        auth_evidence = await page.locator("#evidence-content").inner_text()
+        assert "THIRD_PARTY_RESOURCE_POLICY" in auth_evidence
+        assert "do-not-export-auth-secret" not in auth_evidence
+        assert "source_url" not in auth_evidence and '"body"' not in auth_evidence
+        await page.locator("#evidence-close").click()
+        await page.evaluate("renderReport(window.authDiagnosticOriginalReport); delete window.authDiagnosticOriginalReport")
+        assert await page.locator("#authentication-diagnostics").is_hidden()
         await page.evaluate("""() => {
           window.failureInventoryOriginal = {apis:lastReport.api_inventory, resources:lastReport.resource_inventory};
           lastReport.api_inventory = [...lastReport.api_inventory,
@@ -440,7 +468,10 @@ async def main():
         assert await page.locator("#api-list .api-role-cell").text_content() == "CHALLENGE"
         assert "BLOCKED_BY_POLICY" in await page.locator("#api-list").text_content()
         await page.locator("#api-list .api-endpoint").click()
-        lifecycle = await page.locator("#evidence-content .inspect-section dl").evaluate("""element =>
+        lifecycle_section = page.locator("#evidence-content .inspect-section").filter(
+            has=page.get_by_role("heading", name="Request lifecycle", exact=True),
+        )
+        lifecycle = await lifecycle_section.locator("dl").evaluate("""element =>
           Object.fromEntries([...element.children].map(row => [row.querySelector('dt').textContent, row.querySelector('dd').textContent]))
         """)
         assert lifecycle["observed"] == "1"
@@ -511,6 +542,70 @@ async def main():
         assert await page.locator("#api-list tr").count() == 1
         assert "/query" in await page.locator("#api-list").text_content()
         await page.locator("#api-policy-filter").select_option("all")
+        # Target-failure filtering must use HTTP/transport evidence: mixed
+        # successful/policy-blocked attempts can legitimately have WARNING health.
+        await page.evaluate("""() => {
+          window.targetFailureOriginal = {apis:lastReport.api_inventory, occurrences:lastReport.api_request_occurrences};
+          lastReport.api_inventory = [...lastReport.api_inventory,
+            {method:'GET',host:'api.example.net',endpoint:'/policy-success',calls:2,
+              status_2xx:1,status_4xx:0,status_5xx:0,network_failures:0,response_body_failures:0,
+              allowed_calls:1,blocked_count:1,blocked_calls:1,completed_calls:1,
+              health:'HEALTHY',observation_outcome:'WARNING',failure_count:0,target_failure_count:0},
+            {method:'GET',host:'api.example.net',endpoint:'/http-unfinished',calls:2,
+              status_2xx:0,status_4xx:0,status_5xx:1,network_failures:1,response_body_failures:0,
+              allowed_calls:2,blocked_count:0,completed_calls:0,incomplete_calls:1,
+              health:'INCOMPLETE',observation_outcome:'INCOMPLETE',failure_count:2,target_failure_count:2}];
+          lastReport.api_request_occurrences = [
+            {request_id:'request-501',method:'GET',host:'api.example.net',endpoint:'/http-unfinished',
+              route_activation_id:'activation-9',source_page_id:'page-1',source_frame_id:'frame-1',
+              initiating_route:'https://portal.example/#/reports?token=synthetic-occurrence-secret',
+              phase:'ROUTE_VALIDATION',traffic_role:'APPLICATION_API',policy_decision:'ALLOW',
+              policy_classification:'SAFE_METHOD',request_dispatched:true,response_seen:true,
+              response_status:503,response_completed:false,lifecycle_status:'INCOMPLETE',
+              incomplete_reason:'RESPONSE_BODY_NOT_COMPLETED',observed_at:'2026-10-12T14:00:00Z',
+              url:'https://api.example.net/http-unfinished?token=synthetic-occurrence-secret',
+              headers:{Authorization:'Bearer synthetic-occurrence-secret'},body:'synthetic-occurrence-secret'},
+            {request_id:'request-502',method:'GET',host:'api.example.net',endpoint:'/http-unfinished',
+              route_activation_id:'activation-10',initiating_route:'https://portal.example/#/nested?arbitrary=synthetic-occurrence-secret',
+              request_dispatched:true,response_seen:false,response_completed:false,lifecycle_status:'FAILED',
+              failure_category:'NETWORK_FAILURE',error:'net::ERR_TIMED_OUT https://api.example.net/?token=synthetic-occurrence-secret'},
+            {request_id:'request-503',method:'GET',host:'api.example.net',endpoint:'/policy-success',
+              initiating_route:'/health?token=synthetic-occurrence-secret',policy_decision:'BLOCK',
+              block_reason:'NETWORK_POLICY',blocked_by_validator:true,lifecycle_status:'BLOCKED',
+              authentication_diagnostic:{reason:'AUTHENTICATION_HOSTS_REQUIRED',protocol:'OAUTH_TOKEN',
+                source_host:'portal.example',destination_host:'identity.example.net',source_approved:true,
+                destination_approved:false,flow_active:false,affects_authentication:true,policy_reason:'NETWORK_POLICY',
+                body:'synthetic-occurrence-secret',source_url:'https://portal.example/?token=synthetic-occurrence-secret'}}];
+          renderApiInventory(); renderFailedEndpoints();
+        }""")
+        await page.locator("#api-failed-only").check()
+        assert set(await page.locator("#api-list .api-endpoint").all_text_contents()) == {"/query", "/http-unfinished"}
+        await page.locator("#api-list .api-endpoint").filter(has_text="/http-unfinished").click()
+        occurrence_text = await page.locator("#evidence-content").text_content()
+        for expected in ("request-501", "activation-9", "#/reports", "request-502", "net::ERR_TIMED_OUT", "RESPONSE_BODY_NOT_COMPLETED"):
+            assert expected in occurrence_text, expected
+        for excluded in ("synthetic-occurrence-secret", "request-503", "Authorization"):
+            assert excluded not in occurrence_text, excluded
+        await page.locator("#evidence-close").click()
+        await page.get_by_role("button", name="Show API failures evidence").click()
+        assert set(await page.locator("#api-list .api-endpoint").all_text_contents()) == {"/query", "/http-unfinished"}
+        await page.locator("#failed-endpoint-list tr").filter(has_text="/http-unfinished").get_by_role("button", name="Inspect failure").click()
+        failure_text = await page.locator("#evidence-content").text_content()
+        assert "request-501" in failure_text and "net::ERR_TIMED_OUT" in failure_text
+        assert "synthetic-occurrence-secret" not in failure_text
+        await page.locator("#evidence-close").click()
+        await page.get_by_role("button", name="Show Unique APIs observed evidence").click()
+        await page.locator("#api-list .api-endpoint").filter(has_text="/policy-success").click()
+        blocked_occurrence_text = await page.locator("#evidence-content").text_content()
+        assert "request-503" in blocked_occurrence_text and "NETWORK_POLICY" in blocked_occurrence_text
+        assert "AUTHENTICATION_HOSTS_REQUIRED" in blocked_occurrence_text and "identity.example.net" in blocked_occurrence_text
+        assert "synthetic-occurrence-secret" not in blocked_occurrence_text
+        await page.locator("#evidence-close").click()
+        await page.evaluate("""() => {
+          lastReport.api_inventory = window.targetFailureOriginal.apis;
+          lastReport.api_request_occurrences = window.targetFailureOriginal.occurrences;
+          delete window.targetFailureOriginal; renderApiInventory(); renderFailedEndpoints();
+        }""")
         await page.evaluate("window.savedInventory = lastReport.api_inventory; lastReport.api_inventory = lastReport.api_inventory.filter(item => item.method !== 'POST'); updateApiMethodFilter(lastReport.api_inventory)")
         await page.locator("#api-method-filter").select_option("POST")
         assert await page.locator("#api-list .empty-table").text_content() == "No POST requests were observed for this scan."
@@ -539,7 +634,10 @@ async def main():
             await page.locator("#api-lifecycle-filter").select_option("all")
             await page.locator("#api-response-filter").select_option("all")
             await page.locator("#api-list .api-endpoint").click()
-            lifecycle = await page.locator("#evidence-content .inspect-section dl").evaluate("""element =>
+            lifecycle_section = page.locator("#evidence-content .inspect-section").filter(
+                has=page.get_by_role("heading", name="Request lifecycle", exact=True),
+            )
+            lifecycle = await lifecycle_section.locator("dl").evaluate("""element =>
               Object.fromEntries([...element.children].map(row => [row.querySelector('dt').textContent, row.querySelector('dd').textContent]))
             """)
             assert lifecycle["sent"] == "1" and lifecycle["completed"] == "0"
@@ -833,6 +931,9 @@ async def main():
         await page.locator("#slow-threshold").fill("7250")
         await page.locator("#scan-timing-settings").evaluate("element => { element.open = true; }")
         await concurrency.fill("1")
+        await page.locator("#authentication-hosts").fill("LOGIN.EXAMPLE.NET., identity.example.org login.example.net")
+        assert "2 explicitly configured authentication hosts" in await page.locator("#authentication-configuration-note").inner_text()
+        await page.locator("#readiness-event").fill("portal:ready")
         await page.locator("#run-button").click()
         await page.wait_for_function("() => !document.getElementById('run-button').disabled && document.getElementById('progress').hidden")
         assert len(submitted) == 1
@@ -848,6 +949,10 @@ async def main():
         assert submitted[0]["network_quiet_ms"] == 150
         assert submitted[0]["slow_page_threshold_ms"] == 7250
         assert submitted[0]["concurrency_limit"] == 1
+        assert submitted[0]["authentication_hosts"] == ["login.example.net", "identity.example.org"]
+        assert submitted[0]["readiness_event"] == "portal:ready"
+        await page.locator("#authentication-hosts").fill("")
+        await page.locator("#readiness-event").fill("")
         await concurrency.fill("")
         await page.locator("#scan-timing-settings").evaluate("element => { element.open = false; }")
         await page.unroute("**/api/scans", capture_scan)

@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = '1.12.9';
+const FRONTEND_VERSION = '1.12.10';
 // The server pins this exact deferred script with SRI and a hash-versioned URL.
 // Capture currentScript now; it is unavailable in subsequent async callbacks.
 const frontendScript = document.currentScript;
@@ -385,6 +385,20 @@ function approvedReadPostOperations() {
   });
 }
 
+function configuredAuthenticationHosts() {
+  return [...new Set(byId('authentication-hosts').value.split(/[,\s]+/)
+    .map(host => host.trim().toLowerCase().replace(/\.$/, '')).filter(Boolean))];
+}
+
+function updateAuthenticationConfigurationNote() {
+  const count = configuredAuthenticationHosts().length;
+  byId('authentication-configuration-note').textContent = count
+    ? `${count} explicitly configured authentication host${count === 1 ? '' : 's'}. Network, TLS, protocol and transaction checks still apply.`
+    : authMode.value === 'storage_state'
+      ? 'No authentication hosts approved. A restored portal session may work, but cross-origin authentication POSTs remain blocked until their exact identity-provider hosts are configured. A profile does not grant host approval.'
+      : 'No authentication hosts approved. Public websites do not require a profile. Configure exact identity-provider hosts only if an authorized SSO flow requires them.';
+}
+
 function phaseConfiguration() {
   const configuration = {};
   const fields = {navigation_timeout_ms:'navigation-timeout',authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout',per_route_timeout_ms:'per-route-timeout',concurrency_limit:'concurrency-limit'};
@@ -397,7 +411,12 @@ function phaseConfiguration() {
   }
   const readiness = byId('readiness-selector').value.trim();
   if (readiness) configuration.readiness_selector = readiness;
-  const hosts = splitList(byId('authentication-hosts').value);
+  const readinessEvent = byId('readiness-event').value.trim();
+  if (readinessEvent) {
+    if (!/^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/.test(readinessEvent)) throw new Error('Readiness event must be a valid event name of at most 128 characters.');
+    configuration.readiness_event = readinessEvent;
+  }
+  const hosts = configuredAuthenticationHosts();
   if (hosts.length) configuration.authentication_hosts = hosts;
   return configuration;
 }
@@ -423,7 +442,11 @@ async function requestJson(url, options = {}, operation = 'Request') {
   }
   if (!response.ok) {
     const status = `${response.status}${response.statusText ? ` ${response.statusText}` : ''}`;
-    let reason = data && typeof data.detail === 'string' ? data.detail : sanitizedResponseText(raw);
+    let reason = data && typeof data.detail === 'string' ? data.detail : data
+      ? 'The request configuration was rejected.' : sanitizedResponseText(raw);
+    if (response.status === 422 && Array.isArray(data?.errors)) {
+      reason += ' ' + data.errors.slice(0, 3).map(error => `${error.field}: ${error.message}`).join(' ');
+    }
     if (response.status === 504) reason = 'The gateway ended this request before it completed. Retry the operation or contact the platform team if short status requests also time out.';
     const error = new Error(`${operation} failed · HTTP ${status}${reason ? ` · ${reason}` : ''}`);
     error.status = response.status;
@@ -449,6 +472,7 @@ function renderAuthFields() {
     storage_state: `<label class="field"><span>Mounted SSO profile</span><select id="auth-profile" ${profileNames.length ? '' : 'disabled'}>${profileOptions}</select><small>${escapeHtml(profileHelp)} A companion profile.refresh.json enables silent browser refresh; refreshed state stays private in the pod.</small></label>`,
   };
   authFields.innerHTML = templates[authMode.value];
+  updateAuthenticationConfigurationNote();
 }
 
 function readHeaders() {
@@ -476,7 +500,11 @@ function authenticationPayload() {
   if (mode === 'bearer') return {mode, token: byId('auth-token').value};
   if (mode === 'headers') return {mode, headers: readHeaders()};
   if (mode === 'cookies') return {mode, cookies: readCookies()};
-  if (mode === 'storage_state') return {mode, storage_profile: byId('auth-profile').value};
+  if (mode === 'storage_state') {
+    const profile = byId('auth-profile')?.value;
+    if (!profile) throw new Error('Choose a valid mounted SSO profile, or select No authentication for a public website. Your desktop browser session is separate from the validator browser.');
+    return {mode, storage_profile: profile};
+  }
   return {mode: 'none'};
 }
 
@@ -778,6 +806,65 @@ function apiFailureTypes(item) {
   return types;
 }
 
+function apiOccurrenceEvidence(item) {
+  // The report stream is already sanitized by the server. Select metadata
+  // explicitly so future request fields never expose headers or payloads here.
+  const code = value => typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(value) ? value : null;
+  const flag = value => typeof value === 'boolean' ? value : null;
+  const host = value => typeof value === 'string' && /^[a-z0-9.:-]{1,253}$/i.test(value) ? value : null;
+  const identifier = (value, prefix) => typeof value === 'string' && new RegExp(`^${prefix}-[0-9]+$`).test(value) ? value : null;
+  const path = value => typeof value === 'string' ? value.split(/[?#]/, 1)[0] : '';
+  const route = value => {
+    if (typeof value !== 'string') return null;
+    if (/^UI_VIEW_[a-f0-9]{24}$/.test(value)) return value;
+    try {
+      const relative = value.startsWith('/');
+      const parsed = new URL(value, relative ? 'https://route.invalid' : undefined);
+      if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+      const fragment = /^#!?\//.test(parsed.hash) ? parsed.hash.split('?', 1)[0] : '';
+      return `${relative ? '' : parsed.origin}${parsed.pathname}${fragment}`;
+    } catch (_) { return null; }
+  };
+  return (lastReport?.api_request_occurrences || []).filter(event =>
+    String(event.method || '').toUpperCase() === String(item.method || '').toUpperCase()
+    && String(event.host || '').toLowerCase() === String(item.host || '').toLowerCase()
+    && path(event.endpoint) === path(item.endpoint)
+  ).map(event => ({
+    request_id:identifier(event.request_id, 'request'),
+    route_activation_id:identifier(event.route_activation_id, 'activation'),
+    initiating_route:route(event.initiating_route),
+    source_page_id:identifier(event.source_page_id, 'page'),
+    source_frame_id:identifier(event.source_frame_id, 'frame'),
+    phase:code(event.phase), traffic_role:code(event.traffic_role || event.traffic_category),
+    policy_decision:code(event.policy_decision), policy_classification:code(event.policy_classification),
+    policy_reason:code(event.policy_reason), block_reason:code(event.block_reason),
+    ...(event.authentication_diagnostic && typeof event.authentication_diagnostic === 'object' ? {
+      authentication_diagnostic:{
+        reason:code(event.authentication_diagnostic.reason), protocol:code(event.authentication_diagnostic.protocol),
+        source_host:host(event.authentication_diagnostic.source_host), destination_host:host(event.authentication_diagnostic.destination_host),
+        source_approved:flag(event.authentication_diagnostic.source_approved), destination_approved:flag(event.authentication_diagnostic.destination_approved),
+        flow_active:flag(event.authentication_diagnostic.flow_active), affects_authentication:flag(event.authentication_diagnostic.affects_authentication),
+        policy_reason:code(event.authentication_diagnostic.policy_reason),
+      },
+    } : {}),
+    blocked_by_validator:flag(event.blocked_by_validator),
+    request_dispatched:flag(event.request_dispatched),
+    request_failed:flag(event.request_failed), request_canceled:flag(event.request_canceled),
+    response_seen:flag(event.response_seen),
+    response_status:Number.isInteger(event.response_status ?? event.status)
+      && (event.response_status ?? event.status) >= 100 && (event.response_status ?? event.status) < 600
+      ? (event.response_status ?? event.status) : null,
+    response_completed:flag(event.response_completed),
+    lifecycle_status:code(event.lifecycle_status), failure_category:code(event.failure_category),
+    incomplete_reason:['RESPONSE_BODY_NOT_COMPLETED','NO_RESPONSE_BEFORE_SCAN_END','NOT_DISPATCHED_BEFORE_SCAN_END'].includes(event.incomplete_reason) ? event.incomplete_reason : null,
+    // Browser error codes explain DNS/TLS/timeout failures without copying a
+    // free-form error that could contain a URL or other request contents.
+    transport_error_code:typeof event.error === 'string' ? event.error.match(/\b(?:net::ERR_[A-Z0-9_]+|NS_ERROR_[A-Z0-9_]+)\b/)?.[0] || null : null,
+    observed_at:typeof event.observed_at === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(event.observed_at) ? event.observed_at : null,
+    duration_ms:typeof event.duration_ms === 'number' && Number.isFinite(event.duration_ms) && event.duration_ms >= 0 ? event.duration_ms : null,
+  }));
+}
+
 function updateApiEvidenceFilters(inventory) {
   const lifecycle = byId('api-lifecycle-filter');
   const selectedLifecycle = lifecycle.value;
@@ -839,7 +926,7 @@ function renderApiInventory() {
       && (policy === 'all' || (policy === 'blocked' ? Number(item.blocked_count || 0) > 0 : policy === 'approved-post' ? item.method === 'POST' && policies.includes('APPROVED_READ_ONLY') : policy === 'target-failures' ? targetFailure : Number(item.allowed_calls ?? item.calls ?? 0) > 0))
       && (route === 'all' || (item.routes_using_endpoint || []).includes(route))
       && (failureType === 'all' || apiFailureTypes(item).includes(failureType))
-      && (!failedOnly || ['FAILED','WARNING'].includes(outcome));
+      && (!failedOnly || targetFailure);
   });
   visible.sort((left, right) => compareValues(left[apiSort.key], right[apiSort.key], numericApiKeys.has(apiSort.key)) * apiSort.direction);
   updateAriaSort('[data-api-sort]', apiSort, 'apiSort');
@@ -865,6 +952,8 @@ function renderApiInventory() {
     const item = visible[Number(button.dataset.apiIndex)];
     showEvidence(`${item.method} ${item.host}${item.endpoint}`, item);
     byId('evidence-content').insertAdjacentHTML('afterbegin', inspectSection('Request lifecycle', {traffic_role:item.traffic_role || 'UNCLASSIFIED',traffic_roles:item.traffic_roles,observed:item.observed_calls ?? item.calls ?? null,allowed:item.allowed_calls ?? null,blocked:item.blocked_calls ?? item.blocked_count ?? null,sent:item.sent_calls ?? null,responded:item.responded_calls ?? null,completed:item.completed_calls ?? null,failed:item.failed_calls ?? null,canceled:item.canceled_calls ?? null,incomplete:item.incomplete_calls ?? null,validation_status:item.validation_status,validation_outcome:item.validation_outcome,active_validation_status:item.active_validation_status || 'NOT_ACTIVELY_TESTED',validation_basis:item.validation_basis,validation_reason:apiValidationReason(item),observation_status:item.observation_status || item.observation_outcome,post_classifications:item.post_classifications,authentication_classifications:item.authentication_classifications,response_status_counts:item.response_status_counts,block_reasons:item.block_reasons}));
+    const occurrences = apiOccurrenceEvidence(item);
+    byId('evidence-content').insertAdjacentHTML('beforeend', inspectSection('Request occurrences', occurrences.length ? {requests:occurrences} : {recorded:'No per-request occurrence evidence was recorded in this report.'}));
   }));
   refreshScrollSync();
 }
@@ -985,6 +1074,7 @@ function renderFailedEndpoints() {
       response_status_counts:item.response_status_counts || {}, failure_classifications:item.failure_classifications || {},
       failure_type_counts:item.failure_type_counts || {}, lifecycle_status_counts:item.lifecycle_status_counts || {},
       validation_reasons:item.validation_reasons || [], validation_status:item.validation_status || null,
+      ...(row.kind === 'API' ? {request_occurrences:apiOccurrenceEvidence(item)} : {}),
     });
   }));
 }
@@ -1095,6 +1185,39 @@ function renderCoverageDimensions(report) {
   }).join('');
 }
 
+function authenticationDiagnosticEvidence(item) {
+  const code = value => typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(value) ? value : null;
+  const host = value => typeof value === 'string' && /^[a-z0-9.:-]{1,253}$/i.test(value) ? value : null;
+  const flag = value => typeof value === 'boolean' ? value : null;
+  return {
+    reason:code(item.reason), protocol:code(item.protocol),
+    source_host:host(item.source_host), destination_host:host(item.destination_host),
+    source_approved:flag(item.source_approved), destination_approved:flag(item.destination_approved),
+    flow_active:flag(item.flow_active), affects_authentication:flag(item.affects_authentication),
+    policy_reason:code(item.policy_reason), phase:code(item.phase),
+  };
+}
+
+function renderAuthenticationDiagnostics(report) {
+  const diagnostics = (report.authentication_diagnostics || []).map(authenticationDiagnosticEvidence);
+  byId('authentication-diagnostics').hidden = diagnostics.length === 0;
+  const reasons = {
+    AUTHENTICATION_HOSTS_REQUIRED:'No identity-provider hosts were approved. Configure the exact required hosts; a mounted profile does not approve them.',
+    AUTHENTICATION_HOST_NOT_APPROVED:'The authentication destination was not explicitly approved.',
+    AUTHENTICATION_FLOW_NOT_ACTIVE:'No authorized authentication transaction was active for this request.',
+    AUTHENTICATION_SOURCE_NOT_APPROVED:'The request did not originate from an approved portal or identity-provider context.',
+    AUTHENTICATION_PROTOCOL_MISMATCH:'The request did not match the required authentication protocol context.',
+    AUTHENTICATION_POLICY_BLOCKED:'A separate security policy blocked the authentication request.',
+  };
+  byId('authentication-diagnostic-count').textContent = `${diagnostics.length} authentication policy observations; ${report.scan_configuration?.authentication_host_count ?? 'Not recorded'} explicitly configured hosts. Showing ${Math.min(50, diagnostics.length)} records; all records remain in the JSON export. Authentication approvals do not expand crawler or general API scope.`;
+  byId('authentication-diagnostic-list').innerHTML = diagnostics.slice(0, 50).map((item, index) =>
+    `<li><strong>${escapeHtml(item.reason || 'AUTHENTICATION_POLICY_BLOCKED')}</strong><p>${escapeHtml(reasons[item.reason] || 'Review the original policy decision and authorized session configuration.')}</p><code>${escapeHtml(item.protocol || 'Not recorded')} - ${escapeHtml(item.destination_host || 'Not recorded')}</code><p>Policy: ${escapeHtml(item.policy_reason || 'Not recorded')}. Protected coverage affected: ${item.affects_authentication === true ? 'Yes' : 'Not established'}.</p><button type="button" class="secondary" data-authentication-diagnostic="${index}">Inspect authentication decision</button></li>`
+  ).join('');
+  byId('authentication-diagnostic-list').querySelectorAll('[data-authentication-diagnostic]').forEach(button => {
+    button.addEventListener('click', () => showEvidence('Authentication policy decision', diagnostics[Number(button.dataset.authenticationDiagnostic)]));
+  });
+}
+
 function renderReport(report) {
   lastReport = report;
   Object.values(tablePagination).forEach((state) => { state.page = 0; state.key = ''; });
@@ -1139,6 +1262,7 @@ function renderReport(report) {
   renderSecurityRecommendations();
   renderNavigationCoverage(report);
   renderCoverageDimensions(report);
+  renderAuthenticationDiagnostics(report);
   results.hidden = false;
   panelSizes['route-results'].apply();
   scrollAndFocus(results);
@@ -1370,6 +1494,7 @@ byId('download-button').addEventListener('click', () => {
 });
 
 setupScrollSync();
+byId('authentication-hosts').addEventListener('input', updateAuthenticationConfigurationNote);
 verifyBuildIdentity();
 requestJson('/api/auth-profiles', {}, 'Authentication profile request').then((data) => {
   profileNames = data.profiles || [];

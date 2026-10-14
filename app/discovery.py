@@ -598,8 +598,8 @@ NAVIGATION_DOM_HELPERS = r"""
       collapsed:element.getAttribute('aria-expanded') === 'false',
       panelVisible:!!target && visibleControl(target)};
   };
-  const describeView = element => {
-    if (!isNavigationControl(element) || !visibleControl(element) || composedClosest(element, 'form') || element.hasAttribute('disabled') ||
+  const describeView = (element, includeHidden = false) => {
+    if (!isNavigationControl(element) || (!includeHidden && !visibleControl(element)) || composedClosest(element, 'form') || element.hasAttribute('disabled') ||
         element.getAttribute('aria-disabled') === 'true' || element.hasAttribute('download') ||
         unsafeAction(element) || isMenuExpander(element)) return null;
     const raw = routeAttribute(element);

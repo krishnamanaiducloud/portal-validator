@@ -1,19 +1,38 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 from collections.abc import Callable
 from typing import Any
 
 from app.network import safe_api_identity
 from app.reporting import finding
-from app.discovery import evaluate_dom
+from app.discovery import NAVIGATION_DOM_HELPERS, evaluate_dom, retry_dom_operation
 
 
 RENDER_HEALTH_SCRIPT = r"""
-() => {
-  const body = document.body;
-  const roots = [document];
+({viewControl} = {}) => {
+  /* NAVIGATION_DOM_HELPERS */
+  let body = document.body;
+  if (viewControl?.kind === 'panel') {
+    const controls = navigationRoots().flatMap(root => Array.from(root.querySelectorAll(viewSelector)))
+      .filter(element => {
+        // Activation can hide the opener's ancestor while moving its panel to
+        // a visible sibling portal. Hidden controls are only inspected here;
+        // discovery and activation retain their visible-control safety gate.
+        const view = describeView(element, true);
+        return view && view.identity === viewControl.identity && view.label === viewControl.label &&
+          view.scope === viewControl.scope;
+      });
+    const control = controls.length === 1 ? controls[0] : null;
+    const panel = control && controlledPanel(control);
+    body = panel && control.getRootNode().querySelector('#' + CSS.escape(panel));
+    if (body && !visibleControl(body)) body = null;
+  }
+  const roots = body ? [viewControl?.kind === 'panel' ? body : document] : [];
+  if (viewControl?.kind === 'panel' && body?.shadowRoot) roots.push(body.shadowRoot);
   for (let index = 0; index < roots.length; index++) {
     for (const element of roots[index].querySelectorAll('*')) {
       if (element.shadowRoot) roots.push(element.shadowRoot);
@@ -53,7 +72,14 @@ RENDER_HEALTH_SCRIPT = r"""
     const rect = element.getBoundingClientRect();
     return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
   };
-  const all = (selector) => roots.flatMap(root => Array.from(root.querySelectorAll(selector)));
+  const all = (selector) => roots.flatMap(root => [
+    ...(root instanceof Element && root.matches(selector) ? [root] : []),
+    ...Array.from(root.querySelectorAll(selector))
+  ]);
+  // The selected panel owns its render evidence, while a challenge or visible
+  // application loader elsewhere in the document still prevents readiness.
+  const healthAll = viewControl?.kind === 'panel' ? selector =>
+    navigationRoots().flatMap(root => Array.from(root.querySelectorAll(selector))) : all;
   const visible = body ? all('*').filter(isVisible) : [];
   // body.innerText alone omits open component shadow trees in Chromium.
   // Only rendered component children contribute; hidden/script-only markup
@@ -65,8 +91,8 @@ RENDER_HEALTH_SCRIPT = r"""
     .filter(isVisible)
     .map((element) => (element.textContent || '').replace(/\s+/g, ' ').trim())
     .join(' ').slice(0, 500);
-  const busy = all('[aria-busy="true"], [role="progressbar"]').filter(isVisible).length;
-  const challenge = all([
+  const busy = healthAll('[aria-busy="true"], [role="progressbar"]').filter(isVisible).length;
+  const challenge = healthAll([
     '[data-sitekey]',
     'iframe[src*="captcha" i]',
     'iframe[title*="captcha" i]',
@@ -83,9 +109,11 @@ RENDER_HEALTH_SCRIPT = r"""
     alert_text: alertText,
     dom_generation: activity.generation,
     document_epoch: performance.timeOrigin,
+    view_scope_available: !!body,
+    view_scoped: viewControl?.kind === 'panel',
   };
 }
-"""
+""".replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
 
 
 ERROR_SURFACE_MARKERS = (
@@ -101,8 +129,41 @@ ERROR_SURFACE_MARKERS = (
 RENDER_SAMPLE_INTERVAL_SECONDS = 0.1
 
 
-async def capture_render_health(page) -> dict[str, Any]:
-    result = await evaluate_dom(page, RENDER_HEALTH_SCRIPT)
+def readiness_event_init_script(event_name: str) -> str:
+    """Observe an owner-configured event without retaining its payload."""
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{0,127}", event_name):
+        raise ValueError("Readiness event name is invalid")
+    return """(() => {
+      window.__portalValidatorReadinessEventSeen = false;
+      window.addEventListener(%s, () => {
+        window.__portalValidatorReadinessEventSeen = true;
+      }, {capture: true});
+    })();""" % json.dumps(event_name)
+
+
+async def configured_readiness_conditions(
+    page, *, readiness_selector: str | None = None,
+    readiness_event: str | None = None, timeout_ms: int = 5000,
+    wait_until_met: bool = False,
+) -> dict[str, bool]:
+    """Retry only read-only conditions within the caller's remaining budget."""
+    async def inspect():
+        while True:
+            selector_met = not readiness_selector or await page.locator(readiness_selector).first.is_visible()
+            event_met = not readiness_event or await page.evaluate(
+                "() => window.__portalValidatorReadinessEventSeen === true",
+            )
+            conditions = {"configured_readiness_met": bool(selector_met and event_met),
+                          "readiness_event_seen": bool(event_met) if readiness_event else False}
+            if conditions["configured_readiness_met"] or not wait_until_met:
+                return conditions
+            await asyncio.sleep(RENDER_SAMPLE_INTERVAL_SECONDS)
+
+    return await retry_dom_operation(page, inspect, timeout_ms=timeout_ms)
+
+
+async def capture_render_health(page, *, view_control: dict[str, str] | None = None) -> dict[str, Any]:
+    result = await evaluate_dom(page, RENDER_HEALTH_SCRIPT, {"viewControl": view_control})
     return {
         "ready_state": str(result.get("ready_state") or "unknown"),
         "title": str(result.get("title") or "")[:256],
@@ -113,6 +174,8 @@ async def capture_render_health(page) -> dict[str, Any]:
         "alert_text": str(result.get("alert_text") or "")[:500],
         "dom_generation": max(0, int(result.get("dom_generation", 0))),
         "document_epoch": result.get("document_epoch"),
+        "view_scope_available": bool(result.get("view_scope_available", True)),
+        "view_scoped": bool(result.get("view_scoped", False)),
     }
 
 
@@ -138,6 +201,13 @@ async def document_navigation_timing(page) -> tuple[int, float, float] | None:
     return duration_ms, started, started + duration_ms / 1000
 
 
+def meaningful_rendered_content(snapshot: dict[str, Any]) -> bool:
+    # A compact tab can legitimately contain a short value. Empty panels still
+    # need rendered content of their own rather than the surrounding shell.
+    minimum_text = 1 if snapshot.get("view_scoped") else 20
+    return bool(snapshot.get("text_length", 0) >= minimum_text or snapshot.get("visible_elements", 0) >= 3)
+
+
 def application_shell_ready(snapshot: dict[str, Any] | None) -> bool:
     """Observable rendered readiness, not HTTP 200 or an authentication claim.
 
@@ -148,9 +218,10 @@ def application_shell_ready(snapshot: dict[str, Any] | None) -> bool:
         snapshot
         and snapshot.get("ready_state") in {"interactive", "complete"}
         and snapshot.get("configured_readiness_met", True)
+        and snapshot.get("view_scope_available", True)
         and not snapshot.get("busy_indicators", 0)
         and not snapshot.get("challenge_indicators", 0)
-        and (snapshot.get("text_length", 0) >= 20 or snapshot.get("visible_elements", 0) >= 3)
+        and meaningful_rendered_content(snapshot)
     )
 
 
@@ -163,6 +234,8 @@ async def wait_for_render_settle(
     minimum_observation_ms: int = 500,
     network_quiet_ms: int = 300,
     readiness_selector: str | None = None,
+    readiness_event: str | None = None,
+    view_control: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Wait for bounded DOM stability and route-scoped network quiet.
 
@@ -181,7 +254,9 @@ async def wait_for_render_settle(
         "ready_state": "unknown", "title": "", "text_length": 0,
         "visible_elements": 0, "busy_indicators": 0,
         "challenge_indicators": 0, "alert_text": "",
-        "configured_readiness_met": not bool(readiness_selector),
+        "configured_readiness_met": not bool(readiness_selector or readiness_event),
+        "readiness_event_seen": False,
+        "view_scope_available": not bool(view_control and view_control.get("kind") == "panel"),
     }
     initial_activity = network_activity() if network_activity is not None else {}
     last_generation = int(initial_activity.get("generation", 0))
@@ -236,16 +311,21 @@ async def wait_for_render_settle(
             )
         capture_started = time.perf_counter()
         try:
-            latest = await asyncio.wait_for(capture_render_health(page), timeout=remaining)
+            capture = capture_render_health(page, view_control=view_control) if view_control else capture_render_health(page)
+            latest = await asyncio.wait_for(capture, timeout=remaining)
             # A fresh DOM snapshot does not carry the configured condition. If
             # its visibility check exhausts the budget, readiness is unproven,
             # not implicitly successful or inherited from an earlier sample.
-            latest["configured_readiness_met"] = not bool(readiness_selector)
-            if readiness_selector:
-                latest["configured_readiness_met"] = await asyncio.wait_for(
-                    page.locator(readiness_selector).first.is_visible(),
+            latest["configured_readiness_met"] = not bool(readiness_selector or readiness_event)
+            latest["readiness_event_seen"] = False
+            if readiness_selector or readiness_event:
+                latest.update(await asyncio.wait_for(
+                    configured_readiness_conditions(
+                        page, readiness_selector=readiness_selector, readiness_event=readiness_event,
+                        timeout_ms=max(1, round((deadline - time.perf_counter()) * 1000)),
+                    ),
                     timeout=max(0.001, deadline - time.perf_counter()),
-                )
+                ))
         except TimeoutError:
             capture_intervals.append((capture_started, time.perf_counter()))
             activity = network_activity() if network_activity is not None else {}
@@ -263,18 +343,14 @@ async def wait_for_render_settle(
             latest["challenge_indicators"],
             latest["title"],
             latest.get("configured_readiness_met", True),
+            latest.get("view_scope_available", True),
             latest.get("dom_generation", 0),
             latest.get("document_epoch"),
         )
         activity = network_activity() if network_activity is not None else {}
         generation = int(activity.get("generation", 0))
         pending = int(activity.get("pending", 0))
-        if first_render_ready is None and (
-            latest["ready_state"] in {"interactive", "complete"}
-            and latest.get("configured_readiness_met", True)
-            and not latest["busy_indicators"]
-            and (latest["text_length"] >= 20 or latest["visible_elements"] >= 3)
-        ):
+        if first_render_ready is None and application_shell_ready(latest):
             first_render_ready = capture_started
         if pending:
             api_active_until = capture_started
@@ -309,12 +385,7 @@ async def wait_for_render_settle(
                 pending == 0
                 and (now - network_quiet_since) * 1000 >= network_quiet_ms
             )
-            content_ready = (
-                latest["ready_state"] in {"interactive", "complete"}
-                and latest.get("configured_readiness_met", True)
-                and not latest["busy_indicators"]
-                and (latest["text_length"] >= 20 or latest["visible_elements"] >= 3)
-            )
+            content_ready = application_shell_ready(latest)
             if dom_stable and observed_minimum and network_quiet and content_ready:
                 return finish("DOM_AND_NETWORK_QUIET", now, pending, generation)
         else:
@@ -396,7 +467,7 @@ def assess_page_health(
             "INFO",
             "A browser challenge requires user interaction and was not bypassed.",
         ))
-    elif snapshot.get("text_length", 0) < 20 and snapshot.get("visible_elements", 0) < 3:
+    elif not meaningful_rendered_content(snapshot):
         classification = "PAGE_RENDER_ERROR"
         findings.append(finding(
             "BLANK_PAGE",
@@ -505,9 +576,9 @@ def api_health_findings(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         elif event.get("error") and not event.get("request_canceled") and event.get("lifecycle_status") != "INCOMPLETE":
             upper_error = str(event["error"]).upper()
             failure_type = (
-                "API_TLS_FAILURE" if "CERT" in upper_error or "TLS" in upper_error else
+                "API_TLS_FAILURE" if "CERT" in upper_error or "TLS" in upper_error or "ERR_SSL_" in upper_error else
                 "API_DNS_FAILURE" if "NAME_NOT_RESOLVED" in upper_error else
-                "API_TIMEOUT" if "TIMEOUT" in upper_error else
+                "API_TIMEOUT" if any(marker in upper_error for marker in ("TIMEOUT", "TIMED_OUT", "TIMED OUT")) else
                 "API_NETWORK_FAILURE"
             )
             findings.append(finding(

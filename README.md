@@ -1,11 +1,13 @@
 # Portal Validator
 
-Portal Validator 1.12.9 is a read-only browser health validator with optional authentication for public,
+Portal Validator 1.12.10 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
 results without disabling certificate verification.
 
+See [1.12.10 release verification](docs/RELEASE-1.12.10.md) for authentication
+configuration diagnostics, scoped view readiness and correlated API failures.
 See [1.12.9 release verification](docs/RELEASE-1.12.9.md) for lazy Material/CDK
 menus, nested SPA tabs, passive route retention and the historical regression audit.
 See [1.12.8 release verification](docs/RELEASE-1.12.8.md) for build identity,
@@ -191,6 +193,37 @@ The UI discovers valid `*.json` profiles from this mount; users cannot enter an
 arbitrary container path. Desktop browser sessions are separate from the
 Playwright Chromium session running in OpenShift.
 
+### Explicit authentication and readiness configuration
+
+Approved authentication hosts are configured in the Authentication panel,
+separately from portal, resource/API and credential hosts. The displayed count
+must match `scan_configuration.authentication_host_count` in the report. An SSO
+profile restores only scoped browser state; it never implicitly approves hosts.
+Do not add guessed identity providers or move authentication POSTs into the
+business read-only allowlist. Public websites need no profile by default.
+
+The validated API field is `authentication_hosts` (not `authenticationHosts`).
+Unknown scan/authentication fields are rejected, and validation errors contain
+only safe field/code guidance, never submitted credentials. Missing or malformed
+profiles are rejected before an asynchronous scan is accepted. For example:
+
+```json
+{
+  "target": "https://portal.example.net",
+  "authentication": {"mode": "storage_state", "storage_profile": "approved-session"},
+  "authentication_hosts": ["login.example.net", "identity.example.org"],
+  "readiness_selector": "[data-app-ready]",
+  "readiness_event": "portal:ready"
+}
+```
+
+Both readiness conditions are optional. Configure only conditions the target
+actually provides; if both are set, both are required. The event observer is
+installed before document scripts, stores a boolean without payloads, and resets
+for each full-document navigation. Authentication diagnostics distinguish missing
+host approval, an inactive transaction, and other policy failures. Blocked or
+expired authentication cannot establish complete protected-application coverage.
+
 ### Automatic session refresh
 
 For a profile named `/auth/approved.json`, an optional read-only companion file
@@ -277,10 +310,10 @@ Build versioned tags only:
 ```bash
 docker build --build-arg VCS_REF="$(git rev-parse HEAD)" \
   --build-arg BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -t mohankrishna999/portal-validator:1.12.9 .
+  -t mohankrishna999/portal-validator:1.12.10 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.9 \
-  -t mohankrishna999/portal-validator:1.12.9-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.10 \
+  -t mohankrishna999/portal-validator:1.12.10-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -295,7 +328,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.12.9
+  mohankrishna999/portal-validator:1.12.10
 ```
 
 ## OpenShift

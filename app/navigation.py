@@ -340,6 +340,70 @@ class AuthenticationNavigationPolicy:
             and oauth_token_form_signal(post_data)
         )
 
+    def diagnose_blocked_request(
+        self, method: str, url: str, post_data: str | None, *,
+        resource_type: str, document_navigation: bool, portal_scoped: bool,
+        source_url: str, source_portal_scoped: bool = False,
+    ) -> dict[str, Any] | None:
+        """Explain denied protocol traffic without granting or activating a flow.
+
+        Diagnosis must also work when identity-host approval or flow evidence is
+        missing. Actual form/grant evidence distinguishes those configuration
+        failures from unrelated business requests with authentication-like paths.
+        Only a trusted source and matching protocol can limit app authentication;
+        an unrelated frame cannot invalidate a successfully rendered portal.
+        No URL parameters, form fields or credential values leave this method.
+        """
+        normalized_method = method.upper()
+        destination_host = normalized_host(urlparse(url).hostname or "")
+        source_host = normalized_host(urlparse(source_url).hostname or "")
+        source_approved = source_portal_scoped or source_host in self.approved_hosts
+        destination_approved = destination_host in self.approved_hosts
+        endpoint_matches = True
+        if document_navigation and normalized_method == "POST" and authentication_form_signal(post_data):
+            protocol = "AUTHENTICATION_FORM"
+            destination_approved = destination_approved or portal_scoped
+        elif (
+            not document_navigation and normalized_method == "POST"
+            and resource_type.lower() in {"xhr", "fetch"}
+            and oauth_token_form_signal(post_data)
+        ):
+            protocol = "OAUTH_TOKEN"
+            token_endpoint = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1].lower() == "token"
+            endpoint_matches = auth_protocol_signal(url) or token_endpoint
+        elif (
+            document_navigation and self.active
+            and normalized_method in {"GET", "HEAD", "OPTIONS"}
+            and auth_protocol_signal(url, boundary_only=portal_scoped)
+        ):
+            protocol = "AUTHENTICATION_NAVIGATION"
+            destination_approved = destination_approved or portal_scoped
+        else:
+            return None
+        if not source_approved:
+            reason = "AUTHENTICATION_SOURCE_NOT_APPROVED"
+        elif not endpoint_matches:
+            reason = "AUTHENTICATION_PROTOCOL_MISMATCH"
+        elif not destination_approved:
+            reason = (
+                "AUTHENTICATION_HOST_NOT_APPROVED" if self.approved_hosts
+                else "AUTHENTICATION_HOSTS_REQUIRED"
+            )
+        elif not self.active:
+            reason = "AUTHENTICATION_FLOW_NOT_ACTIVE"
+        else:
+            reason = "AUTHENTICATION_POLICY_BLOCKED"
+        return {
+            "reason": reason,
+            "protocol": protocol,
+            "destination_host": destination_host,
+            "source_host": source_host,
+            "source_approved": source_approved,
+            "destination_approved": destination_approved,
+            "flow_active": self.active,
+            "affects_authentication": bool(source_approved and endpoint_matches),
+        }
+
 
 async def settle_authentication_navigation(
     page: Any,

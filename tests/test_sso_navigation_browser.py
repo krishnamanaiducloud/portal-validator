@@ -6,7 +6,7 @@ import logging
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from urllib.parse import urlparse
 
 import pytest
@@ -27,6 +27,9 @@ def sso_portal(tmp_path, monkeypatch):
         application_delay_ms = 0
         saml_redirect_status = 303
         saml_redirect_delay_ms = 0
+        oauth_exchange_delay_ms = 0
+        oauth_exchange_gate = False
+        oauth_exchange_release = Event()
 
     origins = FixtureOrigins()
 
@@ -46,6 +49,9 @@ def sso_portal(tmp_path, monkeypatch):
             cookies = self.headers.get("Cookie", "")
             requests.append((role, "GET", path, cookies))
             if role == "portal":
+                if path == "/auth-trigger":
+                    origins.oauth_exchange_release.wait(timeout=10)
+                    return self.reply(200, b'{"ready":true}')
                 if path == "/business-warning-page":
                     return self.reply(200, ('''<html><body><h1>Generic application shell</h1>
                         <nav><a href="/business-target-page">Public dashboard</a></nav><main>Application content is available.</main>
@@ -61,13 +67,16 @@ def sso_portal(tmp_path, monkeypatch):
                         <main>Application content remains available.</main><iframe src="'''
                         + origins["oauth"] + '''/saml/iframe-start"></iframe>
                         </body></html>''').encode())
-                if path == "/oauth-exchange-page":
+                if path in {"/oauth-exchange-page", "/token-exchange-page"}:
                     endpoint = json.dumps(origins["oauth"] + "/oauth/token")
                     return self.reply(200, ('''<html><body><h1>Application shell</h1>
                         <main>Application content remains available.</main><script>
-                        fetch(''' + endpoint + ''', {method:'POST',credentials:'include',
+                        const exchange = () => fetch(''' + endpoint + ''', {method:'POST',credentials:'include',
                         headers:{'Content-Type':'application/x-www-form-urlencoded'},
                         body:'grant_type=authorization_code&code=fixture-private-code'});
+                        if (''' + json.dumps(origins.oauth_exchange_gate) + ''') {
+                            fetch('/auth-trigger').then(exchange);
+                        } else { setTimeout(exchange, ''' + str(origins.oauth_exchange_delay_ms) + '''); }
                         </script></body></html>''').encode())
                 if path == "/popup-window-page":
                     return self.reply(200, ('''<html><body><h1>Generic application</h1>
@@ -352,6 +361,66 @@ async def test_real_oauth_fetch_requires_separate_explicit_authentication_approv
     assert event["allowed_calls"] == int(approved) and event["blocked_calls"] == int(not approved)
     if approved:
         assert event["policies"] == ["AUTH_FLOW"] and "localhost" in resolved
+        assert report["results"][0]["authentication_status"] == "PASS"
+        assert report["authentication_diagnostics"] == []
+    else:
+        assert report["results"][0]["authentication_status"] == "AUTHENTICATION_BLOCKED"
+        assert not report["summary"]["coverage_complete"]
+        diagnostic = report["results"][0]["authentication_diagnostics"][0]
+        assert diagnostic["reason"] == "AUTHENTICATION_HOSTS_REQUIRED"
+        assert diagnostic["destination_host"] == "localhost"
+        assert diagnostic["affects_authentication"]
+        assert report["authentication_diagnostics"] == [diagnostic]
+        assert report["api_request_occurrences"][0]["authentication_diagnostic"] == diagnostic
+    assert "fixture-private" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,hosts,delay,expected", [
+    ("/token-exchange-page", ["localhost"], 0, "AUTHENTICATION_FLOW_NOT_ACTIVE"),
+    ("/oauth-exchange-page", [], 200, "AUTHENTICATION_HOSTS_REQUIRED"),
+])
+async def test_denied_oauth_during_bootstrap_cannot_prove_authenticated_shell(sso_portal, path, hosts, delay, expected):
+    await require_browser()
+    origins, requests, _, _ = sso_portal
+    origins.oauth_exchange_delay_ms = delay
+    report = await execute_scan(configuration(
+        origins["portal"] + path, max_pages=1, min_observation_ms=700,
+        authentication_hosts=hosts,
+    ))
+    assert not any(role == "oauth" and method == "POST" for role, method, _, _ in requests)
+    result = report["results"][0]
+    assert result["authentication_status"] == "AUTHENTICATION_BLOCKED"
+    assert not result["application_ready"]
+    assert not report["summary"]["coverage_complete"]
+    assert result["authentication_diagnostics"][0]["reason"] == expected
+    assert "fixture-private" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_denied_oauth_during_final_drain_reconciles_authentication_coverage(sso_portal, monkeypatch):
+    await require_browser()
+    origins, requests, _, _ = sso_portal
+    origins.oauth_exchange_gate = True
+    original_drain = main.drain_pending_api_observations
+
+    async def release_authentication_in_final_drain(observer, **options):
+        assert not any(event.get("endpoint") == "/oauth/token" for event in observer.events)
+        origins.oauth_exchange_release.set()
+        return await original_drain(observer, **options)
+
+    monkeypatch.setattr(main, "drain_pending_api_observations", release_authentication_in_final_drain)
+    report = await execute_scan(configuration(
+        origins["portal"] + "/oauth-exchange-page", authentication_hosts=[], max_pages=1,
+        min_observation_ms=0, render_settle_ms=0,
+    ))
+    assert not any(role == "oauth" and method == "POST" for role, method, _, _ in requests)
+    result = report["results"][0]
+    assert result["authentication_status"] == result["classification"] == "AUTHENTICATION_BLOCKED"
+    assert not result["application_ready"]
+    assert not report["summary"]["coverage_complete"]
+    assert result["authentication_diagnostics"][0]["reason"] == "AUTHENTICATION_HOSTS_REQUIRED"
+    assert report["authentication_diagnostics"] == result["authentication_diagnostics"]
     assert "fixture-private" not in json.dumps(report)
 
 
