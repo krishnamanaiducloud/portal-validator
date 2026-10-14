@@ -11,7 +11,7 @@ authentication, SSRF, TLS or read-only execution.
 | Reproduced behavior before | Focused correction |
 | --- | --- |
 | Default query ignoring collapsed `#/workspace?view=home`, `view=reports` and `view=activity` into one route. | Preserve sanitized SPA fragment parameters as route identity; continue ignoring ordinary HTTP queries by default. Explicit allowlists and secret/tracking exclusions remain enforced. |
-| Breadth-first traversal visited a sibling document before a queued hash/history route. Synthetic history then changed that sibling's URL without restoring the SPA, losing its content and API activity. | Retain the actual observed source document GET separately from its logical history URL. Restore a displaced source through guarded document navigation, retain its real response, then activate the SPA route. Document-local history observations avoid unnecessary reloads within the same SPA. |
+| Breadth-first traversal visited a sibling document before a queued hash/history route. Synthetic history then changed that sibling's URL without restoring the SPA, losing its content and API activity. | Retain the actual observed source document GET separately from its logical history URL. Restore a displaced source through guarded document navigation, retain its real response, then activate the SPA route. The document observer baseline identifies the actual source, ignoring an initial hash; shared history URLs cannot establish document ownership. |
 | An authenticated rendered shell containing a completed ARIA progress bar failed readiness and stopped validation after one page. | A finite completed determinate bar is status, not an active loader. Explicit busy state, incomplete/indeterminate/invalid progress, configured readiness and challenge gates remain blocking. |
 
 ## Synthetic before/after evidence
@@ -25,6 +25,8 @@ authentication, SSRF, TLS or read-only execution.
   History URLs without a server document fallback restore their actual shell
   GET instead. A displaced source without an observed GET fails explicitly;
   authentication/business POST documents are never replayed.
+  A sibling application independently visiting the same history URL still
+  restores the correct source document instead of inheriting the wrong DOM.
 - Completed-progress authenticated fixture: one loaded page, two retained but
   untested routes and `APPLICATION_NOT_READY` before; three rendered, ready,
   passing routes afterward.

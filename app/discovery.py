@@ -1524,34 +1524,42 @@ async def perform_route_navigation(
         source_origin = (source_document.scheme, source_document.hostname, source_document.port)
         if source_origin != (target.scheme, target.hostname, target.port):
             raise RuntimeError("Same-document route transition crossed an origin boundary")
-        if (current.scheme, current.netloc, current.path, current.query) != (
+        source_is_current_document = (
+            current.scheme, current.netloc, current.path, current.query,
+        ) == (
             source_document.scheme, source_document.netloc,
             source_document.path, source_document.query,
-        ):
-            source_is_current_document = await evaluate_dom(
+        )
+        if source_document_url:
+            observed_source_document = await evaluate_dom(
                 page,
-                "sourceUrls => (window.__portalValidatorObservedRoutes || []).some(item => "
-                "sourceUrls.includes(typeof item === 'string' ? item : item.url))",
-                [value for value in (source_document_url, source_route_url) if value],
+                """sourceUrl => {
+                  const baseline = (window.__portalValidatorObservedRoutes || []).find(
+                    item => item && item.mode === 'document' && typeof item.url === 'string');
+                  if (!baseline) return null;
+                  const actual = new URL(baseline.url), expected = new URL(sourceUrl);
+                  return actual.origin === expected.origin && actual.pathname === expected.pathname &&
+                    actual.search === expected.search;
+                }""",
+                source_document_url,
                 timeout_ms=timeout_ms,
             )
-            # Breadth-first traversal can replace the originating SPA with a
-            # sibling document. History mutation alone would then change its
-            # URL while inspecting the sibling's DOM and missing the SPA's API
-            # traffic. Restore the observed source through normal guarded
-            # navigation, preserving the shared context and actual HTTP/TLS
-            # evidence, before dispatching the transition exactly once.
-            # The document-local history observer survives sibling SPA paths
-            # but resets on a real document navigation. Its source observation
-            # avoids unnecessary reloads when only browser history moved.
-            if not source_is_current_document:
-                if source_document_url is None:
-                    raise RuntimeError("Displaced SPA source document has no observed GET restoration target")
-                restored_response = await page.goto(
-                    source_document_url, wait_until="domcontentloaded", timeout=timeout_ms,
-                )
-                if restored_response is None:
-                    raise RuntimeError("Source document restoration completed without an HTTP response")
+            if observed_source_document is not None:
+                source_is_current_document = observed_source_document
+        # Only the document baseline identifies the original GET document.
+        # Unrelated SPAs can visit identical history URLs; those observations
+        # cannot establish shared document ownership. Ignore an initial hash
+        # when comparing the baseline with its fragment-free HTTP response.
+        # Restore a displaced source through normal guarded GET navigation,
+        # preserving context cookies and actual HTTP/TLS response evidence.
+        if not source_is_current_document:
+            if source_document_url is None:
+                raise RuntimeError("Displaced SPA source document has no observed GET restoration target")
+            restored_response = await page.goto(
+                source_document_url, wait_until="domcontentloaded", timeout=timeout_ms,
+            )
+            if restored_response is None:
+                raise RuntimeError("Source document restoration completed without an HTTP response")
     activated = await activate_semantic_route(
         page,
         url,

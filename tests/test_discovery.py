@@ -211,7 +211,8 @@ async def test_displaced_spa_without_observed_get_source_is_not_replayed():
 
 
 @pytest.mark.asyncio
-async def test_synthetic_spa_routes_render_without_additional_document_requests():
+@pytest.mark.parametrize("initial_fragment", ["", "#/home"])
+async def test_synthetic_spa_routes_render_without_additional_document_requests(initial_fragment):
     class Handler(BaseHTTPRequestHandler):
         document_requests = 0
 
@@ -251,7 +252,7 @@ async def test_synthetic_spa_routes_render_without_additional_document_requests(
                 await context.add_init_script(script=ROUTE_OBSERVER_SCRIPT)
                 page = await context.new_page()
                 response, transitioned, activation = await perform_route_navigation(
-                    page, f"{origin}/", DOCUMENT_NAVIGATION, 5000,
+                    page, f"{origin}/{initial_fragment}", DOCUMENT_NAVIGATION, 5000,
                 )
                 assert response.status == 200
                 assert transitioned is False
@@ -268,7 +269,8 @@ async def test_synthetic_spa_routes_render_without_additional_document_requests(
                 ):
                     response, transitioned, activation = await perform_route_navigation(
                         page, target, mode, 5000,
-                        source_document_url=f"{origin}/reports",
+                        source_document_url=f"{origin}/",
+                        source_route_url=f"{origin}/reports",
                     )
                     assert response is None
                     assert transitioned is True
@@ -285,7 +287,10 @@ async def test_synthetic_spa_routes_render_without_additional_document_requests(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route_mode", [HASH_ROUTE_TRANSITION, SPA_ROUTE_TRANSITION])
-async def test_queued_spa_route_restores_its_source_document_and_api_context(monkeypatch, route_mode):
+@pytest.mark.parametrize("overlapping_history", [False, True])
+async def test_queued_spa_route_restores_its_source_document_and_api_context(
+    monkeypatch, route_mode, overlapping_history,
+):
     """A prior document branch must not receive a sibling SPA's history update."""
     from app import main, security
 
@@ -301,6 +306,9 @@ async def test_queued_spa_route_restores_its_source_document_and_api_context(mon
                 content_type = "application/json"
             elif self.path == "/other":
                 body = b"<title>Other document</title><main><h1>Unrelated document contents</h1></main>"
+                if overlapping_history:
+                    body += b'''<script>history.replaceState({}, '', '/workspace');
+                      history.replaceState({}, '', '/other');</script>'''
                 content_type = "text/html"
             elif self.path == "/index":
                 navigation = '<a href="#/reports">Reports</a>' if hash_route else ""
