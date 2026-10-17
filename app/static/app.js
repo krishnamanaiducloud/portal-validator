@@ -1077,6 +1077,47 @@ function renderFailedEndpoints() {
       ...(row.kind === 'API' ? {request_occurrences:apiOccurrenceEvidence(item)} : {}),
     });
   }));
+  renderRequestIssues();
+}
+
+function renderRequestIssues() {
+  // Preserve policy failures and incomplete requests as diagnostic evidence,
+  // not as fictitious HTTP or target network failures.
+  const count = value => Number.isFinite(Number(value)) ? Math.max(0, Math.trunc(Number(value))) : 0;
+  const rows = [];
+  for (const [kind, inventory, endpointField, routeField] of [
+    ['API', lastReport?.api_inventory || [], 'endpoint', 'routes_using_endpoint'],
+    ['Resource', lastReport?.resource_inventory || [], 'path', 'routes_using_resource'],
+  ]) {
+    for (const item of inventory) {
+      const states = {
+        POLICY_BLOCKED: Math.max(count(item.blocked_calls), count(item.blocked_count), count(item.validator_blocks), count(item.failure_type_counts?.POLICY_BLOCKED)),
+        CANCELED: Math.max(count(item.canceled_calls), count(item.failure_type_counts?.CANCELED)),
+        INCOMPLETE: Math.max(count(item.incomplete_calls), count(item.failure_type_counts?.INCOMPLETE)),
+      };
+      for (const [state, affected] of Object.entries(states)) {
+        if (affected) rows.push({kind, item, endpoint:item[endpointField] || '', routes:item[routeField] || [], state, affected});
+      }
+    }
+  }
+  const routes = lastReport?.route_inventory || lastReport?.results || [];
+  const names = ids => ids.map(id => {
+    const match = routes.find(route => [route.route_id, route.normalized_route_identity, route.canonical_route, route.url].includes(id));
+    return match?.route_name || match?.route_label || id;
+  }).join(', ') || 'Not attributed';
+  byId('request-issue-count').textContent = String(rows.length) + ' issue categories; these are not target HTTP failures.';
+  byId('request-issue-list').innerHTML = rows.map((row, index) =>
+    '<tr><td>' + escapeHtml(row.kind) + '</td><td>' + escapeHtml(row.item.method || 'Not recorded') + '</td><td class="resource-path"><strong>' + escapeHtml(row.item.host || '') + '</strong><code>' + escapeHtml(row.endpoint) + '</code></td><td>' + escapeHtml(row.state) + '</td><td>' + escapeHtml(row.affected) + '</td><td>' + escapeHtml(names(row.routes)) + '</td><td><button type="button" class="secondary" data-request-issue="' + index + '">Inspect request issue</button></td></tr>'
+  ).join('') || '<tr><td colspan="7" class="empty-table">No blocked, canceled or incomplete requests were observed.</td></tr>';
+  byId('request-issue-list').querySelectorAll('[data-request-issue]').forEach(button => button.addEventListener('click', () => {
+    const row = rows[Number(button.dataset.requestIssue)];
+    showEvidence((row.item.method || '') + ' ' + (row.item.host || '') + row.endpoint, {
+      kind:row.kind, method:row.item.method || null, host:row.item.host || null, endpoint:row.endpoint,
+      issue_type:row.state, affected_calls:row.affected, associated_routes:row.routes,
+      block_reasons:row.item.block_reasons || [], lifecycle_status_counts:row.item.lifecycle_status_counts || {},
+      ...(row.kind === 'API' ? {request_occurrences:apiOccurrenceEvidence(row.item)} : {}),
+    });
+  }));
 }
 
 function renderSecurityRecommendations() {
@@ -1409,6 +1450,11 @@ for (const [key,label] of tableColumns.route.slice(13)) {
   document.querySelector('#route-table-wrap thead tr').append(header);
 }
 byId('result-filter').insertAdjacentHTML('beforeend', '<option value="not-tested">Not tested</option><option value="SKIPPED">Skipped</option>');
+const requestIssueSection = document.createElement('section');
+requestIssueSection.id = 'request-issues';
+requestIssueSection.className = 'inventory';
+requestIssueSection.innerHTML = '<h3>Blocked / Incomplete Requests</h3><p>Policy-blocked, canceled and incomplete requests are shown separately from target HTTP failures. These are passive observations only.</p><p id="request-issue-count" class="inventory-scope"></p><div class="route-table-wrap"><table class="route-table"><thead><tr><th>Kind</th><th>Method</th><th>Sanitized endpoint</th><th>Issue</th><th>Calls</th><th>Associated routes/views</th><th>Diagnostics</th></tr></thead><tbody id="request-issue-list"></tbody></table></div>';
+byId('failed-endpoints').after(requestIssueSection);
 const postSummary = document.createElement('dl');
 postSummary.className = 'api-post-summary';
 postSummary.setAttribute('aria-label', 'Observed POST request counts across the complete scan');
