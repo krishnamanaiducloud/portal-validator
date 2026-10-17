@@ -18,13 +18,13 @@ blocked unless an independent, specifically approved read operation applies.
 2. With `oc` access, preview what will change:
 
    ```bash
-   scripts/apply_auth_policy.sh YOUR_NAMESPACE /path/to/approved-policies.json
+   bash scripts/apply_auth_policy.sh YOUR_NAMESPACE /path/to/approved-policies.json
    ```
 
 3. Once the policy is security-reviewed and approved, run:
 
    ```bash
-   scripts/apply_auth_policy.sh YOUR_NAMESPACE /path/to/approved-policies.json --apply
+   bash scripts/apply_auth_policy.sh YOUR_NAMESPACE /path/to/approved-policies.json --apply
    ```
 
    This creates a ConfigMap containing the reviewed policy and mounts it
