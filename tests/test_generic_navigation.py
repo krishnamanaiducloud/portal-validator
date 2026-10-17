@@ -47,7 +47,7 @@ PORTAL_HTML = """<!doctype html>
         aria-controls="snapshot-panel" aria-selected="true">Snapshot</button>
       <button type="button" role="tab" id="history-tab"
         aria-controls="history-panel" aria-selected="false"
-        onclick="document.getElementById('history-panel').hidden=false;this.setAttribute('aria-selected','true')">History</button>
+        onclick="document.getElementById('history-panel').hidden=false;this.setAttribute('aria-selected','true');fetch('/api/history')">History</button>
     </div>
     <div role="tabpanel" id="snapshot-panel">Snapshot data</div>
     <div role="tabpanel" id="history-panel" hidden>History data</div>
@@ -70,7 +70,10 @@ async def test_generic_disclosure_dropdown_and_nested_tabs_are_discovered():
         try:
             page = await browser.new_page()
             async def serve_portal(route):
-                await route.fulfill(status=200, content_type="text/html", body=PORTAL_HTML)
+                if route.request.url.endswith("/api/history"):
+                    await route.fulfill(status=502, content_type="application/json", body='{"error":"upstream"}')
+                else:
+                    await route.fulfill(status=200, content_type="text/html", body=PORTAL_HTML)
 
             await page.route("https://portal.test/**", serve_portal)
             await page.goto("https://portal.test/")
@@ -94,7 +97,9 @@ async def test_generic_disclosure_dropdown_and_nested_tabs_are_discovered():
             subviews = await discover_page_routes(page, 0)
             history = next(route for route in subviews if route.label == "History")
             assert history.navigation_mode == UI_VIEW_ACTIVATION
-            await activate_ui_view(page, history.view_control, 5000)
+            async with page.expect_response(lambda response: response.url.endswith("/api/history")) as observed:
+                await activate_ui_view(page, history.view_control, 5000)
+            assert (await observed.value).status == 502
             assert await page.locator("#history-panel").is_visible()
         finally:
             await browser.close()
