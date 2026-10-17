@@ -2586,6 +2586,9 @@ async def execute_scan(
                                     view_control=view_control,
                                     source_document_url=route_document_sources.get(route_key),
                                     source_route_url=discovered_from,
+                                    navigation_hierarchy=tuple(
+                                        route_metadata.get(route_key, {}).get("navigation_hierarchy", ())
+                                    ),
                                     on_popup=select_semantic_popup,
                                 )
                                 if semantic_popup is not None:
