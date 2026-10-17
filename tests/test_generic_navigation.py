@@ -69,8 +69,11 @@ async def test_generic_disclosure_dropdown_and_nested_tabs_are_discovered():
         browser = await playwright.chromium.launch(headless=True)
         try:
             page = await browser.new_page()
-            await page.goto("about:blank")
-            await page.set_content(PORTAL_HTML)
+            async def serve_portal(route):
+                await route.fulfill(status=200, content_type="text/html", body=PORTAL_HTML)
+
+            await page.route("https://portal.test/**", serve_portal)
+            await page.goto("https://portal.test/")
             initial = await discover_page_routes(page, 0)
             assert any(route.label == "Insights" and route.navigation_mode == UI_VIEW_ACTIVATION
                        for route in initial)
