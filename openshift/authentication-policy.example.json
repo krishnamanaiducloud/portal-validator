@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "policies": [
+    {
+      "id": "approved-portal-sso",
+      "portal_hosts": ["portal.example"],
+      "authentication_hosts": ["identity.example"]
+    }
+  ]
+}
