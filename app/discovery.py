@@ -1211,7 +1211,9 @@ RESTORE_MENU_ANCESTOR_SCRIPT = r"""
 (label) => {
   /* NAVIGATION_DOM_HELPERS */
   const matches = navigationRoots().flatMap(root => Array.from(root.querySelectorAll(
-    viewSelector + ',[aria-expanded][aria-controls],[aria-haspopup="menu"]'
+    viewSelector + ',[aria-expanded][aria-controls],[aria-haspopup="menu"],' +
+      'nav summary,header summary,aside summary,[role="navigation"] summary,' +
+      '[data-bs-toggle="dropdown"],[data-toggle="dropdown"]'
   ))).filter(element => visibleControl(element) && controlLabel(element) === label &&
     (isMenuExpander(element) || describeView(element)) && !unsafeAction(element) && !composedClosest(element, 'form') &&
     !element.hasAttribute('disabled') && element.getAttribute('aria-disabled') !== 'true' &&
@@ -1341,6 +1343,39 @@ async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> No
         await handle.dispose()
 
 
+async def restore_navigation_hierarchy(
+    page, hierarchy: tuple[str, ...], timeout_ms: int,
+) -> bool:
+    """Reopen only uniquely evidenced, harmless menu ancestors for a known link.
+
+    Do not discover or click arbitrary buttons as a substitute for a route.
+    This is navigation UI restoration, not form submission or POST replay.
+    """
+    if not hierarchy or len(hierarchy) > 10:
+        return False
+    deadline = asyncio.get_running_loop().time() + max(1, timeout_ms) / 1000
+    for label in hierarchy:
+        remaining_ms = max(1, int((deadline - asyncio.get_running_loop().time()) * 1000))
+        handle = await evaluate_dom(
+            page, RESTORE_MENU_ANCESTOR_SCRIPT, label, handle=True,
+            timeout_ms=remaining_ms,
+        )
+        try:
+            opener = handle.as_element()
+            if opener is not None:
+                if not await opener.evaluate(
+                    "element => {" + NAVIGATION_DOM_HELPERS + "return isMenuExpander(element);}",
+                ):
+                    # A non-expander route/view is never activated implicitly.
+                    return False
+                await _reveal_navigation_menu(page, opener, remaining_ms)
+            elif await handle.json_value() != "open":
+                return False
+        finally:
+            await handle.dispose()
+    return True
+
+
 def resolve_view_target(page, view_control: dict[str, str] | None = None):
     """Resolve an observed frame view without broadening its original boundary.
 
@@ -1375,6 +1410,7 @@ async def perform_route_navigation(
     view_control: dict[str, str] | None = None,
     source_document_url: str | None = None,
     source_route_url: str | None = None,
+    navigation_hierarchy: tuple[str, ...] = (),
     on_popup: Callable[[Any], Awaitable[None]] | None = None,
 ):
     """Navigate a document or transition an existing SPA document.
@@ -1599,6 +1635,18 @@ async def perform_route_navigation(
         source=source,
         timeout_ms=timeout_ms,
     )
+    if (not activated and source in {"a", "menuitem", "link"}
+            and navigation_hierarchy):
+        # Hidden Angular/Bootstrap menu anchors carry their click handlers in
+        # the actual DOM. Reopen the observed ancestor menu before using a
+        # history-only fallback, which cannot execute those handlers.
+        restored = await restore_navigation_hierarchy(
+            page, navigation_hierarchy, timeout_ms,
+        )
+        if restored:
+            activated = await activate_semantic_route(
+                page, url, label=label, source=source, timeout_ms=timeout_ms,
+            )
     transitioned = activated or await page.evaluate(
         SAME_DOCUMENT_TRANSITION_SCRIPT,
         {"target": url, "mode": mode},
