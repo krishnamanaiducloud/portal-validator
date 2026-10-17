@@ -1014,6 +1014,124 @@ def aggregate_report(
     return summary
 
 
+
+# Authentication failures terminate the entire scan. No route discovered before
+# session establishment (including the requested document) is a valid result.
+AUTHENTICATION_SCAN_FAILURE_REASONS = frozenset({
+    "AUTHENTICATION_BLOCKED", "AUTHENTICATION_REQUIRED", "AUTH_REQUIRED",
+    "AUTH_FAILED", "AUTH_TIMEOUT", "MFA_REQUIRED", "SESSION_EXPIRED",
+})
+
+
+def fail_closed_authentication_report(
+    report: dict[str, Any], reason: str,
+) -> dict[str, Any]:
+    """Return a failed-scan report without any route or application API evidence.
+
+    Keep only sanitized authentication diagnostics and configuration metadata.
+    The independently measured bootstrap traffic cannot be claimed as a health
+    check of a route that was never authenticated or activated.
+    """
+    if reason not in AUTHENTICATION_SCAN_FAILURE_REASONS:
+        raise ValueError("Expected a classified authentication failure")
+    messages = {
+        "AUTHENTICATION_BLOCKED": (
+            "A required authentication transition was denied by the request "
+            "or network policy. Review the sanitized authentication diagnostics."
+        ),
+        "SESSION_EXPIRED": (
+            "The authenticated session expired or was rejected. Refresh the "
+            "authorized browser session before starting another scan."
+        ),
+        "AUTH_TIMEOUT": (
+            "The authentication flow did not complete within the configured timeout."
+        ),
+        "MFA_REQUIRED": (
+            "Interactive authentication is required before the application can be validated."
+        ),
+        "AUTH_REQUIRED": "The application requires an authenticated session.",
+        "AUTHENTICATION_REQUIRED": "The application requires an authenticated session.",
+        "AUTH_FAILED": "The authentication flow failed before application readiness.",
+    }
+    message = messages[reason]
+    existing_summary = report.get("summary") or {}
+    empty_summary = aggregate_report(
+        [], routes_discovered=0, routes_eligible=0, routes_queued=0,
+        termination_reason=reason, api_events=[],
+    )
+    for key in (
+        "total_scan_duration_ms", "preflight_duration_ms", "browser_startup_duration_ms",
+        "navigation_duration_ms", "authentication_duration_ms",
+        "readiness_duration_ms", "finalization_duration_ms",
+    ):
+        if key in existing_summary:
+            empty_summary[key] = existing_summary[key]
+    empty_summary.update({
+        "execution_status": "FAILED",
+        "execution_complete": False,
+        "scan_completeness": "FAILED",
+        "discovery_status": "NOT_STARTED",
+        "validation_status": "NOT_STARTED",
+        "coverage_status": "NONE",
+        "coverage_grade": "NONE",
+        "coverage_complete": False,
+        "auth_issues": 1,
+        "failed_scans": 1,
+        "authentication_status": "FAILED",
+        "scan_failure_reason": reason,
+    })
+    report["summary"] = empty_summary
+    report["scan_status"] = "FAILED"
+    report["authentication_status"] = "FAILED"
+    report["failure"] = {
+        "classification": reason,
+        "stage": "AUTHENTICATING",
+        "message": message,
+    }
+    report["pages"] = 0
+    for field in (
+        "results", "route_inventory", "not_tested_routes", "skipped_routes",
+        "api_inventory", "business_api_inventory", "api_request_occurrences",
+        "resource_inventory", "resource_details", "security_recommendations",
+    ):
+        report[field] = []
+    # The route and API inventory must not expose bootstrap requests as
+    # application health observations; their sanitized authentication policy
+    # decisions remain available separately in authentication_diagnostics.
+    report["network_observation"] = {
+        "total_http_requests_observed": 0,
+        "api_requests_observed": 0,
+        "scope": "NOT_STARTED_AUTHENTICATION_FAILED",
+    }
+    report["resource_summary"] = {
+        "resources_observed": 0,
+        "scope": "NOT_STARTED_AUTHENTICATION_FAILED",
+    }
+    report["navigation_coverage"] = navigation_coverage([], empty_summary, [])
+    report["coverage_dimensions"] = build_coverage_dimensions([], empty_summary)
+    report["coverage_dimensions"]["authentication"] = {
+        "status": "FAILED", "reason": message,
+    }
+    report["coverage"] = {
+        "discovery_status": "NOT_STARTED",
+        "validation_status": "NOT_STARTED",
+        "scan_completeness": "FAILED",
+        "execution_status": "FAILED",
+        "coverage_status": "NONE",
+        "coverage_grade": "NONE",
+        "termination_reason": reason,
+        "routes_discovered": 0, "routes_eligible": 0,
+        "routes_queued": 0, "routes_validated": 0,
+        "routes_skipped": 0, "routes_remaining": 0, "routes_not_tested": 0,
+        "navigation_controls_discovered": 0,
+        "navigation_controls_activated": 0,
+        "navigation_controls_unresolved": 0,
+        "coverage_reasons": empty_summary["coverage_reasons"],
+        "total_application_coverage": "UNKNOWN",
+    }
+    return report
+
+
 def classify_api_status(status: int | None, error: str | None) -> str:
     if error:
         upper = error.upper()
