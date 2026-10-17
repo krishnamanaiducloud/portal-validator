@@ -1215,7 +1215,8 @@ function authenticationHostApprovalSummary(configuration = {}) {
 function renderAuthenticationDiagnostics(report) {
   const diagnostics = (report.authentication_diagnostics || []).map(authenticationDiagnosticEvidence);
   const approvalSummary = authenticationHostApprovalSummary(report.scan_configuration);
-  byId('authentication-diagnostics').hidden = diagnostics.length === 0 && approvalSummary === null;
+  const scanFailure = report.failure || null;
+  byId('authentication-diagnostics').hidden = diagnostics.length === 0 && approvalSummary === null && !scanFailure;
   const reasons = {
     AUTHENTICATION_HOSTS_REQUIRED:'No identity-provider hosts were approved. Submit the exact approved hosts or ask an administrator to configure a separate approval policy; a mounted profile does not approve them.',
     AUTHENTICATION_HOST_NOT_APPROVED:'The authentication destination was not explicitly approved.',
@@ -1224,8 +1225,8 @@ function renderAuthenticationDiagnostics(report) {
     AUTHENTICATION_PROTOCOL_MISMATCH:'The request did not match the required authentication protocol context.',
     AUTHENTICATION_POLICY_BLOCKED:'A separate security policy blocked the authentication request.',
   };
-  byId('authentication-diagnostic-count').textContent = `${diagnostics.length} authentication policy observations. ${approvalSummary || 'Authentication host approval counts were not recorded.'} Showing ${Math.min(50, diagnostics.length)} records; all records remain in the JSON export. Authentication approvals do not expand crawler or general API scope.`;
-  byId('authentication-diagnostic-list').innerHTML = diagnostics.slice(0, 50).map((item, index) =>
+  byId('authentication-diagnostic-count').textContent = `${scanFailure ? 'SCAN FAILED: ' + scanFailure.classification + '. ' : ''}${diagnostics.length} authentication policy observations. ${approvalSummary || 'Authentication host approval counts were not recorded.'} Showing ${Math.min(50, diagnostics.length)} records; all records remain in the JSON export. Authentication approvals do not expand crawler or general API scope.`;
+  byId('authentication-diagnostic-list').innerHTML = (scanFailure ? `<li><strong>${escapeHtml(scanFailure.classification)}</strong><p>${escapeHtml(scanFailure.message)}</p><p>Stage: ${escapeHtml(scanFailure.stage)}. Route discovery and health validation were not performed.</p></li>` : '') + diagnostics.slice(0, 50).map((item, index) =>
     `<li><strong>${escapeHtml(item.reason || 'AUTHENTICATION_POLICY_BLOCKED')}</strong><p>${escapeHtml(reasons[item.reason] || 'Review the original policy decision and authorized session configuration.')}</p><code>${escapeHtml(item.protocol || 'Not recorded')} - ${escapeHtml(item.destination_host || 'Not recorded')}</code><p>Policy: ${escapeHtml(item.policy_reason || 'Not recorded')}. Protected coverage affected: ${item.affects_authentication === true ? 'Yes' : 'Not established'}.</p><button type="button" class="secondary" data-authentication-diagnostic="${index}">Inspect authentication decision</button></li>`
   ).join('');
   byId('authentication-diagnostic-list').querySelectorAll('[data-authentication-diagnostic]').forEach(button => {
@@ -1241,12 +1242,13 @@ function renderReport(report) {
   const scanDuration = report.summary.total_scan_duration_ms ?? report.scan_timing?.total_scan_ms ?? report.summary.duration_ms;
   const duration = scanDuration > 1000 ? `${(scanDuration / 1000).toFixed(1)}s` : `${scanDuration}ms`;
   const notTested = report.summary.routes_not_tested ?? report.summary.not_tested ?? 0;
-  const authIssues = Array.isArray(report.results) ? report.results.filter((item) => authOutcomes.has(item.classification)).length : report.summary.auth_issues || 0;
+  const authIssues = report.summary.auth_issues ?? ((report.results || []).filter((item) => authOutcomes.has(item.classification)).length);
   const accessIssues = report.summary.access_issues ?? (report.results || []).filter((item) => accessOutcomes.has(item.classification)).length;
   const summaryMetrics = [
     ['Discovered routes', report.summary.routes_discovered, '', 'discovered'], ['Validated routes', report.summary.routes_validated, '', 'validated'], ['Healthy', report.summary.healthy_routes, 'good', 'healthy'], ['Passed with warnings', report.summary.routes_with_warnings, report.summary.routes_with_warnings ? 'warn' : '', 'warnings'], ['Failed', report.summary.failed_pages, report.summary.failed_pages ? 'bad' : 'good', 'failed'], ['Auth issues', authIssues, authIssues ? 'auth' : '', 'auth'], ['Access / challenges', accessIssues, accessIssues ? 'warn' : '', 'access'], ['Not tested', notTested, notTested ? 'warn' : 'good', 'not-tested'], ['Unique APIs observed', report.summary.unique_apis || 0, '', 'apis'], ['API failures', report.summary.api_failures, report.summary.api_failures ? 'bad' : 'good', 'api-failures'], ['Resources observed', report.summary.unique_resources || 0, '', 'resources'], ['Resource failures', report.summary.resource_failures, report.summary.resource_failures ? 'warn' : 'good', 'resource-failures'], ['Console issues', report.summary.console_failures || 0, report.summary.console_failures ? 'warn' : 'good', 'console'], ['Slow routes', report.summary.slow_pages, report.summary.slow_pages ? 'warn' : 'good', 'slow'], ['Read-only blocks', report.summary.read_only_blocks, report.summary.read_only_blocks ? 'warn' : 'good', 'read-only'], ['Security recommendations', report.summary.security_recommendations || 0, report.summary.security_recommendations ? 'warn' : 'good', 'security'], ['Scan duration', duration, '', 'validated'],
   ];
   summaryMetrics.splice(8, 0, ['Business APIs', report.summary.business_apis ?? (report.business_api_inventory || []).length, '', 'business-apis']);
+  if (report.failure) summaryMetrics.unshift(['Scan status', 'FAILED', 'bad', 'all']);
   byId('summary').innerHTML = summaryMetrics.map(([label, value, kind, action]) => `<button type="button" class="metric ${kind}" data-summary-action="${action}" aria-label="Show ${escapeHtml(label)} evidence"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></button>`).join('');
   byId('summary').querySelectorAll('[data-summary-action]').forEach((button) => button.addEventListener('click', () => activateSummary(button.dataset.summaryAction, button.querySelector('strong').textContent, button)));
   byId('summary').querySelector('[data-summary-action="access"]').title = 'Access restrictions and challenges limit application coverage. They do not establish that credentials are required or that the application failed.';
@@ -1257,7 +1259,9 @@ function renderReport(report) {
   const limitations = [...new Set([...(coverage.coverage_reasons || []),...(report.summary.coverage_reasons || [])].map((reason) => typeof reason === 'string' ? reason : reason.message || reason.code).filter(Boolean))];
   const navigationCounts = coverage.navigation_controls_discovered != null ? ` Navigation controls: ${coverage.navigation_controls_discovered} discovered, ${coverage.navigation_controls_activated || 0} activated, ${coverage.navigation_controls_unresolved || 0} unresolved.` : '';
   const scopeExplanation = ' Coverage describes safely reachable routes observed within the configured limits; total application coverage remains unknown.';
-  byId('coverage').innerHTML = `<strong>Coverage: ${escapeHtml(coverageStatus)}</strong><span>Execution: ${escapeHtml(executionStatus)}. ${escapeHtml(terminationMessage(coverage))}${escapeHtml(accessExplanation)}${escapeHtml(navigationCounts)}${escapeHtml(scopeExplanation)}</span>${limitations.length ? `<span class="coverage-reasons">Limitations: ${escapeHtml(limitations.join('; '))}</span>` : ''}`;
+  byId('coverage').innerHTML = report.failure
+    ? `<strong>SCAN FAILED: ${escapeHtml(report.failure.classification)}</strong><span>${escapeHtml(report.failure.message)} No routes or application API health checks were performed. Review authentication diagnostics.</span>`
+    : `<strong>Coverage: ${escapeHtml(coverageStatus)}</strong><span>Execution: ${escapeHtml(executionStatus)}. ${escapeHtml(terminationMessage(coverage))}${escapeHtml(accessExplanation)}${escapeHtml(navigationCounts)}${escapeHtml(scopeExplanation)}</span>${limitations.length ? `<span class="coverage-reasons">Limitations: ${escapeHtml(limitations.join('; '))}</span>` : ''}`;
   byId('scan-diagnostics-content').innerHTML = `${detailSection('Effective scan configuration', report.scan_configuration || report.scan_config || {})}${detailSection('Scan timing breakdown', report.scan_timing || report.scan_timings || {})}`;
   byId('raw-report').textContent = JSON.stringify(report, null, 2);
   activeDrilldown = 'all';
@@ -1319,7 +1323,7 @@ async function pollScan(scanId) {
     }
     updateProgress(status);
     if (terminalStates.has(status.state)) {
-      if (status.state === 'FAILED') throw new Error(status.error || 'Scan failed before producing a report.');
+      if (status.state === 'FAILED' && !status.report_ready) throw new Error(status.error || 'Scan failed before producing a report.');
       return requestJson(`/api/scans/${encodeURIComponent(scanId)}/report`, {}, 'Scan report request');
     }
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
@@ -1488,6 +1492,14 @@ form.addEventListener('submit', async (event) => {
     payload.network_quiet_ms = Number(byId('network-quiet').value);
   } catch (error) { notify(error.message, true); return; }
   clearTransientCredentials();
+  // Never leave results from an earlier scan on screen while a new scan
+  // authenticates or fails. Each new report belongs to one scan ID only.
+  lastReport = null;
+  results.hidden = true;
+  byId('raw-report').textContent = '';
+  byId('summary').replaceChildren();
+  byId('coverage').replaceChildren();
+  closeRouteInspector(false);
   runButton.disabled = true;
   runButton.querySelector('span').textContent = 'Validating…';
   startProgress();
@@ -1495,9 +1507,12 @@ form.addEventListener('submit', async (event) => {
     const created = await requestJson('/api/scans', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)}, 'Scan request');
     activeScanId = created.scan_id;
     const report = await pollScan(activeScanId);
+    // A delayed response must never replace a newer scan's report.
+    if (report.scan_id !== created.scan_id) throw new Error('Scan report identity mismatch.');
     renderReport(report);
     const coverage = report.coverage || {};
-    notify(`Execution finished · Coverage: ${coverage.coverage_status || coverage.scan_completeness || 'UNKNOWN'} · ${report.summary.routes_validated ?? report.pages} routes validated`);
+    if (report.failure) notify(`Scan failed: ${report.failure.classification}. ${report.failure.message}`, true);
+    else notify(`Execution finished · Coverage: ${coverage.coverage_status || coverage.scan_completeness || 'UNKNOWN'} · ${report.summary.routes_validated ?? report.pages} routes validated`);
   } catch (error) { notify(error.message || 'Validation failed', true); }
   finally { stopProgress(); runButton.disabled = buildIdentityMismatch; runButton.querySelector('span').textContent = 'Run validation'; }
   } finally { scanSubmissionPending = false; runButton.disabled = buildIdentityMismatch || Boolean(activeScanId); }
