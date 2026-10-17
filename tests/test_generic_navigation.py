@@ -8,6 +8,8 @@ from playwright.async_api import async_playwright
 from app.discovery import (
     UI_VIEW_ACTIVATION,
     activate_ui_view,
+    perform_route_navigation,
+    HASH_ROUTE_TRANSITION,
     discover_page_routes,
     expand_safe_navigation,
 )
@@ -27,7 +29,7 @@ PORTAL_HTML = """<!doctype html>
       onclick="document.getElementById('dynamic-menu').hidden=false;this.setAttribute('aria-expanded','true')"
       aria-expanded="false">Operations</button>
     <div id="dynamic-menu" class="dropdown-menu" hidden>
-      <a href="#/operations/audit">Audit</a>
+      <a href="#/operations/audit" onclick="window.auditNavigationCount=(window.auditNavigationCount||0)+1">Audit</a>
       <a href="#/operations/queue">Queue</a>
     </div>
   </div>
@@ -101,5 +103,36 @@ async def test_generic_disclosure_dropdown_and_nested_tabs_are_discovered():
                 await activate_ui_view(page, history.view_control, 5000)
             assert (await observed.value).status == 502
             assert await page.locator("#history-panel").is_visible()
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_hidden_spa_menu_link_activates_real_navigation_handler():
+    """A history-only fallback is not equivalent to clicking an actual menu link."""
+    async with async_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).is_file():
+            pytest.skip("matching Playwright Chromium is not installed")
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page()
+
+            async def serve_portal(route):
+                await route.fulfill(status=200, content_type="text/html", body=PORTAL_HTML)
+
+            await page.route("https://portal.test/**", serve_portal)
+            await page.goto("https://portal.test/")
+            assert await page.locator("#dynamic-menu").is_hidden()
+
+            response, transitioned, method = await perform_route_navigation(
+                page, "https://portal.test/#/operations/audit",
+                HASH_ROUTE_TRANSITION, 5000,
+                label="Audit", source="a", navigation_hierarchy=("Operations",),
+            )
+            assert response is None
+            assert transitioned is True
+            assert method == "SEMANTIC_CONTROL"
+            assert await page.evaluate("window.auditNavigationCount") == 1
+            assert page.url.endswith("#/operations/audit")
         finally:
             await browser.close()
