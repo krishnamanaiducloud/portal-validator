@@ -1,0 +1,29 @@
+name: Validate Portal Validator
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m playwright install --with-deps chromium
+      - name: Static compilation and browser script syntax
+        run: |
+          python -m compileall -q app tests
+          node --check app/static/app.js
+          bash -n scripts/apply_auth_policy.sh
+          python -m json.tool openshift/authentication-policy.example.json > /dev/null
+      - name: Python unit and Playwright integration suites
+        run: python -m pytest -q --tb=short tests
