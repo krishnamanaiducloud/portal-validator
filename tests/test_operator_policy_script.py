@@ -18,7 +18,7 @@ def run_helper(tmp_path, arguments, *, enabled=True):
     oc = bin_dir / "oc"
     if enabled:
         oc.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$OC_CALL_LOG\"\n"
-                      "case \" $* \" in *' -o yaml '*) printf 'kind: ConfigMap\\n' ;; esac\n",
+                      "case \" $* \" in *' -o yaml '*) printf 'kind: ConfigMap\\n' ;; *' apply -f - '*) cat >/dev/null ;; esac\n",
                       encoding="utf-8")
         oc.chmod(0o755)
     env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "OC_CALL_LOG": str(log)}
