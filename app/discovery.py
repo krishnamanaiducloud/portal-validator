@@ -919,6 +919,12 @@ async def _reveal_navigation_menu(page, element, timeout_ms: int) -> tuple[bool,
             arg=element, timeout=remaining_ms(),
         )
     before = await element.evaluate(MENU_REVEALED_SCRIPT, True)
+    if before["expanded"] and not before["collapsed"]:
+        # An already opened native disclosure or asynchronously mounted
+        # menu must not be clicked again: that would close its real routes.
+        if not before["panelVisible"]:
+            await page.wait_for_function(MENU_READY_SCRIPT, arg=element, timeout=remaining_ms())
+        return False, False
     if before["panelVisible"] and not before["collapsed"]:
         return False, False
     await element.hover(timeout=remaining_ms())
