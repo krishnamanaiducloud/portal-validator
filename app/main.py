@@ -22,11 +22,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
-from playwright.async_api import BrowserContext, Error as PlaywrightError, Route, async_playwright
+from playwright.async_api import BrowserContext, Error as PlaywrightError, Request as BrowserRequest, Route, async_playwright
 
 from app.authentication import (
     AuthenticationConfigurationError,
     build_authentication_manager,
+)
+from app.auth_policy import (
+    AuthenticationPolicyConfigurationError,
+    approved_authentication_endpoints_for_target,
+    approved_authentication_hosts_for_target,
+    load_authentication_policies,
 )
 from app.logging_config import LOGGER, log_event
 from app.browser_lifecycle import BrowserLifecycle
@@ -56,6 +62,7 @@ from app.health import (
     api_health_findings,
     assess_page_health,
     application_shell_ready,
+    capture_render_health,
     configured_readiness_conditions,
     document_navigation_timing,
     readiness_event_init_script,
@@ -64,6 +71,7 @@ from app.health import (
     wait_for_render_settle,
 )
 from app.navigation import (
+    AuthenticationObservationCancelled,
     AuthenticationNavigationPolicy,
     NavigationTracker,
     classify_authentication,
@@ -148,6 +156,9 @@ REPORT_SCHEMA_VERSION = "2.5"
 async def lifespan(application: FastAPI):
     application.state.trust_status = inspect_trust_status()
     application.state.read_only_policy = load_read_only_policy()
+    # Operator approvals are a separate, read-only configuration contract.
+    # Invalid configured policy fails startup; browser profiles never grant it.
+    load_authentication_policies()
     try:
         yield
     finally:
@@ -552,6 +563,40 @@ def browser_context_options(state_path: Path | None, approved_storage_hosts: set
     return options
 
 
+def authentication_approvals_for_scan(req: ScanRequest, root_host: str):
+    """Resolve explicit approvals without consulting or mutating session state."""
+    try:
+        policies = load_authentication_policies()
+        operator_hosts, matched_policies = approved_authentication_hosts_for_target(root_host, policies)
+        operator_endpoints = approved_authentication_endpoints_for_target(root_host, policies)
+    except AuthenticationPolicyConfigurationError as exc:
+        raise HTTPException(503, "Administrator authentication policy is invalid") from exc
+    hosts = list(dict.fromkeys([*req.authentication_hosts, *sorted(operator_hosts)]))
+    if len(hosts) > 25:
+        raise HTTPException(400, "Combined authentication-host approvals exceed the maximum of 25")
+    return hosts, operator_endpoints, {
+        "submitted_authentication_host_count": len(req.authentication_hosts),
+        "operator_authentication_host_count": len(operator_hosts),
+        "operator_authentication_policy_count": len(matched_policies),
+        "operator_authentication_endpoint_count": len(operator_endpoints),
+    }
+
+
+def authentication_request_source(request: BrowserRequest) -> str:
+    """Use the previous HTTP hop, or initiating frame, never the destination."""
+    try:
+        previous = request.redirected_from
+        if previous is not None:
+            return previous.url
+        frame = request.frame
+        while frame.parent_frame is not None and not frame.url.startswith(("http://", "https://")):
+            frame = frame.parent_frame
+        return frame.url
+    except PlaywrightError:
+        # Unavailable source evidence must fail closed for authentication POSTs.
+        return ""
+
+
 def auth_headers(authentication: Authentication) -> dict[str, str]:
     try:
         manager = build_authentication_manager(
@@ -803,6 +848,9 @@ async def execute_scan(
     progress_callback: ProgressCallback | None = None,
     cancel_event: asyncio.Event | None = None,
 ):
+    # Each scan receives its own effective configuration. Do not write policy
+    # approvals into a caller's request, mounted profile, or another session.
+    req = req.model_copy(deep=True)
     scan_id = scan_id or str(uuid.uuid4())
     scan_started = time.perf_counter()
     deadline = scan_started + req.total_timeout_ms / 1000
@@ -854,6 +902,14 @@ async def execute_scan(
         log_event(logging.ERROR, "SCAN_FAILED", scan_id=scan_id, classification=exc.classification, error=exc.public_message)
         raise HTTPException(400, exc.public_message) from exc
     log_event(logging.INFO, "URL_VALIDATED", scan_id=scan_id, requested_url=requested_target, hostname=root_host)
+    effective_authentication_hosts, operator_authentication_endpoints, authentication_approval_counts = (
+        authentication_approvals_for_scan(req, root_host)
+    )
+    req = req.model_copy(update={"authentication_hosts": effective_authentication_hosts})
+    log_event(
+        logging.INFO, "AUTHENTICATION_APPROVALS_APPLIED", scan_id=scan_id,
+        effective_host_count=len(effective_authentication_hosts), **authentication_approval_counts,
+    )
     try:
         await resolve_preflight(root_host)
     except DestinationError as exc:
@@ -1212,6 +1268,11 @@ async def execute_scan(
         except ScanAdmissionCancelled:
             cancellation_requested = True
             log_event(logging.INFO, "SCAN_CANCELLED_WHILE_QUEUED", scan_id=scan_id)
+        except AuthenticationObservationCancelled:
+            cancellation_requested = True
+            if active_route_identity is not None:
+                seen.discard(active_route_identity)
+            log_event(logging.INFO, "SCAN_CANCELLED_DURING_BOOTSTRAP", scan_id=scan_id)
         except TimeoutError:
             if not budget.expired() and time.perf_counter() < deadline:
                 raise
@@ -1289,6 +1350,7 @@ async def execute_scan(
                 navigation_hosts: set[str] = set()
                 authentication_navigation = AuthenticationNavigationPolicy(
                     approved_hosts=frozenset(req.authentication_hosts), active=approved_session,
+                    approved_endpoints=operator_authentication_endpoints,
                 )
                 latest_document_response = None
                 validator_blocks: dict[tuple[str, str, str, bool], deque[str]] = defaultdict(deque)
@@ -1596,13 +1658,7 @@ async def execute_scan(
                         auth_body = request.post_data
                     except PlaywrightError:
                         auth_body = None
-                    try:
-                        source_frame = request.frame
-                        while source_frame.parent_frame is not None and not source_frame.url.startswith(("http://", "https://")):
-                            source_frame = source_frame.parent_frame
-                        source_url = source_frame.url
-                    except PlaywrightError:
-                        source_url = ""
+                    source_url = authentication_request_source(request)
                     # Diagnose concrete protocol attempts even when the missing
                     # identity-host approval prevented an active flow. Diagnosis
                     # cannot authorize a request or retain credential payloads.
@@ -2103,13 +2159,7 @@ async def execute_scan(
                     resource_scoped = host in approved_resource_hosts
                     approved_operation = read_only_policy.match(request.method, request.url)
                     main_navigation = is_main_navigation(request)
-                    try:
-                        source_frame = request.frame
-                        while source_frame.parent_frame is not None and not source_frame.url.startswith(("http://", "https://")):
-                            source_frame = source_frame.parent_frame
-                        source_url = source_frame.url
-                    except PlaywrightError:
-                        source_url = ""
+                    source_url = authentication_request_source(request)
                     try:
                         auth_body = request.post_data
                     except PlaywrightError:
@@ -2187,13 +2237,17 @@ async def execute_scan(
                         if main_navigation:
                             try:
                                 post_data = request.post_data
-                            except Exception:
+                            except PlaywrightError:
                                 post_data = None
                             auth_navigation_allowed = authentication_navigation.allows_main_frame_method(
                                 request.method,
                                 request.url,
                                 post_data,
                                 portal_scoped=portal_scoped,
+                                source_url=source_url,
+                                source_portal_scoped=url_in_scan_scope(
+                                    source_url, root_host, req.allow_subdomains, approved_portal_hosts,
+                                ),
                             )
                         approved_rule = approved_operation
                         if approved_rule is not None and approved_rule.graphql_queries_only:
@@ -2552,6 +2606,21 @@ async def execute_scan(
                                 navigation_policy_ms = navigation_policy_time_ms(started, time.perf_counter())
                                 navigation_duration_ms += navigation_ms
                                 browser_lifecycle.advance("AUTHENTICATING")
+                                require_bootstrap_readiness = bool(
+                                    not results and (
+                                        req.authentication.mode != "none" or req.readiness_selector
+                                        or req.readiness_event or authentication_navigation.active
+                                    )
+                                )
+
+                                async def bootstrap_application_ready(target):
+                                    snapshot = await capture_render_health(target)
+                                    snapshot.update(await configured_readiness_conditions(
+                                        target, readiness_selector=req.readiness_selector,
+                                        readiness_event=req.readiness_event,
+                                    ))
+                                    return application_shell_ready(snapshot)
+
                                 auth_settle = await settle_authentication_navigation(
                                     page,
                                     in_portal_scope=lambda candidate: url_in_scan_scope(
@@ -2569,6 +2638,11 @@ async def execute_scan(
                                         latest_document_response.status if latest_document_response is not None
                                         else response.status if response is not None else None
                                     ),
+                                    application_ready=(
+                                        bootstrap_application_ready if require_bootstrap_readiness else None
+                                    ),
+                                    application_readiness_timeout_ms=req.readiness_timeout_ms,
+                                    cancel_event=cancel_event,
                                 )
                                 authentication_duration_ms += int(auth_settle["elapsed_ms"])
                                 # This policy records authentication evidence for
@@ -2679,7 +2753,7 @@ async def execute_scan(
                                     password_form=password_form,
                                     mfa_form=mfa_form,
                                 )
-                                if auth_settle["timed_out"]:
+                                if auth_settle["timed_out"] and auth_settle["stage"] != "APPLICATION_BOOTSTRAP_PENDING":
                                     authentication_classification = "AUTH_TIMEOUT"
                                 if active_route_activation_id in authentication_denials:
                                     authentication_classification = "AUTHENTICATION_BLOCKED"
@@ -3928,6 +4002,7 @@ async def execute_scan(
     scan_configuration["readiness_selector_configured"] = bool(req.readiness_selector)
     scan_configuration["readiness_event_configured"] = bool(req.readiness_event)
     scan_configuration["authentication_host_count"] = len(req.authentication_hosts)
+    scan_configuration.update(authentication_approval_counts)
     scan_configuration["route_concurrency"] = 1
     scan_configuration["maximum_concurrent_scans"] = MAX_CONCURRENT_SCANS
     scan_configuration["approved_read_post_operations"] = [
@@ -4136,9 +4211,10 @@ async def create_scan(req: ScanRequest):
     if req.allow_mutations:
         raise HTTPException(400, "Portal health validation is read-only; mutations cannot be enabled")
     try:
-        validate_http_url(req.target.strip())
+        root_host, _ = validate_http_url(req.target.strip())
     except DestinationError as exc:
         raise HTTPException(400, exc.public_message) from exc
+    authentication_approvals_for_scan(req, root_host)
     # Reject unusable submitted credentials/profiles before queueing a scan.
     # A profile never implicitly approves any identity-provider destination.
     auth_headers(req.authentication)

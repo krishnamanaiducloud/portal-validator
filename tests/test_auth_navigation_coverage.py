@@ -20,7 +20,10 @@ def test_business_fields_cannot_authorize_authentication_post(body):
 
 
 def test_authentication_post_requires_explicit_destination_and_protocol():
-    policy = AuthenticationNavigationPolicy(approved_hosts=frozenset({"identity.example"}))
+    policy = AuthenticationNavigationPolicy(
+        approved_hosts=frozenset({"identity.example"}),
+        approved_endpoints=frozenset({"https://portal.example/consume"}),
+    )
     policy.observe("https://identity.example/oauth/authorize?client_id=portal")
     assert not policy.allows_main_frame_method("POST", "https://attacker.example/sso", "SAMLRequest=opaque")
     assert not policy.allows_main_frame_method("POST", "https://identity.example/account/delete", "state=x")
@@ -54,6 +57,12 @@ def test_explicit_identity_host_can_begin_nonstandard_authentication_endpoint_fl
     policy = AuthenticationNavigationPolicy(approved_hosts=frozenset({"identity.example"}))
     policy.observe("https://identity.example/consume", "GET")
     assert policy.active
+    assert not policy.allows_main_frame_method("POST", "https://identity.example/consume", "SAMLResponse=opaque")
+    policy = AuthenticationNavigationPolicy(
+        approved_hosts=frozenset({"identity.example"}),
+        approved_endpoints=frozenset({"https://identity.example/consume"}),
+    )
+    policy.observe("https://identity.example/consume", "GET")
     assert policy.allows_main_frame_method("POST", "https://identity.example/consume", "SAMLResponse=opaque")
 
 

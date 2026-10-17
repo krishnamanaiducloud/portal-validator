@@ -93,8 +93,20 @@ for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
     assert os.environ[name] == expected_bundle
 identity = build_diagnostics()
 print("BUILD_IDENTITY=" + json.dumps(identity), flush=True)
-assert identity["version"] == "1.12.11"
-assert identity["source_integrity"]["status"] == "VERIFIED"
+assert identity["version"] == "1.12.12"
+# An explicitly selected, uncommitted release snapshot must be compared with
+# the operator's expected hashes rather than falsely claiming a Git revision.
+snapshot_path = os.getenv("RELEASE_SMOKE_SOURCE_HASHES")
+if snapshot_path:
+    from app.build_info import SOURCE_ROOT, source_hashes
+    expected = json.loads(Path(snapshot_path).read_text())
+    manifest = json.loads((SOURCE_ROOT / "build-info.json").read_text())
+    assert expected and source_hashes(SOURCE_ROOT) == manifest["source_sha256"] == expected
+    assert identity["git_commit"] is None
+    assert identity["source_integrity"]["status"] == "UNVERIFIED"
+    print("REVIEWED_SOURCE_SNAPSHOT_MATCH=true", flush=True)
+else:
+    assert identity["source_integrity"]["status"] == "VERIFIED"
 print("PLAYWRIGHT_VERSION=" + m.version("playwright"), flush=True)
 assert m.version("playwright") == "1.63.0"
 packages = {}

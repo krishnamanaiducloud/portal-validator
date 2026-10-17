@@ -24,9 +24,20 @@ async def main():
             lambda message: console_errors.append(message.text)
             if message.type == "error" else None,
         )
+        profile_host_requests = []
+        page.on("request", lambda request: profile_host_requests.append(request.url)
+                if "/api/auth-profiles/" in request.url else None)
+
+        async def profile_list_fixture(route):
+            await route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                "profiles": ["fixture-one", "fixture-two"], "refresh_enabled_profiles": [],
+                "message": "Synthetic mounted session profiles.",
+            }))
+
+        await page.route("**/api/auth-profiles", profile_list_fixture)
         await page.goto(base_url, wait_until="networkidle")
         build_metadata = await page.evaluate("async () => (await fetch('/api/diagnostics/build', {cache:'no-store'})).json()")
-        assert build_metadata["version"] == "1.12.11"
+        assert build_metadata["version"] == "1.12.12"
         assert await page.evaluate("loadedFrontendSha256") == build_metadata["frontend_sha256"]
         assert await page.evaluate("loadedFrontendIntegrity.startsWith('sha256-')")
         assert "Frontend matched" in await page.locator("#build-summary").text_content()
@@ -116,10 +127,22 @@ async def main():
         await page.locator("#scan-timing-settings > summary").click()
         await page.locator("#auth-mode").select_option("storage_state")
         assert await page.get_by_text("Mounted SSO profile", exact=True).is_visible()
-        assert "No authentication hosts approved" in await page.locator("#authentication-configuration-note").inner_text()
+        assert "No authentication hosts entered manually" in await page.locator("#authentication-configuration-note").inner_text()
+        assert "operator-approved policy" in await page.locator("#authentication-configuration-note").inner_text()
         assert "Choose a valid mounted SSO profile" in await page.evaluate("""() => {
           try { authenticationPayload(); return ''; } catch (error) { return error.message; }
         }""")
+        entered_hosts = "LOGIN.EXAMPLE.NET., identity.example.org"
+        await page.locator("#authentication-hosts").fill(entered_hosts)
+        for profile in ("fixture-one", "fixture-two"):
+            await page.locator("#auth-profile").select_option(profile)
+            assert await page.locator("#authentication-hosts").input_value() == entered_hosts
+            assert await page.evaluate("authenticationPayload()") == {"mode": "storage_state", "storage_profile": profile}
+            assert await page.evaluate("phaseConfiguration().authentication_hosts") == ["login.example.net", "identity.example.org"]
+        await page.wait_for_load_state("networkidle")
+        assert profile_host_requests == []
+        await page.locator("#authentication-hosts").fill("")
+        await page.locator("#auth-profile").select_option("")
         await page.locator("#read-post-settings > summary").click()
         await page.locator("#add-read-post").click()
         await page.locator("#add-read-post").click()
@@ -241,7 +264,8 @@ async def main():
         }""")
         auth_diagnostic_text = await page.locator("#authentication-diagnostics").inner_text()
         assert "AUTHENTICATION_HOSTS_REQUIRED" in auth_diagnostic_text
-        assert "0 explicitly configured hosts" in auth_diagnostic_text
+        assert "0 approved authentication hosts" in auth_diagnostic_text
+        assert "Approval source counts were not recorded" in auth_diagnostic_text
         assert "profile does not approve" in auth_diagnostic_text
         assert "do-not-export-auth-secret" not in auth_diagnostic_text
         await page.locator("[data-authentication-diagnostic]").first.click()
@@ -250,6 +274,23 @@ async def main():
         assert "do-not-export-auth-secret" not in auth_evidence
         assert "source_url" not in auth_evidence and '"body"' not in auth_evidence
         await page.locator("#evidence-close").click()
+        await page.evaluate("""() => renderReport({...window.authDiagnosticOriginalReport,
+          scan_configuration:{authentication_host_count:3, submitted_authentication_host_count:2,
+            operator_authentication_host_count:2}, authentication_diagnostics:[]})""")
+        assert await page.locator("#authentication-diagnostics").is_visible()
+        approval_counts = await page.locator("#authentication-diagnostic-count").inner_text()
+        assert "3 approved authentication hosts" in approval_counts
+        assert "Submitted manually: 2; operator configuration: 2" in approval_counts
+        assert "Source counts may overlap" in approval_counts
+        assert "login.example.net" not in approval_counts and "fixture-one" not in approval_counts
+        await page.evaluate("""() => renderReport({...window.authDiagnosticOriginalReport,
+          scan_configuration:{authentication_host_count:0, submitted_authentication_host_count:0,
+            operator_authentication_host_count:0}, authentication_diagnostics:[]})""")
+        zero_approval_counts = await page.locator("#authentication-diagnostic-count").inner_text()
+        assert "0 approved authentication hosts" in zero_approval_counts
+        assert "Submitted manually: 0; operator configuration: 0" in zero_approval_counts
+        assert await page.evaluate("authenticationHostApprovalSummary({authentication_host_count:'private-value'})") is None
+        assert await page.evaluate("authenticationHostApprovalSummary(null)") is None
         await page.evaluate("renderReport(window.authDiagnosticOriginalReport); delete window.authDiagnosticOriginalReport")
         assert await page.locator("#authentication-diagnostics").is_hidden()
         await page.evaluate("""() => {
@@ -932,7 +973,7 @@ async def main():
         await page.locator("#scan-timing-settings").evaluate("element => { element.open = true; }")
         await concurrency.fill("1")
         await page.locator("#authentication-hosts").fill("LOGIN.EXAMPLE.NET., identity.example.org login.example.net")
-        assert "2 explicitly configured authentication hosts" in await page.locator("#authentication-configuration-note").inner_text()
+        assert "2 authentication hosts submitted manually" in await page.locator("#authentication-configuration-note").inner_text()
         await page.locator("#readiness-event").fill("portal:ready")
         await page.locator("#run-button").click()
         await page.wait_for_function("() => !document.getElementById('run-button').disabled && document.getElementById('progress').hidden")
@@ -1118,7 +1159,8 @@ async def main():
             if "Cross-Origin-Opener-Policy header has been ignored" not in error
         ]
         assert not actionable_errors, actionable_errors
-        print("UI_SMOKE_PASSED: phase controls, traffic roles/lifecycle, definitive HTTP/network/resource failure table with timestamps and blocked/incomplete exclusion, POST form contract/counters, actual scan duration, blocked methods, columns/persistence, density, warnings, pointer/keyboard panel resizing and session persistence, expandable/fullscreen sanitized diagnostic copy/export, long diagnostics, independent scrolling/sticky headers/keyboard focus, resource filters, synchronized scrolling, 44 routes, 52 paginated routes, 1000 paginated API records, mobile layouts, strict CSP")
+        assert profile_host_requests == []
+        print("UI_SMOKE_PASSED: manual approvals preserved across actual profile switches without host-metadata requests, effective/manual/operator approval counts and older-report compatibility, phase controls, traffic roles/lifecycle, definitive HTTP/network/resource failure table with timestamps and blocked/incomplete exclusion, POST form contract/counters, actual scan duration, blocked methods, columns/persistence, density, warnings, pointer/keyboard panel resizing and session persistence, expandable/fullscreen sanitized diagnostic copy/export, long diagnostics, independent scrolling/sticky headers/keyboard focus, resource filters, synchronized scrolling, 44 routes, 52 paginated routes, 1000 paginated API records, mobile layouts, strict CSP")
         await browser.close()
 
 

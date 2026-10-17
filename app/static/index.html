@@ -31,7 +31,7 @@
         <section class="panel"><div class="panel-head"><div class="step">03</div><div><h2>Authentication</h2><p>Use a scoped session; refresh is browser-native.</p></div></div>
           <label class="field"><span>Authentication method</span><select id="auth-mode"><option value="none">No authentication</option><option value="basic">Basic username &amp; password</option><option value="bearer">Bearer / API token</option><option value="headers">Custom request headers</option><option value="cookies">Session cookies</option><option value="storage_state">SSO session profile</option></select></label>
           <div id="auth-fields" class="auth-fields" aria-live="polite"></div>
-          <label class="field"><span>Approved authentication hosts <em>optional</em></span><input id="authentication-hosts" type="text" placeholder="login.example.net, identity.example.org" aria-describedby="authentication-configuration-note"><small>Exact identity-provider hosts, comma or space separated. These approvals are separate from crawler, API/resource and credential scope; no host is inferred from a session profile.</small></label>
+          <label class="field"><span>Approved authentication hosts <em>optional</em></span><input id="authentication-hosts" type="text" placeholder="login.example.net, identity.example.org" aria-describedby="authentication-configuration-note"><small>Manually approved exact identity-provider hosts, comma or space separated. An administrator may also configure a separate approved-host policy file. Approvals are independent of session state, crawler, API/resource and credential scope; selecting a profile never infers hosts or changes this field.</small></label>
           <p id="authentication-configuration-note" class="policy-help" role="status"></p>
           <div class="privacy"><span>&#128274;</span><p><b>Secrets are scan-scoped.</b> Credentials, cookies, browser storage, and authentication parameters never enter reports. SSO profile updates are stored privately in the pod runtime only.</p></div>
           <div class="read-only-notice"><strong>Read-only guard active</strong><span>GET, HEAD, and OPTIONS are permitted. POST requires a narrow authentication-navigation exception or explicit read-only approval. PUT, PATCH, and DELETE remain blocked.</span></div>
@@ -65,5 +65,5 @@
     </section>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
-  <footer><span>Portal Validator 1.12.11</span><span>Optional authentication &middot; Bounded discovery &middot; Strict read-only execution</span></footer>
+  <footer><span>Portal Validator 1.12.12</span><span>Optional authentication &middot; Bounded discovery &middot; Strict read-only execution</span></footer>
 </body></html>

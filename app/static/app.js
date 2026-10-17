@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = '1.12.11';
+const FRONTEND_VERSION = '1.12.12';
 // The server pins this exact deferred script with SRI and a hash-versioned URL.
 // Capture currentScript now; it is unavailable in subsequent async callbacks.
 const frontendScript = document.currentScript;
@@ -393,10 +393,10 @@ function configuredAuthenticationHosts() {
 function updateAuthenticationConfigurationNote() {
   const count = configuredAuthenticationHosts().length;
   byId('authentication-configuration-note').textContent = count
-    ? `${count} explicitly configured authentication host${count === 1 ? '' : 's'}. Network, TLS, protocol and transaction checks still apply.`
+    ? `${count} authentication host${count === 1 ? '' : 's'} submitted manually. Optional operator-approved policy may add hosts. Network, TLS, protocol and transaction checks still apply.`
     : authMode.value === 'storage_state'
-      ? 'No authentication hosts approved. A restored portal session may work, but cross-origin authentication POSTs remain blocked until their exact identity-provider hosts are configured. A profile does not grant host approval.'
-      : 'No authentication hosts approved. Public websites do not require a profile. Configure exact identity-provider hosts only if an authorized SSO flow requires them.';
+      ? 'No authentication hosts entered manually. Optional operator-approved policy may supply approvals. A restored session may work, but authentication POST exceptions require exact approved hosts. A profile does not grant host approval.'
+      : 'No authentication hosts entered manually. Public websites do not require a profile. Submit exact approved identity-provider hosts or use operator-approved policy only if an authorized SSO flow requires them.';
 }
 
 function phaseConfiguration() {
@@ -469,7 +469,7 @@ function renderAuthFields() {
     bearer: '<label class="field"><span>Bearer token</span><input id="auth-token" type="password" autocomplete="off" placeholder="Token is never stored or returned"></label>',
     headers: '<label class="field"><span>Custom headers</span><textarea id="auth-headers" rows="4" placeholder="X-API-Key: value&#10;X-Portal-Context: validation"></textarea><small>One header per line. Unsafe transport headers are blocked.</small></label>',
     cookies: '<label class="field"><span>Session cookies</span><textarea id="auth-cookies" rows="4" placeholder="session_id=value&#10;portal_context=value"></textarea><small>One name=value pair per line, scoped to approved portal hosts.</small></label>',
-    storage_state: `<label class="field"><span>Mounted SSO profile</span><select id="auth-profile" ${profileNames.length ? '' : 'disabled'}>${profileOptions}</select><small>${escapeHtml(profileHelp)} A companion profile.refresh.json enables silent browser refresh; refreshed state stays private in the pod.</small></label>`,
+    storage_state: `<label class="field"><span>Mounted SSO profile</span><select id="auth-profile" ${profileNames.length ? '' : 'disabled'}>${profileOptions}</select><small>${escapeHtml(profileHelp)} Session state supplies no host approvals. Changing profiles preserves manually entered approvals. A companion profile.refresh.json enables silent browser refresh; refreshed state stays private in the pod.</small></label>`,
   };
   authFields.innerHTML = templates[authMode.value];
   updateAuthenticationConfigurationNote();
@@ -1198,18 +1198,33 @@ function authenticationDiagnosticEvidence(item) {
   };
 }
 
+function authenticationHostApprovalSummary(configuration = {}) {
+  configuration = configuration || {};
+  const count = key => Number.isSafeInteger(configuration[key]) && configuration[key] >= 0 ? configuration[key] : null;
+  const effective = count('authentication_host_count');
+  const submitted = count('submitted_authentication_host_count');
+  const operator = count('operator_authentication_host_count');
+  if (effective === null && submitted === null && operator === null) return null;
+  const total = effective === null ? 'Approved authentication host count: not recorded.'
+    : `${effective} approved authentication host${effective === 1 ? '' : 's'}.`;
+  const sources = submitted === null && operator === null ? 'Approval source counts were not recorded.'
+    : `Submitted manually: ${submitted ?? 'Not recorded'}; operator configuration: ${operator ?? 'Not recorded'}. Source counts may overlap.`;
+  return `${total} ${sources}`;
+}
+
 function renderAuthenticationDiagnostics(report) {
   const diagnostics = (report.authentication_diagnostics || []).map(authenticationDiagnosticEvidence);
-  byId('authentication-diagnostics').hidden = diagnostics.length === 0;
+  const approvalSummary = authenticationHostApprovalSummary(report.scan_configuration);
+  byId('authentication-diagnostics').hidden = diagnostics.length === 0 && approvalSummary === null;
   const reasons = {
-    AUTHENTICATION_HOSTS_REQUIRED:'No identity-provider hosts were approved. Configure the exact required hosts; a mounted profile does not approve them.',
+    AUTHENTICATION_HOSTS_REQUIRED:'No identity-provider hosts were approved. Submit the exact approved hosts or ask an administrator to configure a separate approval policy; a mounted profile does not approve them.',
     AUTHENTICATION_HOST_NOT_APPROVED:'The authentication destination was not explicitly approved.',
     AUTHENTICATION_FLOW_NOT_ACTIVE:'No authorized authentication transaction was active for this request.',
     AUTHENTICATION_SOURCE_NOT_APPROVED:'The request did not originate from an approved portal or identity-provider context.',
     AUTHENTICATION_PROTOCOL_MISMATCH:'The request did not match the required authentication protocol context.',
     AUTHENTICATION_POLICY_BLOCKED:'A separate security policy blocked the authentication request.',
   };
-  byId('authentication-diagnostic-count').textContent = `${diagnostics.length} authentication policy observations; ${report.scan_configuration?.authentication_host_count ?? 'Not recorded'} explicitly configured hosts. Showing ${Math.min(50, diagnostics.length)} records; all records remain in the JSON export. Authentication approvals do not expand crawler or general API scope.`;
+  byId('authentication-diagnostic-count').textContent = `${diagnostics.length} authentication policy observations. ${approvalSummary || 'Authentication host approval counts were not recorded.'} Showing ${Math.min(50, diagnostics.length)} records; all records remain in the JSON export. Authentication approvals do not expand crawler or general API scope.`;
   byId('authentication-diagnostic-list').innerHTML = diagnostics.slice(0, 50).map((item, index) =>
     `<li><strong>${escapeHtml(item.reason || 'AUTHENTICATION_POLICY_BLOCKED')}</strong><p>${escapeHtml(reasons[item.reason] || 'Review the original policy decision and authorized session configuration.')}</p><code>${escapeHtml(item.protocol || 'Not recorded')} - ${escapeHtml(item.destination_host || 'Not recorded')}</code><p>Policy: ${escapeHtml(item.policy_reason || 'Not recorded')}. Protected coverage affected: ${item.affects_authentication === true ? 'Yes' : 'Not established'}.</p><button type="button" class="secondary" data-authentication-diagnostic="${index}">Inspect authentication decision</button></li>`
   ).join('');

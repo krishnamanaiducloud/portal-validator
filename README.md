@@ -1,11 +1,13 @@
 # Portal Validator
 
-Portal Validator 1.12.11 is a read-only browser health validator with optional authentication for public,
+Portal Validator 1.12.12 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
 results without disabling certificate verification.
 
+See [1.12.12 authentication policy review](docs/RELEASE-1.12.12.md) for
+operator-approved destinations, endpoint restrictions and bounded bootstrap readiness.
 See [1.12.11 regression verification](docs/RELEASE-1.12.11.md) for the
 known-good discovery comparison, SPA fragment identity and source-document restoration.
 See [1.12.10 release verification](docs/RELEASE-1.12.10.md) for authentication
@@ -197,10 +199,14 @@ Playwright Chromium session running in OpenShift.
 
 ### Explicit authentication and readiness configuration
 
-Approved authentication hosts are configured in the Authentication panel,
-separately from portal, resource/API and credential hosts. The displayed count
-must match `scan_configuration.authentication_host_count` in the report. An SSO
-profile restores only scoped browser state; it never implicitly approves hosts.
+Approved authentication hosts are entered in the Authentication panel or supplied
+by an administrator-managed policy file, separately from portal, resource/API and
+credential hosts. Reports show the effective approved count
+(`scan_configuration.authentication_host_count`) and its manual/operator source
+counts (`submitted_authentication_host_count`, `operator_authentication_host_count`).
+Source counts may overlap; effective approvals are deduplicated. An SSO profile
+restores only scoped browser state; it never implicitly approves hosts, and
+switching profiles preserves the manually entered host field.
 Do not add guessed identity providers or move authentication POSTs into the
 business read-only allowlist. Public websites need no profile by default.
 
@@ -226,6 +232,50 @@ for each full-document navigation. Authentication diagnostics distinguish missin
 host approval, an inactive transaction, and other policy failures. Blocked or
 expired authentication cannot establish complete protected-application coverage.
 
+An optional administrator-owned JSON policy can supply previously approved
+destinations without re-entering them for each scan. Mount it read-only, separately
+from `/auth` session files, and set `PORTAL_VALIDATOR_AUTH_POLICIES_FILE` to its
+container path, for example `/etc/portal-validator/auth-policies/policies.json`:
+
+```json
+{
+  "version": 1,
+  "policies": [
+    {
+      "id": "approved-sso",
+      "portal_hosts": ["portal.example"],
+      "authentication_hosts": ["identity.example"],
+      "authentication_endpoints": ["https://portal.example/custom/relay"]
+    }
+  ]
+}
+```
+
+Policies match the exact target hostname, without wildcard, suffix or automatic
+subdomain approval. Matching operator hosts are combined with manually submitted
+hosts; the combined limit is 25. `authentication_endpoints` is optional and names
+explicitly approved nonstandard authentication POST destinations by scheme,
+host, port and path. Configured endpoints cannot contain queries, fragments,
+credentials, wildcards or ambiguous paths, and their hosts must belong to that
+policy's portal or authentication hosts. Endpoint approval still requires a
+validated active flow, approved source/destination, protocol evidence and every
+network/redirect check; it does not authorize arbitrary business POSTs.
+
+Leaving the environment variable unset preserves manual configuration. A
+configured invalid or unavailable file fails startup or rejects new scans rather
+than silently removing policy. The service never derives approvals from cookies,
+local storage or redirects, and exposes no profile-host metadata endpoint.
+Reports expose policy counts, not policy contents or identifiers. Store operator
+policies in a separately restricted ConfigMap or Secret; changing these optional
+approvals requires operator configuration, not a session-state rewrite. Existing
+CA and session Secret mounts need no change for this release.
+
+Authentication bootstrap waits for a read-only application-readiness predicate,
+with document-replacement events, cancellation and configured deadlines. A fixed
+750 ms quiet period is not treated as readiness. Existing optional selectors and
+events remain supported; without them, the rendered-shell checks apply. These
+checks do not prove compatibility with every portal or identity provider.
+
 ### Automatic session refresh
 
 For a profile named `/auth/approved.json`, an optional read-only companion file
@@ -250,8 +300,11 @@ reported as `SESSION_EXPIRED`, `AUTH_REQUIRED`, or `MFA_REQUIRED`. Pod-local
 state is intentionally ephemeral, so the mounted Secret remains the bootstrap
 source after a rollout.
 
-Run this service only for systems you are authorized to validate, and protect
-the service itself with organizational access controls.
+Run this service only for systems you are authorized to validate. The application
+has no built-in multi-tenant authentication or per-profile ownership enforcement;
+protect the entire UI and API with platform authentication and authorization,
+restrict ingress and mounted profile/policy access, and separate deployments
+where users must not share that trust boundary.
 
 ## Enterprise CA trust
 
@@ -309,13 +362,18 @@ runs as UID/GID 10001 while supporting an arbitrary OpenShift UID.
 
 Build versioned tags only:
 
+Record `VCS_REF` only for a clean, reviewed, committed source tree. For an
+authorized uncommitted snapshot, omit it rather than labeling new code with an
+older commit; diagnostics intentionally remain `UNVERIFIED` while still checking
+runtime files against the image's generated hash manifest.
+
 ```bash
 docker build --build-arg VCS_REF="$(git rev-parse HEAD)" \
   --build-arg BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -t mohankrishna999/portal-validator:1.12.11 .
+  -t mohankrishna999/portal-validator:1.12.12 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.11 \
-  -t mohankrishna999/portal-validator:1.12.11-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.12.12 \
+  -t mohankrishna999/portal-validator:1.12.12-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -330,7 +388,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.12.11
+  mohankrishna999/portal-validator:1.12.12
 ```
 
 ## OpenShift
