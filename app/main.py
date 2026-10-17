@@ -101,6 +101,8 @@ from app.reporting import (
     aggregate_api_events,
     aggregate_api_inventory,
     aggregate_report,
+    AUTHENTICATION_SCAN_FAILURE_REASONS,
+    fail_closed_authentication_report,
     aggregate_resource_events,
     aggregate_resource_inventory,
     aggregate_security_recommendations,
@@ -1253,11 +1255,9 @@ async def execute_scan(
     redirect_guards: list[RedirectResponseGuard] = []
     guard_install_tasks = weakref.WeakKeyDictionary()
 
-    await publish_progress(
-        "DISCOVERING",
-        discovered=len(discovered_routes),
-        queued=len(queue),
-    )
+    # A requested URL is not an authenticated, discovered portal route.
+    # Never advertise route discovery before session establishment.
+    await publish_progress("AUTHENTICATING", discovered=0, queued=0, validated=0)
     @asynccontextmanager
     async def scan_deadline_scope():
         nonlocal total_timeout_reached, cancellation_requested
@@ -2476,9 +2476,9 @@ async def execute_scan(
                     page = browser_pages.get(selected_page_key, primary_page)
                     active_browser_page_key = browser_page_keys.get(request_identity(page))
                     await publish_progress(
-                        "VALIDATING",
-                        discovered=len(discovered_routes),
-                        queued=len(queue) + 1,
+                        "AUTHENTICATING" if not results else "VALIDATING",
+                        discovered=0 if not results else len(discovered_routes),
+                        queued=0 if not results else len(queue) + 1,
                         validated=len(results),
                         healthy=sum(bool(item.get("passed")) for item in results),
                         failed=sum(
@@ -2907,30 +2907,9 @@ async def execute_scan(
                                     for frame in page.frames
                                     if frame.url.startswith(("http://", "https://"))
                                 ]
-                                if req.check_links and final_in_scope and not application_ready:
-                                    # Readiness gates activation, not passive evidence.
-                                    # Preserve already rendered in-scope destinations
-                                    # without opening menus, clicking tabs, scrolling,
-                                    # following login links or sending extra requests.
-                                    observation_phase = "DISCOVERY"
-                                    discovery_started = time.perf_counter()
-                                    passive_routes = await discover_page_routes(page, 0)
-                                    external_links[:] = sorted(set(external_links).union(
-                                        enqueue_discovered_routes(passive_routes, depth, final_raw_url),
-                                    ))
-                                    navigation_actions["passive_routes_observed"] = len(passive_routes)
-                                    navigation_actions["activation_block_reason"] = (
-                                        authentication_classification
-                                        if authentication_classification != "PASS" else "APPLICATION_NOT_READY"
-                                    )
-                                    route_discovery_ms = round((time.perf_counter() - discovery_started) * 1000)
-                                    discovery_duration_ms += route_discovery_ms
-                                    observation_phase = "ROUTE_VALIDATION"
-                                    log_event(
-                                        logging.INFO, "PASSIVE_NAVIGATION_RETAINED", scan_id=scan_id,
-                                        routes_observed=len(passive_routes), routes_discovered=len(discovered_routes),
-                                        reason=navigation_actions["activation_block_reason"],
-                                    )
+                                # Fail closed: unauthenticated or unready documents
+                                # are not inspected for portal routes or tab controls.
+                                # The requested document is diagnostics, not coverage.
                                 if (
                                     req.check_links
                                     and final_in_scope
@@ -3537,6 +3516,25 @@ async def execute_scan(
                     }
                     results.append(result)
                     active_route_identity = None
+                    # An authentication failure aborts the whole scan, even if
+                    # earlier route observations were successful. Finalization
+                    # removes *all* route/API health evidence for this scan.
+                    if (
+                        session_expired
+                        or authentication_classification in AUTHENTICATION_SCAN_FAILURE_REASONS
+                        or (len(results) == 1 and not application_ready)
+                    ):
+                        discovery_stop_reason = (
+                            "SESSION_EXPIRED" if session_expired else
+                            authentication_classification
+                            if authentication_classification in AUTHENTICATION_SCAN_FAILURE_REASONS
+                            else browser_lifecycle.failure_reason or error_classification or "APPLICATION_NOT_READY"
+                        )
+                        log_event(
+                            logging.WARNING, "SCAN_DISCOVERY_STOPPED",
+                            scan_id=scan_id, reason=discovery_stop_reason,
+                        )
+                        break
                     await publish_progress(
                         "VALIDATING",
                         discovered=len(discovered_routes),
@@ -3566,16 +3564,6 @@ async def execute_scan(
                         classification=result["classification"],
                         elapsed_ms=elapsed,
                     )
-                    if (session_expired or authentication_classification in {
-                        "AUTHENTICATION_BLOCKED", "AUTHENTICATION_REQUIRED", "AUTH_REQUIRED",
-                        "AUTH_FAILED", "AUTH_TIMEOUT", "MFA_REQUIRED",
-                    } or (len(results) == 1 and not application_ready)):
-                        discovery_stop_reason = (
-                            "SESSION_EXPIRED" if session_expired else
-                            authentication_classification if authentication_classification not in {None, "PASS"} else
-                            browser_lifecycle.failure_reason or error_classification or "APPLICATION_NOT_READY"
-                        )
-                        break
                     if not queue and popup_tasks and req.check_links:
                         _, pending_popups = await asyncio.wait(
                             tuple(popup_tasks), timeout=max(0, min(
@@ -4142,6 +4130,15 @@ async def execute_scan(
     summary["total_scan_duration_ms"] = round((time.perf_counter() - scan_started) * 1000)
     scan_timing["finalization_ms"] = summary["finalization_duration_ms"]
     scan_timing["total_scan_ms"] = summary["total_scan_duration_ms"]
+    if termination_reason in AUTHENTICATION_SCAN_FAILURE_REASONS:
+        # The root document and any earlier portal routes become ineligible
+        # once the current scan has no valid authenticated session.
+        report = fail_closed_authentication_report(report, termination_reason)
+        log_event(
+            logging.ERROR, "SCAN_AUTHENTICATION_FAILED",
+            scan_id=scan_id, classification=termination_reason,
+            discovered_routes=0, validated_routes=0,
+        )
     return report
 
 
@@ -4161,9 +4158,16 @@ async def _run_scan_job(job: ScanJob, req: ScanRequest) -> None:
         termination_reason = summary.get("termination_reason")
         terminal_state = (
             "CANCELLED" if termination_reason == "USER_CANCELLED" else
+            "FAILED" if report.get("failure") or summary.get("scan_completeness") == "FAILED" else
             "COMPLETED" if summary.get("scan_completeness") == "COMPLETE" else
             "PARTIAL"
         )
+        if terminal_state == "FAILED":
+            job.error = sanitize_text(
+                (report.get("failure") or {}).get("message")
+                or "The scan failed before authenticated route discovery.",
+                limit=1000,
+            )
         job.update(
             terminal_state,
             discovered=int(summary.get("routes_discovered", 0)),
