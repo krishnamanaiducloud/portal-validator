@@ -535,6 +535,13 @@ NAVIGATION_DOM_HELPERS = r"""
     return panel && !/[\s/?!]/.test(panel) && panel.length <= 160 ? panel : '';
   };
   const isMenuExpander = element => {
+    if (element.matches('summary')) {
+      const details = element.closest('details');
+      // Native disclosures are allowed only as genuine navigation containers;
+      // never click a general-purpose disclosure or a form action.
+      return !!details && !!composedClosest(element, 'header,nav,aside,[role="navigation"],[role="menu"]') &&
+        !!details.querySelector(routeSelector + ',[role="menuitem"]');
+    }
     const role = element.getAttribute('role');
     if (role === 'tab' || element.matches('[data-bs-toggle="tab"],[data-toggle="tab"]')) return false;
     if (element.hasAttribute('aria-expanded') || ['menu','true','tree','listbox'].includes(element.getAttribute('aria-haspopup')) ||
@@ -565,7 +572,7 @@ NAVIGATION_DOM_HELPERS = r"""
     return names;
   };
   const menuPanels = () => navigationRoots().flatMap(root => Array.from(root.querySelectorAll(
-    '[role="menu"],mat-menu,.mat-menu-panel,.mat-mdc-menu-panel'
+    '[role="menu"],mat-menu,.mat-menu-panel,.mat-mdc-menu-panel,.dropdown-menu'
   )));
   const bindNavigationPanel = (element, panel, opening) => {
     if (!panel || panel === element || panel.contains(element)) return;
@@ -585,6 +592,11 @@ NAVIGATION_DOM_HELPERS = r"""
     const labelled = element.id && menuPanels().filter(candidate => visibleControl(candidate) &&
       (candidate.getAttribute('aria-labelledby') || '').split(/\s+/).includes(element.id));
     if (labelled?.length === 1) return labelled[0];
+    // Bootstrap-style dropdowns often render as a unique adjacent panel
+    // without role=menu or aria-controls. Only use a visible semantic sibling.
+    const adjacent = Array.from(element.parentElement?.children || []).filter(candidate =>
+      candidate !== element && candidate.matches('.dropdown-menu,[role="menu"]') && visibleControl(candidate));
+    if (adjacent.length === 1) return adjacent[0];
     const opening = window.__portalValidatorMenuOpenings?.get(element);
     const revealed = opening && menuPanels().filter(candidate =>
       visibleControl(candidate) && !opening.panels.has(candidate));
@@ -603,8 +615,9 @@ NAVIGATION_DOM_HELPERS = r"""
     }
     const target = associatedMenuPanel(element);
     if (target) bindNavigationPanel(element, target, window.__portalValidatorMenuOpenings?.get(element));
-    return {expanded:element.getAttribute('aria-expanded') === 'true',
-      collapsed:element.getAttribute('aria-expanded') === 'false',
+    const nativeDetails = element.matches('summary') ? element.closest('details') : null;
+    return {expanded:nativeDetails ? nativeDetails.open : element.getAttribute('aria-expanded') === 'true',
+      collapsed:nativeDetails ? !nativeDetails.open : element.getAttribute('aria-expanded') === 'false',
       panelVisible:!!target && visibleControl(target)};
   };
   const describeView = (element, includeHidden = false) => {
@@ -759,7 +772,14 @@ EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
     '[aria-haspopup="menu"][aria-expanded="false"]',
     '[role="menuitem"]', '[role="tab"]',
     'nav [data-bs-target]', '[role="navigation"] [data-bs-target]',
-    'nav [data-target]', '[role="navigation"] [data-target]'
+    'nav [data-target]', '[role="navigation"] [data-target]',
+    'header [aria-expanded="false"][aria-controls]',
+    'header [aria-haspopup="menu"]', 'header [aria-haspopup="true"]',
+    'nav [data-bs-toggle="dropdown"]', 'header [data-bs-toggle="dropdown"]',
+    '[role="navigation"] [data-bs-toggle="dropdown"]',
+    'nav [data-toggle="dropdown"]', 'header [data-toggle="dropdown"]',
+    '[role="navigation"] [data-toggle="dropdown"]',
+    'nav summary', 'header summary', 'aside summary', '[role="navigation"] summary'
   ].join(',');
   // This set lives only for one bounded expansion pass. Retain it between
   // steps so Python can observe lazy panel requests and collect transient
@@ -847,8 +867,10 @@ MENU_READY_SCRIPT = r"""
 (element) => {
   /* NAVIGATION_DOM_HELPERS */
   const state = menuRevealed(element, false);
+  if (element.matches('summary')) return !!element.closest('details')?.open;
   const expectsMenu = ['menu','true'].includes(element.getAttribute('aria-haspopup')) ||
-    element.matches('[mat-menu-trigger-for],[matmenutriggerfor],.mat-menu-trigger,.mat-mdc-menu-trigger');
+    element.matches('[mat-menu-trigger-for],[matmenutriggerfor],.mat-menu-trigger,.mat-mdc-menu-trigger,'+
+      '[data-bs-toggle="dropdown"],[data-toggle="dropdown"]');
   // Framework triggers can set aria-expanded synchronously while fetching
   // their overlay. Do not move to another top-level menu before it exists.
   return expectsMenu ? state.panelVisible : state.expanded || state.panelVisible;
