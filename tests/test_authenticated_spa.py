@@ -230,11 +230,11 @@ async def test_unapproved_authentication_stops_before_discovery(authenticated_sp
         # not a login challenge caused by intentionally excluded profile cookies.
         monkeypatch.setattr(main.AuthenticationNavigationPolicy, "allows_browser_request", lambda *_args, **_kwargs: False)
     report = await scan_fixture(origins, authentication_hosts=["localhost"] if approved else [])
-    assert len(report["results"]) == 1
-    assert report["results"][0]["authentication_status"] == expected
-    assert report["results"][0]["application_ready"] is False
-    assert report["results"][0]["browser_lifecycle"]["failed_stage"] == "AUTHENTICATING"
-    assert report["results"][0]["browser_lifecycle"]["failure_reason"] == expected
+    assert report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["category"] == expected
+    assert report["results"] == report["route_inventory"] == []
+    assert report["summary"]["routes_discovered"] == 0
+    assert report["coverage"]["discovery_status"] == "NOT_STARTED"
     assert not report["summary"]["coverage_complete"]
     assert not any(method == "POST" for _, method, _ in receipts)
 
@@ -243,12 +243,12 @@ async def test_unapproved_authentication_stops_before_discovery(authenticated_sp
 async def test_missing_shell_readiness_never_starts_navigation_discovery(authenticated_spa):
     origins, _ = authenticated_spa
     report = await scan_fixture(origins, readiness_selector="[data-nonexistent-shell]", readiness_timeout_ms=1000)
-    assert len(report["results"]) == 1
-    assert report["results"][0]["application_ready"] is False
-    assert report["results"][0]["browser_lifecycle"]["failed_stage"] == "APPLICATION_BOOTSTRAP"
-    assert report["results"][0]["browser_lifecycle"]["failure_reason"] == "APPLICATION_NOT_READY"
+    assert report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["stage"] == "APPLICATION_BOOTSTRAP"
+    assert report["authentication_error"]["category"] == "APPLICATION_NOT_READY"
+    assert report["results"] == report["route_inventory"] == []
     assert not report["summary"]["coverage_complete"]
-    assert report["results"][0]["navigation_controls_activated"] == 0
+    assert report["summary"]["navigation_controls_activated"] == 0
 
 
 @pytest.mark.asyncio

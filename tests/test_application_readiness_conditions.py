@@ -269,9 +269,14 @@ async def test_readiness_event_reaches_scan_engine_and_report(readiness_site, re
     if ready:
         documents["/"] += "<script>window.dispatchEvent(new Event('workspace:ready'));</script>"
     report = await scan_readiness(origin, readiness_selector="[data-ready]", readiness_event="workspace:ready")
-    assert report["results"][0]["application_ready"] is ready
-    assert report["results"][0]["render_health"]["readiness_event_seen"] is ready
-    assert report["results"][0]["page_load_status"] == "LOADED"
+    if ready:
+        assert report["results"][0]["application_ready"] is True
+        assert report["results"][0]["render_health"]["readiness_event_seen"] is True
+        assert report["results"][0]["page_load_status"] == "LOADED"
+    else:
+        assert report["scan_status"] == "FAILED"
+        assert report["authentication_error"]["category"] == "APPLICATION_NOT_READY"
+        assert report["results"] == report["route_inventory"] == []
     assert report["scan_configuration"]["readiness_event_configured"] is True
     assert "readiness_event" not in report["scan_configuration"]
 

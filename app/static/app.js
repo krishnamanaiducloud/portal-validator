@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = '1.12.12';
+const FRONTEND_VERSION = '1.13.0';
 // The server pins this exact deferred script with SRI and a hash-versioned URL.
 // Capture currentScript now; it is unavailable in subsequent async callbacks.
 const frontendScript = document.currentScript;
@@ -29,6 +29,33 @@ let inspectTrigger = null;
 let buildIdentityMismatch = false;
 let buildIdentityCheck = null;
 let scanSubmissionPending = false;
+// A scan ID alone is insufficient while its create request is still pending.
+// Keep a local generation through every asynchronous step as well.
+let scanGeneration = 0;
+class StaleScanResponse extends Error {}
+const isCurrentScan = (generation, scanId = null) => generation === scanGeneration && (scanId === null || activeScanId === scanId);
+
+function assertCurrentScan(generation, scanId = null) {
+  if (!isCurrentScan(generation, scanId)) throw new StaleScanResponse('Superseded scan response ignored.');
+}
+
+function clearReportResults() {
+  lastReport = null;
+  results.hidden = true;
+  delete results.dataset.scanId;
+  closeRouteResultsFullscreen();
+  closeRouteInspector(false);
+  byId('evidence-panel').hidden = true;
+  byId('authentication-failure').hidden = true;
+  ['summary','coverage','coverage-dimensions','result-list','api-list','resource-list',
+    'resource-summary','failed-endpoint-list','security-list','security-raw','raw-report',
+    'navigation-coverage-metrics','navigation-tree','scan-diagnostics-content',
+    'authentication-diagnostic-list','authentication-failure-details','evidence-content'].forEach((id) => byId(id).replaceChildren());
+  ['api-count','resource-count','resource-scope','failed-endpoint-count',
+    'navigation-coverage-limitations','authentication-diagnostic-count'].forEach((id) => { byId(id).textContent = ''; });
+  byId('authentication-diagnostics').hidden = true;
+  Object.values(tablePagination).forEach((state) => { state.page = 0; state.key = ''; });
+}
 // Panel preferences contain dimensions only, never report or authentication data.
 const panelSizes = {};
 
@@ -132,7 +159,7 @@ const splitList = (value) => value.split(',').map((item) => item.trim()).filter(
 const statusClass = (value) => String(value || 'NOT_TESTED').toLowerCase().replaceAll('_', '-');
 const authOutcomes = new Set(['AUTH_REQUIRED','AUTHENTICATION_REQUIRED','AUTHENTICATION_BLOCKED','AUTH_FAILED','AUTH_TIMEOUT','MFA_REQUIRED','SESSION_EXPIRED']);
 const accessOutcomes = new Set(['ACCESS_RESTRICTED','CHALLENGE_REQUIRED']);
-const failureOutcomes = new Set(['TLS_ERROR','DNS_ERROR','NETWORK_ERROR','HTTP_ERROR','TIMEOUT','NAVIGATION_ERROR','VALIDATION_FAILED','PAGE_RENDER_ERROR','FAIL']);
+const failureOutcomes = new Set(['TLS_ERROR','DNS_ERROR','NETWORK_ERROR','HTTP_ERROR','AUTHORIZATION_DENIED','TIMEOUT','NAVIGATION_ERROR','VALIDATION_FAILED','PAGE_RENDER_ERROR','FAIL']);
 const passOutcomes = new Set(['PASS','PASS_WITH_WARNINGS']);
 const terminalStates = new Set(['COMPLETED','PARTIAL','FAILED','CANCELLED']);
 const numericRouteKeys = new Set(['status','load_ms','api_failures','resource_failure_count','console_count','warning_findings']);
@@ -1233,8 +1260,70 @@ function renderAuthenticationDiagnostics(report) {
   });
 }
 
-function renderReport(report) {
+function failedAuthenticationReport(report) {
+  if (report.scan_status !== 'FAILED' || report.authentication_status !== 'FAILED') return report;
+  // Defense in depth: a failed global authentication gate can never display
+  // application observations, including legacy or incorrectly merged data.
+  const summary = {routes_discovered:0,routes_validated:0,routes_tested:0,
+    healthy_routes:0,routes_with_warnings:0,failed_pages:0,routes_not_tested:0,
+    unique_apis:0,business_apis:0,api_failures:0,resource_failures:0,slow_pages:0,read_only_blocks:0,
+    duration_ms:report.summary?.duration_ms,total_scan_duration_ms:report.summary?.total_scan_duration_ms,
+    route_coverage:'NOT_STARTED',post_summary:{},post_diagnostics:{}};
+  const failureReason = 'Authentication failed before application discovery and validation.';
+  return {...report, summary, pages:0, results:[],route_inventory:[],not_tested_routes:[],
+    skipped_routes:[],api_inventory:[],business_api_inventory:[],api_request_occurrences:[],
+    resource_inventory:[],resource_details:[],resource_summary:{},network_observation:{},security_recommendations:[],
+    coverage_dimensions:{execution:{status:'FAILED',reason:failureReason},authentication:{status:'FAILED',reason:failureReason},
+      navigation:{status:'NOT_STARTED',reason:failureReason},api:{status:'NOT_STARTED',reason:failureReason}},
+    navigation_coverage:{controls_discovered:0,safe_candidates:0,visited_views:0,validated_views:0,
+      failed_views:0,skipped_unsafe_controls:0,unreachable_views:0,authentication_blocked_views:0,
+      application_not_ready_views:0,not_tested_views:0,unresolved_controls:0,menus_expanded:0,successful_views:0,
+      limitations:[failureReason]},
+    coverage:{coverage_grade:'NOT_STARTED',coverage_status:'NOT_STARTED',coverage_reasons:[failureReason],
+      routes_discovered:0,routes_validated:0,routes_tested:0,routes_not_tested:0,routes_remaining:0,
+      navigation_controls_discovered:0,navigation_controls_activated:0,navigation_controls_unresolved:0,
+      execution_status:'FAILED',termination_reason:report.authentication_error?.category || 'AUTHENTICATION_FAILED'}};
+}
+
+function renderAuthenticationFailure(report) {
+  const failed = report.scan_status === 'FAILED' && report.authentication_status === 'FAILED';
+  byId('authentication-failure').hidden = !failed;
+  if (!failed) { byId('authentication-failure-details').replaceChildren(); return; }
+  const error = report.authentication_error || {};
+  const code = value => typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(value) ? value : 'NOT_RECORDED';
+  const evidence = {scan_status:'FAILED',authentication_status:'FAILED',category:code(error.category),
+    stage:code(error.stage),route_coverage:'NOT_STARTED',discovered_routes:0,validated_routes:0,tested_routes:0};
+  if (Number.isInteger(error.http_status) && error.http_status >= 100 && error.http_status <= 599) evidence.http_status = error.http_status;
+  if (typeof error.method === 'string' && /^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS)$/.test(error.method)) evidence.method = error.method;
+  if (typeof error.endpoint === 'string') {
+    try {
+      const endpoint = new URL(error.endpoint, window.location.origin);
+      if (['https:','http:'].includes(endpoint.protocol)) evidence.endpoint = `${error.endpoint.startsWith('/') ? '' : endpoint.origin}${endpoint.pathname}`;
+    } catch (_) { /* Malformed diagnostic URLs are not displayed. */ }
+  }
+  if (error.policy_decision) evidence.policy_decision = code(error.policy_decision);
+  if (Number.isFinite(error.duration_ms) && error.duration_ms >= 0) evidence.duration_ms = error.duration_ms;
+  const guidance = {
+    AUTHENTICATION_BLOCKED:'Review the reported policy decision and exact operator-approved authentication destinations. Do not disable read-only, TLS or network security controls.',
+    AUTHENTICATION_FAILED:'Complete an authorized login and verify that the application accepts the resulting session.',
+    AUTHENTICATION_REQUIRED:'Provide an authorized session or complete the approved authentication workflow before scanning protected routes.',
+    AUTHENTICATION_TIMEOUT:'Check identity-provider availability and the configured authentication timeout.',
+    SESSION_EXPIRED:'Refresh the selected session profile through the authorized workflow, then start a new scan.',
+    IDENTITY_PROVIDER_UNAVAILABLE:'Check identity-provider connectivity and the reported HTTP or network failure.',
+    AUTHENTICATION_CONFIGURATION_ERROR:'Review the selected session profile and operator-approved authentication policy.',
+    APPLICATION_NOT_READY:'Check application-shell readiness criteria and its timeout. An HTTP 200 login or bootstrap page does not prove readiness.',
+  };
+  byId('authentication-failure-guidance').textContent = guidance[error.category] || 'Review the sanitized authentication diagnostics and authorized session configuration before starting another scan.';
+  byId('authentication-failure-details').innerHTML = `<dl>${Object.entries(evidence).map(([key,value]) =>
+    `<dt>${escapeHtml(key.replaceAll('_',' '))}</dt><dd>${escapeHtml(value)}</dd>`).join('')}</dl>`;
+}
+
+function renderReport(report, context = null) {
+  if (context && (!isCurrentScan(context.generation, context.scanId)
+      || (report.scan_id || report.run_id) !== context.scanId)) return false;
+  report = failedAuthenticationReport(report);
   lastReport = report;
+  results.dataset.scanId = report.scan_id || report.run_id || '';
   Object.values(tablePagination).forEach((state) => { state.page = 0; state.key = ''; });
   try { byId('result-title').textContent = new URL(report.target).hostname; }
   catch (_) { byId('result-title').textContent = 'Portal health'; }
@@ -1247,6 +1336,8 @@ function renderReport(report) {
     ['Discovered routes', report.summary.routes_discovered, '', 'discovered'], ['Validated routes', report.summary.routes_validated, '', 'validated'], ['Healthy', report.summary.healthy_routes, 'good', 'healthy'], ['Passed with warnings', report.summary.routes_with_warnings, report.summary.routes_with_warnings ? 'warn' : '', 'warnings'], ['Failed', report.summary.failed_pages, report.summary.failed_pages ? 'bad' : 'good', 'failed'], ['Auth issues', authIssues, authIssues ? 'auth' : '', 'auth'], ['Access / challenges', accessIssues, accessIssues ? 'warn' : '', 'access'], ['Not tested', notTested, notTested ? 'warn' : 'good', 'not-tested'], ['Unique APIs observed', report.summary.unique_apis || 0, '', 'apis'], ['API failures', report.summary.api_failures, report.summary.api_failures ? 'bad' : 'good', 'api-failures'], ['Resources observed', report.summary.unique_resources || 0, '', 'resources'], ['Resource failures', report.summary.resource_failures, report.summary.resource_failures ? 'warn' : 'good', 'resource-failures'], ['Console issues', report.summary.console_failures || 0, report.summary.console_failures ? 'warn' : 'good', 'console'], ['Slow routes', report.summary.slow_pages, report.summary.slow_pages ? 'warn' : 'good', 'slow'], ['Read-only blocks', report.summary.read_only_blocks, report.summary.read_only_blocks ? 'warn' : 'good', 'read-only'], ['Security recommendations', report.summary.security_recommendations || 0, report.summary.security_recommendations ? 'warn' : 'good', 'security'], ['Scan duration', duration, '', 'validated'],
   ];
   summaryMetrics.splice(8, 0, ['Business APIs', report.summary.business_apis ?? (report.business_api_inventory || []).length, '', 'business-apis']);
+  if (report.scan_status === 'FAILED' && report.authentication_status === 'FAILED') summaryMetrics.unshift(
+    ['Scan status','FAILED','bad','auth'],['Authentication status','FAILED','bad','auth'],['Tested routes',0,'','validated']);
   byId('summary').innerHTML = summaryMetrics.map(([label, value, kind, action]) => `<button type="button" class="metric ${kind}" data-summary-action="${action}" aria-label="Show ${escapeHtml(label)} evidence"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></button>`).join('');
   byId('summary').querySelectorAll('[data-summary-action]').forEach((button) => button.addEventListener('click', () => activateSummary(button.dataset.summaryAction, button.querySelector('strong').textContent, button)));
   byId('summary').querySelector('[data-summary-action="access"]').title = 'Access restrictions and challenges limit application coverage. They do not establish that credentials are required or that the application failed.';
@@ -1278,17 +1369,20 @@ function renderReport(report) {
   renderNavigationCoverage(report);
   renderCoverageDimensions(report);
   renderAuthenticationDiagnostics(report);
+  renderAuthenticationFailure(report);
   results.hidden = false;
   panelSizes['route-results'].apply();
   scrollAndFocus(results);
+  return true;
 }
 
-function startProgress() {
+function startProgress(generation = scanGeneration) {
   const started = Date.now();
   progress.hidden = false;
+  byId('cancel-button').disabled = false;
   byId('progress-state').textContent = 'QUEUED';
   byId('progress-route').textContent = '';
-  progressTimer = window.setInterval(() => { byId('progress-time').textContent = `${Math.round((Date.now() - started) / 1000)}s elapsed`; }, 1000);
+  progressTimer = window.setInterval(() => { if (isCurrentScan(generation)) byId('progress-time').textContent = `${Math.round((Date.now() - started) / 1000)}s elapsed`; }, 1000);
 }
 
 function updateProgress(status) {
@@ -1296,21 +1390,26 @@ function updateProgress(status) {
   byId('progress-route').textContent = status.current_route ? `Current: ${status.current_route}` : '';
 }
 
-function stopProgress() {
+function stopProgress(generation = scanGeneration) {
+  if (!isCurrentScan(generation)) return;
   if (progressTimer) window.clearInterval(progressTimer);
   progressTimer = null;
   progress.hidden = true;
   activeScanId = null;
 }
 
-async function pollScan(scanId) {
+async function pollScan(scanId, generation = scanGeneration) {
   let transientFailures = 0;
   while (true) {
+    assertCurrentScan(generation, scanId);
     let status;
     try {
       status = await requestJson(`/api/scans/${encodeURIComponent(scanId)}`, {}, 'Scan status request');
+      assertCurrentScan(generation, scanId);
+      if (status.scan_id && status.scan_id !== scanId) throw new Error('Scan status identity mismatch. Start a new scan.');
       transientFailures = 0;
     } catch (error) {
+      assertCurrentScan(generation, scanId);
       transientFailures += 1;
       if (transientFailures >= 3) throw error;
       byId('progress-state').textContent = `Connection interrupted · retrying ${transientFailures}/3`;
@@ -1319,8 +1418,11 @@ async function pollScan(scanId) {
     }
     updateProgress(status);
     if (terminalStates.has(status.state)) {
-      if (status.state === 'FAILED') throw new Error(status.error || 'Scan failed before producing a report.');
-      return requestJson(`/api/scans/${encodeURIComponent(scanId)}/report`, {}, 'Scan report request');
+      if (status.state === 'FAILED' && !status.report_ready) throw new Error(status.error || 'Scan failed before producing a report.');
+      const report = await requestJson(`/api/scans/${encodeURIComponent(scanId)}/report`, {}, 'Scan report request');
+      assertCurrentScan(generation, scanId);
+      if ((report.scan_id || report.run_id) !== scanId) throw new Error('Scan report identity mismatch. Results were not displayed.');
+      return report;
     }
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
   }
@@ -1460,19 +1562,27 @@ document.querySelectorAll('[data-api-sort]').forEach((button) => button.addEvent
 document.querySelectorAll('[data-resource-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.resourceSort; resourceSort = {key, direction:resourceSort.key === key ? -resourceSort.direction : 1}; renderResourceDetails(); }));
 byId('cancel-button').addEventListener('click', async () => {
   if (!activeScanId) return;
+  const scanId = activeScanId, generation = scanGeneration;
   byId('cancel-button').disabled = true;
-  try { await requestJson(`/api/scans/${encodeURIComponent(activeScanId)}/cancel`, {method:'POST'}, 'Cancel scan request'); notify('Cancellation requested. The current route will finish safely.'); }
-  catch (error) { notify(error.message, true); }
-  finally { byId('cancel-button').disabled = false; }
+  try {
+    await requestJson(`/api/scans/${encodeURIComponent(scanId)}/cancel`, {method:'POST'}, 'Cancel scan request');
+    if (isCurrentScan(generation, scanId)) notify('Cancellation requested. The current route will finish safely.');
+  }
+  catch (error) { if (isCurrentScan(generation, scanId)) notify(error.message, true); }
+  finally { if (isCurrentScan(generation, scanId)) byId('cancel-button').disabled = false; }
 });
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (scanSubmissionPending || activeScanId) return;
+  const generation = ++scanGeneration;
+  clearReportResults();
   scanSubmissionPending = true;
   runButton.disabled = true;
   try {
-  if (!await verifyBuildIdentity()) { notify('Dashboard and backend build identities differ. Reload the dashboard before starting a scan.', true); return; }
+  const buildCompatible = await verifyBuildIdentity();
+  assertCurrentScan(generation);
+  if (!buildCompatible) { notify('Dashboard and backend build identities differ. Reload the dashboard before starting a scan.', true); return; }
   if ([...document.querySelectorAll('.read-post-operation input[required]')].some((input) => !input.validity.valid)) byId('read-post-settings').open = true;
   if (!form.reportValidity()) return;
   let payload;
@@ -1490,17 +1600,21 @@ form.addEventListener('submit', async (event) => {
   clearTransientCredentials();
   runButton.disabled = true;
   runButton.querySelector('span').textContent = 'Validating…';
-  startProgress();
+  startProgress(generation);
   try {
     const created = await requestJson('/api/scans', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)}, 'Scan request');
+    assertCurrentScan(generation);
+    if (typeof created.scan_id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(created.scan_id)) throw new Error('The server returned an invalid scan identity.');
     activeScanId = created.scan_id;
-    const report = await pollScan(activeScanId);
-    renderReport(report);
+    const report = await pollScan(activeScanId, generation);
+    if (!renderReport(report, {generation,scanId:created.scan_id})) return;
     const coverage = report.coverage || {};
-    notify(`Execution finished · Coverage: ${coverage.coverage_status || coverage.scan_completeness || 'UNKNOWN'} · ${report.summary.routes_validated ?? report.pages} routes validated`);
-  } catch (error) { notify(error.message || 'Validation failed', true); }
-  finally { stopProgress(); runButton.disabled = buildIdentityMismatch; runButton.querySelector('span').textContent = 'Run validation'; }
-  } finally { scanSubmissionPending = false; runButton.disabled = buildIdentityMismatch || Boolean(activeScanId); }
+    if (report.scan_status === 'FAILED' && report.authentication_status === 'FAILED') notify('Scan FAILED · Authentication FAILED · Route coverage NOT_STARTED · 0 routes tested', true);
+    else notify(`Execution finished · Coverage: ${coverage.coverage_status || coverage.scan_completeness || 'UNKNOWN'} · ${report.summary.routes_validated ?? report.pages} routes validated`);
+  } catch (error) { if (isCurrentScan(generation) && !(error instanceof StaleScanResponse)) notify(error.message || 'Validation failed', true); }
+  finally { if (isCurrentScan(generation)) { stopProgress(generation); runButton.disabled = buildIdentityMismatch; runButton.querySelector('span').textContent = 'Run validation'; } }
+  } catch (error) { if (isCurrentScan(generation) && !(error instanceof StaleScanResponse)) notify(error.message || 'Validation failed', true); }
+  finally { if (isCurrentScan(generation)) { scanSubmissionPending = false; runButton.disabled = buildIdentityMismatch || Boolean(activeScanId); } }
 });
 
 byId('download-button').addEventListener('click', () => {

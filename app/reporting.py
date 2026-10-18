@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
 import math
 from typing import Any
 from urllib.parse import urlparse
@@ -36,6 +37,7 @@ FAILURE_OUTCOMES = frozenset({
     "NAVIGATION_ERROR",
     "VALIDATION_FAILED",
     "PAGE_RENDER_ERROR",
+    "AUTHORIZATION_DENIED",
     "FAIL",
 })
 API_WARNING_TYPES = frozenset({
@@ -45,6 +47,244 @@ API_WARNING_TYPES = frozenset({
     "API_NETWORK_FAILURE", "API_NOT_FOUND", "API_RATE_LIMITED", "API_REQUEST_FAILED",
     "API_RESPONSE_BODY_FAILURE", "API_SERVER_ERROR_OPTIONAL", "API_TIMEOUT", "API_TLS_FAILURE",
 })
+
+
+_AUTHENTICATION_FAILURE_ALIASES = {
+    "AUTH_FAILED": "AUTHENTICATION_FAILED",
+    "AUTH_REQUIRED": "AUTHENTICATION_REQUIRED",
+    "MFA_REQUIRED": "AUTHENTICATION_REQUIRED",
+    "AUTH_TIMEOUT": "AUTHENTICATION_TIMEOUT",
+    "AUTH_CONFIGURATION_ERROR": "AUTHENTICATION_CONFIGURATION_ERROR",
+}
+_AUTHENTICATION_FAILURE_GUIDANCE = {
+    "AUTHENTICATION_BLOCKED": (
+        "Review the blocked authentication transition and explicitly approved authentication hosts/endpoints. "
+        "Preserve TLS, SSRF and read-only restrictions; do not broadly allow external destinations."
+    ),
+    "AUTHENTICATION_FAILED": "Complete the authorized login workflow and verify that the application accepts the resulting session.",
+    "AUTHENTICATION_REQUIRED": (
+        "Provide a current authorized session profile or complete the approved authentication workflow. "
+        "A desktop browser session is separate from the validator browser."
+    ),
+    "AUTHENTICATION_TIMEOUT": "Check identity-provider reachability and the authorized login workflow before adjusting the authentication timeout.",
+    "SESSION_EXPIRED": "Refresh the authorized session using the configured refresh workflow, then start a new scan.",
+    "IDENTITY_PROVIDER_UNAVAILABLE": "Check the approved identity provider's availability and network reachability; retry after service is restored.",
+    "AUTHENTICATION_CONFIGURATION_ERROR": "Ask the operator to verify the configured authentication policy and selected session profile without sharing their contents.",
+    "APPLICATION_NOT_READY": "Verify that the authenticated application shell renders and that configured readiness conditions are correct.",
+    "ACCESS_RESTRICTED": "The target denied access. Verify permission and any approved access requirements; HTTP 403 alone does not prove a missing login.",
+    "CHALLENGE_REQUIRED": "Complete any permitted access challenge through an authorized workflow; do not bypass the target's browser security.",
+    "TLS_ERROR": "Verify the mounted corporate CA chain and browser trust initialization. Keep certificate verification enabled.",
+    "DNS_ERROR": "Check target DNS and the configured destination/network policy before starting a new scan.",
+    "NETWORK_ERROR": "Check target connectivity and network policy before starting a new scan.",
+    "HTTP_ERROR": "Review the captured main-document HTTP status and restore target availability before starting a new scan.",
+    "NAVIGATION_ERROR": "Review the approved navigation flow and target availability before starting a new scan.",
+    "TIMEOUT": "Review target navigation and application readiness within the configured scan timeouts.",
+}
+_AUTHENTICATION_FAILURE_STAGES = frozenset({
+    "INITIALIZING", "INITIAL_NAVIGATION", "AUTHENTICATING", "AUTHENTICATED",
+    "SESSION_ESTABLISHED", "SESSION_REFRESH", "APPLICATION_BOOTSTRAP", "APPLICATION_READY",
+    "REQUEST_POLICY", "NAVIGATING", "AUTHENTICATION", "READINESS",
+})
+
+
+def _diagnostic_code(value: object, *, maximum: int = 96) -> str | None:
+    """Accept machine classifications, never arbitrary exception text or secrets."""
+    if not isinstance(value, str) or not 1 <= len(value) <= maximum:
+        return None
+    if any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for character in value):
+        return None
+    return value
+
+
+def create_authentication_error(
+    category: str,
+    *,
+    stage: str = "AUTHENTICATING",
+    http_status: int | None = None,
+    method: str | None = None,
+    endpoint: str | None = None,
+    policy_decision: str | None = None,
+    duration_ms: int | float | None = None,
+) -> dict[str, Any]:
+    """Produce strictly whitelisted, body/header-free bootstrap diagnostics.
+
+    This records evidence; it cannot approve a destination or infer that an
+    arbitrary HTTP error is an identity-provider/authentication failure. The
+    orchestration gate must decide whether a failure is global.
+    """
+    category = _AUTHENTICATION_FAILURE_ALIASES.get(category, category)
+    if category not in _AUTHENTICATION_FAILURE_GUIDANCE:
+        category = "AUTHENTICATION_FAILED"
+    safe_endpoint = None
+    if isinstance(endpoint, str):
+        try:
+            safe_endpoint = safe_api_identity(endpoint)[0]
+        except (TypeError, ValueError):
+            safe_endpoint = None
+        if safe_endpoint == "[REDACTED_URL]":
+            safe_endpoint = None
+    safe_duration = (
+        round(duration_ms) if isinstance(duration_ms, (int, float))
+        and not isinstance(duration_ms, bool) and math.isfinite(duration_ms) and duration_ms >= 0 else None
+    )
+    return {
+        "category": category,
+        "stage": stage if stage in _AUTHENTICATION_FAILURE_STAGES else "AUTHENTICATING",
+        "http_status": (
+            http_status if isinstance(http_status, int) and not isinstance(http_status, bool)
+            and 100 <= http_status <= 599 else None
+        ),
+        "method": method.upper() if isinstance(method, str) and method.upper() in {
+            "GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE", "CONNECT", "TRACE",
+        } else None,
+        "endpoint": safe_endpoint,
+        "policy_decision": _diagnostic_code(policy_decision),
+        "duration_ms": safe_duration,
+        "remediation": _AUTHENTICATION_FAILURE_GUIDANCE[category],
+    }
+
+
+def _safe_authentication_diagnostics(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Authentication traffic is diagnostic evidence, never application API health."""
+    output = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        diagnostic = create_authentication_error(
+            str(item.get("category") or item.get("reason") or "AUTHENTICATION_FAILED"),
+            stage=str(item.get("stage") or "AUTHENTICATING"),
+            http_status=item.get("http_status", item.get("status")),
+            method=item.get("method"),
+            endpoint=item.get("endpoint", item.get("url")),
+            policy_decision=item.get("policy_decision", item.get("policy_reason")),
+            duration_ms=item.get("duration_ms"),
+        )
+        for key in ("reason", "policy_reason", "phase", "protocol"):
+            value = _diagnostic_code(item.get(key))
+            if value:
+                diagnostic[key] = value
+        for key in ("affects_authentication", "source_approved", "destination_approved", "flow_active"):
+            if isinstance(item.get(key), bool):
+                diagnostic[key] = item[key]
+        for key in ("source_host", "destination_host"):
+            value = item.get(key)
+            if isinstance(value, str):
+                # Host-only evidence must not admit URL credentials or queries.
+                try:
+                    parsed = urlparse("https://" + value)
+                    if parsed.hostname and parsed.netloc == value and not parsed.username and not parsed.password:
+                        diagnostic[key] = parsed.hostname.lower().rstrip(".")
+                except ValueError:
+                    pass
+        if diagnostic not in output:
+            output.append(diagnostic)
+    return output
+
+
+def apply_global_authentication_failure(
+    report: dict[str, Any],
+    error: dict[str, Any],
+    *,
+    diagnostics: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build a failed, zero-coverage report without mutating prior scan data.
+
+    Invoke only after the scan's global authentication/application-readiness
+    gate failed, never for an individual denied route after readiness succeeds.
+    Allowlisting retained metadata prevents stale/new route or API collections
+    from surviving an authentication failure through an unexpected report key.
+    """
+    safe_error = create_authentication_error(
+        str(error.get("category") or "AUTHENTICATION_FAILED"),
+        stage=str(error.get("stage") or "AUTHENTICATING"),
+        http_status=error.get("http_status"), method=error.get("method"),
+        endpoint=error.get("endpoint"), policy_decision=error.get("policy_decision"),
+        duration_ms=error.get("duration_ms"),
+    )
+    category = safe_error["category"]
+    output = {
+        key: deepcopy(report[key]) for key in (
+            "report_schema_version", "validator_version", "build_identity", "scan_id", "run_id",
+            "target", "scan_configuration", "scan_timing", "timings", "safety", "scan_lifecycle",
+        ) if key in report
+    }
+    summary = aggregate_report(
+        [], routes_discovered=0, routes_eligible=0, routes_queued=0,
+        termination_reason=category, api_events=[],
+    )
+    summary.update({
+        "status": "FAILED", "scan_status": "FAILED", "authentication_status": "FAILED",
+        "execution_status": "FAILED", "execution_complete": False,
+        "scan_completeness": "FAILED", "coverage_status": "NOT_STARTED",
+        "coverage_grade": "NOT_STARTED", "coverage_complete": False,
+        "discovery_status": "NOT_STARTED", "validation_status": "NOT_STARTED",
+        "route_coverage": "NOT_STARTED", "routes_tested": 0, "tested_routes": 0,
+        "coverage_detail": "Global authentication/application readiness failed; no application route or API results are accepted for this scan.",
+        "coverage_reasons": [{"code": category, "count": 1}],
+        "unique_apis": 0, "business_apis": 0, "api_calls": 0,
+        "unique_resources": 0, "resource_calls": 0, "security_recommendations": 0,
+        "menu_controls_discovered": 0, "menu_controls_activated": 0, "menu_controls_unresolved": 0,
+        "view_controls_discovered": 0, "view_controls_activated": 0, "view_controls_unresolved": 0,
+    })
+    for key in (
+        "authentication_duration_ms", "finalization_duration_ms", "total_scan_duration_ms",
+    ):
+        value = report.get("summary", {}).get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+            summary[key] = round(value)
+    summary.update({
+        "discovery_duration_ms": 0, "validation_duration_ms": 0,
+        "average_route_duration_ms": 0, "p50_route_duration_ms": 0, "p95_route_duration_ms": 0,
+    })
+    coverage = {
+        "discovery_status": "NOT_STARTED", "validation_status": "NOT_STARTED",
+        "scan_completeness": "FAILED", "execution_status": "FAILED",
+        "coverage_status": "NOT_STARTED", "coverage_grade": "NOT_STARTED",
+        "coverage_scope": "OBSERVED_REACHABLE_SCOPE", "total_application_coverage": "UNKNOWN",
+        "coverage_reasons": summary["coverage_reasons"], "termination_reason": category,
+        **{key: summary[key] for key in (
+            "routes_discovered", "routes_eligible", "routes_queued", "routes_validated", "routes_skipped",
+            "routes_remaining", "routes_not_tested", "routes_tested", "tested_routes",
+            "navigation_controls_discovered", "navigation_controls_activated", "navigation_controls_unresolved",
+            "business_apis", "api_requests_observed", "api_responses_completed", "api_requests_blocked",
+            "api_requests_failed", "api_requests_incomplete", "api_requests_canceled", "api_requests_not_actively_tested",
+            "not_tested_reason_counts",
+        )},
+    }
+    safe_diagnostics = _safe_authentication_diagnostics(
+        diagnostics if diagnostics is not None else report.get("authentication_diagnostics", []),
+    )
+    output.update({
+        "scan_status": "FAILED", "outcome": "FAILED", "authentication_status": "FAILED",
+        "authentication_error": safe_error, "pages": 0, "summary": summary, "coverage": coverage,
+        "navigation_coverage": {
+            **navigation_coverage([], summary, []), "status": "NOT_STARTED",
+        },
+        "coverage_dimensions": {
+            "execution": {"status": "FAILED", "reason": "Global authentication/application readiness failed."},
+            "navigation": {"status": "NOT_STARTED", "reason": "No route results are accepted after global authentication/application-readiness failure."},
+            "authentication": {"status": "FAILED", "reason": safe_error["remediation"]},
+            "api": {"status": "NOT_STARTED", "reason": "Authentication diagnostics are not application API checks."},
+        },
+        "authentication_diagnostics": safe_diagnostics,
+        "network_observation": {
+            **{key: 0 for key in (
+                "total_http_requests_observed", "api_requests_observed", "observed_requests", "policy_evaluated",
+                "blocked_requests", "responses_seen", "responses_completed", "requests_failed",
+                "browser_request_failed_events", "route_handler_seen", "request_dispatched", "read_only_blocks",
+                "aggregated_requests", "requests_canceled", "requests_incomplete",
+            )},
+            "http_methods_observed": {}, "observed_methods": [], "scope": "APPLICATION_RESULTS_WITHHELD",
+        },
+        "resource_summary": {"scope": "APPLICATION_RESULTS_WITHHELD", "total_resources": 0},
+        "session": {"status": "FAILED"},
+        **{key: [] for key in (
+            "results", "route_inventory", "not_tested_routes", "skipped_routes", "api_inventory",
+            "api_request_occurrences", "business_api_inventory", "resource_inventory", "resource_details",
+            "security_recommendations",
+        )},
+    })
+    return output
 
 
 def _api_validation_status(items: list[dict[str, Any]], *, loaded: bool) -> str:
@@ -180,7 +420,13 @@ def build_findings(
                 resource_failure.get("error") or "A page resource failed to load.",
                 resource=resource,
             ))
-    if status in {403, 429}:
+    if classification == "AUTHORIZATION_DENIED":
+        items.append(finding(
+            "AUTHORIZATION_DENIED", "ERROR",
+            "The established application session is not authorized for this route (HTTP 403).",
+            blocking=True,
+        ))
+    elif status in {403, 429}:
         items.append(finding(
             "HTTP_ACCESS_RESTRICTED" if status == 403 else "HTTP_RATE_LIMITED",
             "INFO",

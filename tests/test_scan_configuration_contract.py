@@ -70,8 +70,12 @@ def test_missing_sso_profile_rejected_before_job_or_browser(monkeypatch, tmp_pat
                 "mode": "storage_state", "storage_profile": profile,
             },
         })
-    assert response.status_code == 400
-    assert "Storage-state profile" in response.json()["detail"]
+        assert response.status_code == 202
+        created = response.json()
+        report = client.get(created["report_url"]).json()
+    assert created["state"] == report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["category"] == "AUTHENTICATION_CONFIGURATION_ERROR"
+    assert report["results"] == []
 
 
 def test_malformed_sso_profile_rejected_before_job(monkeypatch, tmp_path):
@@ -83,5 +87,9 @@ def test_malformed_sso_profile_rejected_before_job(monkeypatch, tmp_path):
                 "mode": "storage_state", "storage_profile": "session",
             },
         })
-    assert response.status_code == 400
+        assert response.status_code == 202
+        report = client.get(response.json()["report_url"]).json()
+    assert report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["category"] == "AUTHENTICATION_CONFIGURATION_ERROR"
     assert "do-not-echo-secret" not in response.text
+    assert "do-not-echo-secret" not in str(report)

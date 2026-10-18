@@ -100,25 +100,33 @@ async def test_invalid_operator_policy_fails_before_dns_or_browser(tmp_path, mon
 
     monkeypatch.setattr(main, "resolve_and_validate", forbidden_dns)
     monkeypatch.setattr(main, "async_playwright", forbidden_browser)
-    with pytest.raises(HTTPException) as error:
-        await execute_scan(ScanRequest(target="https://portal.example"))
-    assert error.value.status_code == 503
-    assert error.value.detail == "Administrator authentication policy is invalid"
-    assert "do-not-echo-secret" not in str(error.value)
+    report = await execute_scan(ScanRequest(target="https://portal.example"))
+    assert report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["category"] == "AUTHENTICATION_CONFIGURATION_ERROR"
+    assert report["results"] == report["route_inventory"] == []
+    assert "do-not-echo-secret" not in json.dumps(report)
 
 
-def test_invalid_policy_is_rejected_before_creating_scan_job(tmp_path, monkeypatch):
-    def forbidden_job(*_args, **_kwargs):
-        raise AssertionError("An invalid operator policy must not queue a scan")
+def test_invalid_policy_retains_failed_job_without_starting_browser(tmp_path, monkeypatch):
+    def forbidden_browser(*_args, **_kwargs):
+        raise AssertionError("An invalid operator policy must not start a browser")
 
-    monkeypatch.setattr(main.SCAN_REGISTRY, "create", forbidden_job)
+    monkeypatch.setattr(main, "async_playwright", forbidden_browser)
     with TestClient(main.app) as client:
         # A projected policy can become invalid after a successful startup.
         monkeypatch.setenv(AUTH_POLICIES_FILE_ENV, str(tmp_path / "missing-policy.json"))
         response = client.post("/api/scans", json={"target": "https://portal.example"})
-    assert response.status_code == 503
-    assert response.json() == {"detail": "Administrator authentication policy is invalid"}
+        assert response.status_code == 202
+        created = response.json()
+        assert created["state"] == "FAILED"
+        status = client.get(created["status_url"]).json()
+        report = client.get(created["report_url"]).json()
+    assert status["state"] == report["scan_status"] == "FAILED"
+    assert report["scan_id"] == created["scan_id"]
+    assert report["authentication_error"]["category"] == "AUTHENTICATION_CONFIGURATION_ERROR"
+    assert report["results"] == report["route_inventory"] == []
     assert "missing-policy.json" not in response.text
+    assert "missing-policy.json" not in json.dumps(report)
 
 
 def test_invalid_policy_also_fails_application_startup(tmp_path, monkeypatch):
@@ -307,11 +315,12 @@ async def test_operator_approved_bootstrap_cancellation_preserves_partial_report
     assert report["summary"]["scan_completeness"] == "CANCELLED"
     assert report["summary"]["healthy_routes"] == 0
     assert report["summary"]["routes_validated"] == 0
-    assert report["summary"]["routes_not_tested"] == 1
-    assert report["summary"]["not_tested_reason_counts"] == {"NOT_TESTED_CANCELLED": 1}
+    assert report["summary"]["routes_not_tested"] == 0
+    assert report["summary"]["routes_discovered"] == 0
+    assert report["summary"]["not_tested_reason_counts"] == {}
     assert not report["summary"]["coverage_complete"]
     assert report["results"] == []
-    assert all(route["classification"] == "NOT_TESTED" for route in report["route_inventory"])
+    assert report["route_inventory"] == []
     assert observed_pages and all(page.is_closed() for page in observed_pages)
     assert not main.SCAN_LIMITER._active and not main.SCAN_LIMITER._waiting
     assert "fixture-private" not in json.dumps(report)

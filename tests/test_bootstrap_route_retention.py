@@ -1,4 +1,4 @@
-"""Readiness/auth failures retain passive scope evidence without activating it."""
+"""Readiness/auth failures must not inspect even passive application routes."""
 import json
 
 import pytest
@@ -9,7 +9,7 @@ from test_scan_post_lifecycle import production_spa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("requires_login", [False, True])
-async def test_unready_shell_retains_visible_hash_routes_without_activation(production_spa, monkeypatch, requires_login):
+async def test_unready_shell_does_not_discover_visible_hash_routes(production_spa, monkeypatch, requires_login):
     origin, handler = production_spa
 
     def document(self):
@@ -34,17 +34,15 @@ async def test_unready_shell_retains_visible_hash_routes_without_activation(prod
         max_discovery_scrolls=0, min_observation_ms=100, network_quiet_ms=50,
         render_settle_ms=100, check_security_headers=False,
     ))
-    reason = "NOT_TESTED_AUTHENTICATION_REQUIRED" if requires_login else "NOT_TESTED_APPLICATION_NOT_READY"
-    assert len(report["results"]) == 1
-    assert report["results"][0]["application_ready"] is False
-    assert report["results"][0]["navigation_controls_activated"] == 0
-    assert report["summary"]["routes_discovered"] == len(report["route_inventory"]) == 3
+    category = "AUTHENTICATION_FAILED" if requires_login else "APPLICATION_NOT_READY"
+    assert report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["category"] == category
+    assert report["results"] == report["route_inventory"] == []
+    assert report["summary"]["routes_discovered"] == 0
     assert report["summary"]["application_routes_validated"] == 0
     assert not report["summary"]["coverage_complete"]
-    unvisited = [item for item in report["route_inventory"] if item["classification"] == "NOT_TESTED"]
-    assert {item["spa_route"] for item in unvisited} == {"#/reports", "#/activity"}
-    assert all(item["coverage_reason"] == reason for item in unvisited)
-    assert report["summary"]["not_tested_reason_counts"] == {reason: 2}
+    assert report["coverage"]["discovery_status"] == "NOT_STARTED"
+    assert report["summary"]["navigation_controls_activated"] == 0
     assert handler.post_paths == []
     assert report["network_observation"]["http_methods_observed"].get("POST", 0) == 0
     assert all(report["summary"]["counter_invariants"].values())

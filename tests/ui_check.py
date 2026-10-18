@@ -6,6 +6,157 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 
+async def check_scan_isolation(page, saved_report):
+    """Exercise real submission plus delayed transport races without target traffic."""
+    created = asyncio.Event()
+    release_create = asyncio.Event()
+    failure = {
+        **saved_report, "scan_id": "ui-auth-failed", "run_id": "ui-auth-failed",
+        "scan_status": "FAILED", "authentication_status": "FAILED",
+        "authentication_error": {
+            "category": "AUTHENTICATION_BLOCKED", "stage": "AUTHENTICATING",
+            "http_status": 403, "method": "POST",
+            "endpoint": "https://identity.example.org/saml/acs",
+            "policy_decision": "AUTHENTICATION_HOST_NOT_APPROVED", "duration_ms": 120,
+        },
+        "authentication_diagnostics": [{
+            "reason": "AUTHENTICATION_HOST_NOT_APPROVED", "protocol": "SAML",
+            "destination_host": "identity.example.org", "affects_authentication": True,
+            "policy_reason": "THIRD_PARTY_RESOURCE_POLICY",
+        }],
+    }
+
+    async def capture_failed_scan(route):
+        created.set()
+        await release_create.wait()
+        await route.fulfill(status=202, json={"scan_id": "ui-auth-failed"})
+
+    async def failed_status(route):
+        await route.fulfill(status=200, json={
+            "scan_id": "ui-auth-failed", "state": "FAILED", "report_ready": True,
+            "validated": 0, "discovered": 0, "healthy": 0, "failed": 0,
+        })
+
+    async def failed_report(route):
+        await route.fulfill(status=200, json=failure)
+
+    await page.route("**/api/scans", capture_failed_scan)
+    await page.route("**/api/scans/ui-auth-failed", failed_status)
+    await page.route("**/api/scans/ui-auth-failed/report", failed_report)
+    await page.evaluate("report => renderReport(report)", saved_report)
+    assert await page.locator("#result-list .route-row").count() > 0
+    assert await page.locator("#api-list .api-endpoint").count() > 0
+    await page.locator("#scan-form").evaluate("element => element.dispatchEvent(new Event('submit', {bubbles:true,cancelable:true}))")
+    await asyncio.wait_for(created.wait(), timeout=10)
+    assert await page.locator("#results").is_hidden()
+    assert await page.evaluate("lastReport === null")
+    assert await page.locator("#result-list").inner_text() == ""
+    assert await page.locator("#api-list").inner_text() == ""
+    assert await page.locator("#raw-report").inner_text() == ""
+    release_create.set()
+    await page.wait_for_function("() => !scanSubmissionPending && document.getElementById('progress').hidden")
+    assert await page.locator("#authentication-failure").is_visible()
+    assert "AUTHENTICATION_BLOCKED" in await page.locator("#authentication-failure-details").inner_text()
+    assert "operator-approved" in await page.locator("#authentication-failure-guidance").inner_text()
+    assert await page.locator("#results").get_attribute("data-scan-id") == "ui-auth-failed"
+    assert await page.locator("#result-list .route-row").count() == 0
+    assert await page.locator("#api-list .api-endpoint").count() == 0
+    assert await page.locator("#failed-endpoint-list [data-failed-endpoint]").count() == 0
+    assert await page.evaluate("lastReport.summary.routes_discovered === 0 && lastReport.summary.routes_validated === 0 && lastReport.summary.routes_tested === 0 && lastReport.api_request_occurrences.length === 0")
+    assert "NOT_STARTED" in await page.locator("#coverage").inner_text()
+    assert "FAILED" in await page.locator("#summary").inner_text()
+    assert "identity.example.org" in await page.locator("#authentication-diagnostic-list").inner_text()
+    await page.unroute("**/api/scans", capture_failed_scan)
+    await page.unroute("**/api/scans/ui-auth-failed", failed_status)
+    await page.unroute("**/api/scans/ui-auth-failed/report", failed_report)
+    # Promise-controlled responses test all race boundaries. A delayed request
+    # from a superseded generation must not mutate newer UI or control state.
+    races = await page.evaluate("""async () => {
+      const originalFetch = window.fetch;
+      const failureReport = lastReport;
+      const json = value => new Response(JSON.stringify(value), {headers:{'content-type':'application/json'}});
+      const outcomes = {};
+      try {
+        for (const phase of ['status','report']) {
+          const generation = scanGeneration, scanId = `stale-${phase}`;
+          activeScanId = scanId;
+          let release, reached;
+          const waiting = new Promise(resolve => { reached = resolve; });
+          window.fetch = async url => {
+            if (phase === 'report' && !String(url).endsWith('/report')) return json({scan_id:scanId,state:'COMPLETED'});
+            return new Promise(resolve => { release = resolve; reached(); });
+          };
+          const pending = pollScan(scanId,generation).then(() => false,error => error instanceof StaleScanResponse);
+          await Promise.race([waiting,new Promise((_,reject) => setTimeout(() => reject(new Error(`Stale ${phase} fixture was not reached`)),10000))]);
+          ++scanGeneration;
+          activeScanId = 'current-generation';
+          release(json(phase === 'status' ? {scan_id:scanId,state:'COMPLETED'} : {...failureReport,scan_id:scanId,run_id:scanId}));
+          outcomes[phase] = await pending;
+          outcomes[`${phase}Render`] = renderReport({...failureReport,scan_id:scanId,run_id:scanId},{generation,scanId}) === false;
+          stopProgress(generation);
+          outcomes[`${phase}State`] = activeScanId === 'current-generation' && lastReport === failureReport;
+        }
+        const mismatchId = 'mismatched-report';
+        activeScanId = mismatchId;
+        window.fetch = async url => json(String(url).endsWith('/report') ? {...failureReport,scan_id:'another-scan',run_id:'another-scan'} : {scan_id:mismatchId,state:'COMPLETED'});
+        outcomes.mismatchedReport = await pollScan(mismatchId,scanGeneration).then(() => false,error => error.message.includes('identity mismatch'));
+        let releaseCancel, cancelReached;
+        const cancelWaiting = new Promise(resolve => { cancelReached = resolve; });
+        window.fetch = async () => new Promise(resolve => { releaseCancel = resolve; cancelReached(); });
+        byId('cancel-button').disabled = false;
+        byId('cancel-button').click();
+        await Promise.race([cancelWaiting,new Promise((_,reject) => setTimeout(() => reject(new Error('Stale cancel fixture was not reached')),10000))]);
+        ++scanGeneration;
+        activeScanId = 'new-cancel-generation';
+        byId('cancel-button').disabled = true;
+        toast.textContent = 'Current scan message';
+        releaseCancel(json({scan_id:mismatchId}));
+        await new Promise(resolve => setTimeout(resolve,0));
+        outcomes.cancel = toast.textContent === 'Current scan message' && byId('cancel-button').disabled;
+        activeScanId = null;
+        scanSubmissionPending = false;
+        let releaseCreate, createReached;
+        const createWaiting = new Promise(resolve => { createReached = resolve; });
+        window.fetch = async (url,options) => {
+          if (String(url) === '/api/scans' && options?.method === 'POST') return new Promise(resolve => { releaseCreate = resolve; createReached(); });
+          return originalFetch(url,options);
+        };
+        form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+        await Promise.race([createWaiting,new Promise((_,reject) => setTimeout(() => reject(new Error('Stale create fixture was not reached')),10000))]);
+        ++scanGeneration;
+        activeScanId = 'new-create-generation';
+        runButton.disabled = true;
+        scanSubmissionPending = true;
+        releaseCreate(json({scan_id:'stale-created-scan'}));
+        await new Promise(resolve => setTimeout(resolve,0));
+        outcomes.create = activeScanId === 'new-create-generation' && scanSubmissionPending && runButton.disabled && lastReport === null;
+      } finally {
+        window.fetch = originalFetch;
+        stopProgress(scanGeneration);
+        scanSubmissionPending = false;
+        runButton.disabled = buildIdentityMismatch;
+        runButton.querySelector('span').textContent = 'Run validation';
+        renderReport(failureReport);
+      }
+      return outcomes;
+    }""")
+    assert races and all(races.values()), races
+    await page.evaluate("""report => {
+      const denied = {...report.results[0],route_id:'forbidden',url:'https://portal.example.com/restricted',
+        route_name:'Restricted view',classification:'AUTHORIZATION_DENIED',page_load_status:'LOADED',status:403};
+      renderReport({...report,results:[denied,...report.results],route_inventory:[denied,...report.results]});
+      byId('result-filter').value = 'failure';
+      renderRows();
+    }""", saved_report)
+    assert await page.locator("#result-list .route-row").count() == 1
+    assert "AUTHORIZATION_DENIED" in await page.locator("#result-list").inner_text()
+    assert "403" in await page.locator("#result-list").inner_text()
+    assert await page.locator("#authentication-failure").is_hidden()
+    await page.evaluate("report => renderReport(report)", saved_report)
+    assert await page.locator("#authentication-failure").is_hidden()
+    assert await page.locator("#result-list .route-row").count() > 0
+
+
 async def main():
     base_url = os.getenv("PORTAL_VALIDATOR_URL", "http://host.docker.internal:18080")
     screenshot = os.getenv("UI_SCREENSHOT", "/reports/portal-validator.png")
@@ -37,7 +188,7 @@ async def main():
         await page.route("**/api/auth-profiles", profile_list_fixture)
         await page.goto(base_url, wait_until="networkidle")
         build_metadata = await page.evaluate("async () => (await fetch('/api/diagnostics/build', {cache:'no-store'})).json()")
-        assert build_metadata["version"] == "1.12.12"
+        assert build_metadata["version"] == "1.13.0"
         assert await page.evaluate("loadedFrontendSha256") == build_metadata["frontend_sha256"]
         assert await page.evaluate("loadedFrontendIntegrity.startsWith('sha256-')")
         assert "Frontend matched" in await page.locator("#build-summary").text_content()
@@ -529,7 +680,7 @@ async def main():
         assert await page.locator("#api-list .api-active-test-cell").text_content() == "NOT_ACTIVELY_TESTED"
         assert "one call was blocked" in await page.locator("#api-list .api-validation-reason-cell").text_content()
         await page.get_by_role("button", name="Show Unique APIs observed evidence").click()
-        assert await page.locator("#api-list tr").count() == 6
+        await page.wait_for_function("document.querySelectorAll('#api-list tr').length === 6")
         await page.locator("#api-lifecycle-filter").select_option("BLOCKED_BY_POLICY")
         assert await page.locator("#api-list tr").count() == 4
         await page.locator("#api-lifecycle-filter").select_option("all")
@@ -952,7 +1103,7 @@ async def main():
             await route.fulfill(status=200, content_type="application/json", body=json.dumps({"state": "COMPLETED", "validated": 1, "discovered": 1, "healthy": 1, "failed": 0, "warnings": 1}))
 
         async def fixture_report(route):
-            await route.fulfill(status=200, content_type="application/json", body=json.dumps(saved_report))
+            await route.fulfill(status=200, content_type="application/json", body=json.dumps({**saved_report, "scan_id": "ui-policy", "run_id": "ui-policy"}))
 
         await page.route("**/api/scans", capture_scan)
         await page.route("**/api/scans/ui-policy", completed_status)
@@ -1001,6 +1152,7 @@ async def main():
         await page.unroute("**/api/scans/ui-policy/report", fixture_report)
         await page.locator(".remove-operation").click()
         await page.locator("#read-post-settings > summary").click()
+        await check_scan_isolation(page, saved_report)
         for inventory_size in (100, 500, 1000):
             large_inventory = await page.evaluate("""
           (inventorySize) => {
@@ -1160,7 +1312,7 @@ async def main():
         ]
         assert not actionable_errors, actionable_errors
         assert profile_host_requests == []
-        print("UI_SMOKE_PASSED: manual approvals preserved across actual profile switches without host-metadata requests, effective/manual/operator approval counts and older-report compatibility, phase controls, traffic roles/lifecycle, definitive HTTP/network/resource failure table with timestamps and blocked/incomplete exclusion, POST form contract/counters, actual scan duration, blocked methods, columns/persistence, density, warnings, pointer/keyboard panel resizing and session persistence, expandable/fullscreen sanitized diagnostic copy/export, long diagnostics, independent scrolling/sticky headers/keyboard focus, resource filters, synchronized scrolling, 44 routes, 52 paginated routes, 1000 paginated API records, mobile layouts, strict CSP")
+        print("UI_SMOKE_PASSED: strict failed-auth zero-route/API rendering and immediate old-result clearing, stale create/status/report/cancel generation isolation and mismatched report rejection, manual approvals preserved across actual profile switches without host-metadata requests, effective/manual/operator approval counts and older-report compatibility, phase controls, traffic roles/lifecycle, definitive HTTP/network/resource failure table with timestamps and blocked/incomplete exclusion, POST form contract/counters, actual scan duration, blocked methods, columns/persistence, density, warnings, pointer/keyboard panel resizing and session persistence, expandable/fullscreen sanitized diagnostic copy/export, long diagnostics, independent scrolling/sticky headers/keyboard focus, resource filters, synchronized scrolling, 44 routes, 52 paginated routes, 1000 paginated API records, mobile layouts, strict CSP")
         await browser.close()
 
 

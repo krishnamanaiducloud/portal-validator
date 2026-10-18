@@ -127,7 +127,9 @@ async def test_anonymous_public_routes_and_natural_read_post_are_validated(publi
     assert all(item["page_load_status"] == "LOADED" and item["passed"] for item in routes.values())
     assert report["summary"]["healthy_routes"] == 3
     assert report["summary"]["failed_pages"] == report["summary"]["auth_issues"] == 0
-    assert "AUTHENTICATING" not in phases
+    lifecycle = [event["state"] for event in report["scan_lifecycle"]["events"]]
+    assert lifecycle == ["INITIALIZING", "AUTHENTICATING", "AUTHENTICATED", "APPLICATION_READY",
+                         "DISCOVERING_ROUTES", "VALIDATING_ROUTES", "COMPLETED"]
     posts = {item["endpoint"]: item for item in report["api_inventory"] if item["method"] == "POST"}
     assert set(posts) == {"/api/read-statistics", "/api/unapproved"}
     assert posts["/api/read-statistics"]["completed_calls"] == 1
@@ -144,15 +146,13 @@ async def test_access_barriers_are_not_login_requirements_or_application_health(
     await require_browser()
     origin, handler = public_access_site
     report = await execute_scan(scan_request(origin + path))
-    route = report["results"][0]
-    assert route["status"] == status
-    assert route["page_load_status"] == "LOADED"
-    assert route["classification"] == "ACCESS_RESTRICTED"
-    assert route["validation_status"] == route["authentication_status"] == "NOT_TESTED"
-    assert route["api_status"] == "NOT_TESTED"
-    assert "AUTHENTICATION_REQUIRED" not in json.dumps(route)
+    assert report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["http_status"] == status
+    assert report["authentication_error"]["category"] == "ACCESS_RESTRICTED"
+    assert report["results"] == report["route_inventory"] == []
+    assert "AUTHENTICATION_REQUIRED" not in json.dumps(report)
     assert report["summary"]["auth_issues"] == report["summary"]["failed_pages"] == 0
-    assert report["summary"]["coverage_status"] == "NONE"
+    assert report["coverage"]["discovery_status"] == "NOT_STARTED"
     assert handler.receipts[("GET", "/must-not-crawl")] == 0
 
 
@@ -161,9 +161,11 @@ async def test_real_unauthorized_document_still_requires_authentication(public_a
     await require_browser()
     origin, _handler = public_access_site
     report = await execute_scan(scan_request(origin + "/protected"))
-    assert report["results"][0]["classification"] == "AUTH_REQUIRED"
-    assert report["summary"]["auth_issues"] == 1
-    assert report["summary"]["coverage_status"] == "NONE"
+    assert report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["category"] == "AUTHENTICATION_FAILED"
+    assert report["authentication_error"]["http_status"] == 401
+    assert report["results"] == report["route_inventory"] == []
+    assert report["coverage"]["discovery_status"] == "NOT_STARTED"
 
 
 @pytest.mark.asyncio

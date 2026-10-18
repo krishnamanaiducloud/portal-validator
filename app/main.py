@@ -104,8 +104,10 @@ from app.reporting import (
     aggregate_resource_events,
     aggregate_resource_inventory,
     aggregate_security_recommendations,
+    apply_global_authentication_failure,
     build_coverage_dimensions,
     classify_page_result,
+    create_authentication_error,
     finding,
     refresh_route_api_health,
     navigation_coverage,
@@ -149,7 +151,7 @@ SECURITY_HEADERS = (
 COMMON_COUNTRY_CODE_SECOND_LEVEL_LABELS = frozenset({
     "ac", "co", "com", "edu", "gov", "net", "org",
 })
-REPORT_SCHEMA_VERSION = "2.5"
+REPORT_SCHEMA_VERSION = "2.6"
 
 
 @asynccontextmanager
@@ -841,6 +843,10 @@ async def _resolve_with_logging(host: str, req: ScanRequest, scan_id: str) -> li
     return addresses
 
 
+class _AuthenticationGateFailure(Exception):
+    """Unwind browser work without treating bootstrap as an application route."""
+
+
 async def execute_scan(
     req: ScanRequest,
     *,
@@ -855,8 +861,34 @@ async def execute_scan(
     scan_started = time.perf_counter()
     deadline = scan_started + req.total_timeout_ms / 1000
     preflight_timeout_reached = False
+    application_gate_confirmed = False
+    authentication_error: dict | None = None
+    authentication_approval_counts: dict[str, int] = {}
+    browser_context_count = 0
+    browser_page_count = 0
+    scan_lifecycle: dict[str, object] = {"state": "INITIALIZING", "events": []}
+    lifecycle_order = (
+        "INITIALIZING", "AUTHENTICATING", "AUTHENTICATED", "APPLICATION_READY",
+        "DISCOVERING_ROUTES", "VALIDATING_ROUTES", "COMPLETED",
+    )
 
     async def publish_progress(state: str, **values) -> None:
+        if scan_lifecycle["state"] == "FAILED" and state != "FAILED":
+            return
+        if state in {"FAILED", "CANCELLED", "PARTIAL"} or (
+            state in lifecycle_order and (
+                not scan_lifecycle["events"]
+                or lifecycle_order.index(state) > lifecycle_order.index(str(scan_lifecycle["state"]))
+            )
+        ):
+            scan_lifecycle["state"] = state
+            scan_lifecycle["events"].append({
+                "state": state, "elapsed_ms": max(0, round((time.perf_counter() - scan_started) * 1000)),
+            })
+        if state in {"DISCOVERING_ROUTES", "VALIDATING_ROUTES"} and not application_gate_confirmed:
+            raise RuntimeError("Application work cannot start before authentication/readiness")
+        if not application_gate_confirmed or state == "FAILED":
+            values.update(discovered=0, queued=0, validated=0, healthy=0, failed=0, warnings=0, current_route=None)
         if progress_callback is None:
             return
         values.setdefault("remaining_budget_ms", max(
@@ -876,6 +908,38 @@ async def execute_scan(
                 raise
             log_event(logging.WARNING, "SCAN_PROGRESS_DEADLINE_REACHED", scan_id=scan_id)
 
+    async def failed_authentication_report(error: dict, diagnostics: list[dict] | None = None) -> dict:
+        await publish_progress("FAILED")
+        elapsed = max(0, round((time.perf_counter() - scan_started) * 1000))
+        report = apply_global_authentication_failure({
+            "report_schema_version": REPORT_SCHEMA_VERSION,
+            "validator_version": VALIDATOR_VERSION,
+            "build_identity": build_diagnostics(), "scan_id": scan_id, "run_id": scan_id,
+            "target": sanitized_url(req.target), "scan_lifecycle": scan_lifecycle,
+            "scan_configuration": {
+                "authentication_mode": req.authentication.mode,
+                "authentication_host_count": len(req.authentication_hosts),
+                "readiness_selector_configured": bool(req.readiness_selector),
+                "readiness_event_configured": bool(req.readiness_event),
+                **authentication_approval_counts,
+            },
+            "scan_timing": {"total_scan_ms": elapsed, "browser_contexts": browser_context_count,
+                            "pages": browser_page_count},
+            "timings": {"browser_contexts": browser_context_count, "pages": browser_page_count},
+            "summary": {"total_scan_duration_ms": elapsed},
+            "safety": {"read_only_enforced": True, "mutations_enabled": False},
+        }, error, diagnostics=diagnostics or [])
+        log_event(logging.ERROR, "SCAN_AUTHENTICATION_FAILED", scan_id=scan_id,
+                  classification=error["category"], stage=error["stage"],
+                  http_status=error.get("http_status"))
+        return report
+
+    async def configuration_failure() -> dict:
+        return await failed_authentication_report(create_authentication_error(
+            "AUTHENTICATION_CONFIGURATION_ERROR", stage="INITIALIZING",
+            duration_ms=round((time.perf_counter() - scan_started) * 1000),
+        ))
+
     async def resolve_preflight(host: str) -> None:
         nonlocal preflight_timeout_reached
         if preflight_timeout_reached or time.perf_counter() >= deadline:
@@ -893,7 +957,7 @@ async def execute_scan(
             preflight_timeout_reached = True
             log_event(logging.WARNING, "SCAN_PREFLIGHT_DEADLINE_REACHED", scan_id=scan_id)
 
-    await publish_progress("STARTING")
+    await publish_progress("INITIALIZING")
     requested_target = req.target.strip()
     log_event(logging.INFO, "SCAN_STARTED", scan_id=scan_id, requested_url=requested_target)
     try:
@@ -902,9 +966,12 @@ async def execute_scan(
         log_event(logging.ERROR, "SCAN_FAILED", scan_id=scan_id, classification=exc.classification, error=exc.public_message)
         raise HTTPException(400, exc.public_message) from exc
     log_event(logging.INFO, "URL_VALIDATED", scan_id=scan_id, requested_url=requested_target, hostname=root_host)
-    effective_authentication_hosts, operator_authentication_endpoints, authentication_approval_counts = (
-        authentication_approvals_for_scan(req, root_host)
-    )
+    try:
+        effective_authentication_hosts, operator_authentication_endpoints, authentication_approval_counts = (
+            authentication_approvals_for_scan(req, root_host)
+        )
+    except HTTPException:
+        return await configuration_failure()
     req = req.model_copy(update={"authentication_hosts": effective_authentication_hosts})
     log_event(
         logging.INFO, "AUTHENTICATION_APPROVALS_APPLIED", scan_id=scan_id,
@@ -991,8 +1058,7 @@ async def execute_scan(
 
     # Anonymous validation does not imply that the destination needs credentials.
     # Actual login/SSO evidence is still evaluated after browser navigation.
-    if req.authentication.mode != "none":
-        await publish_progress("AUTHENTICATING")
+    await publish_progress("AUTHENTICATING")
     try:
         authentication_manager = build_authentication_manager(
             mode=req.authentication.mode,
@@ -1013,8 +1079,8 @@ async def execute_scan(
         )
         # Force configuration validation before Chromium starts.
         authentication_manager.configured_headers()
-    except AuthenticationConfigurationError as exc:
-        raise HTTPException(400, str(exc)) from exc
+    except AuthenticationConfigurationError:
+        return await configuration_failure()
     if req.authentication.mode == "bearer":
         log_event(
             logging.INFO,
@@ -1022,26 +1088,24 @@ async def execute_scan(
             scan_id=scan_id,
             credential_scope_host_count=authentication_manager.credential_host_count,
         )
-    mounted_state_path = (
-        storage_state_path(req.authentication.storage_profile)
-        if req.authentication.mode == "storage_state"
-        else None
-    )
-    runtime_session_store = RuntimeSessionStore()
-    state_path = (
-        runtime_session_store.seed(req.authentication.storage_profile, mounted_state_path)
-        if mounted_state_path is not None and req.authentication.storage_profile
-        else None
-    )
-    state_generation = state_path.stat().st_mtime_ns if state_path is not None else None
     try:
+        mounted_state_path = (
+            storage_state_path(req.authentication.storage_profile)
+            if req.authentication.mode == "storage_state" else None
+        )
+        runtime_session_store = RuntimeSessionStore()
+        state_path = (
+            runtime_session_store.seed(req.authentication.storage_profile, mounted_state_path)
+            if mounted_state_path is not None and req.authentication.storage_profile else None
+        )
+        state_generation = state_path.stat().st_mtime_ns if state_path is not None else None
         refresh_config = (
             load_refresh_config(req.authentication.storage_profile, AUTH_STATE_DIR)
             if req.authentication.mode == "storage_state" and req.authentication.storage_profile
             else None
         )
-    except (OSError, ValueError, json.JSONDecodeError, DestinationError) as exc:
-        raise HTTPException(400, "Session refresh configuration is invalid") from exc
+    except (HTTPException, OSError, ValueError, json.JSONDecodeError, DestinationError):
+        return await configuration_failure()
     preflight_duration_ms = round((time.perf_counter() - scan_started) * 1000)
     authentication_duration_ms = 0
     browser_startup_duration_ms = 0
@@ -1072,8 +1136,9 @@ async def execute_scan(
         None,
     )])
     seen: set[str] = set()
-    discovered_routes: set[str] = {requested_route}
-    queued_routes: set[str] = {requested_route}
+    # A bootstrap target is not discovered/tested application coverage yet.
+    discovered_routes: set[str] = set()
+    queued_routes: set[str] = set()
     depth_limited_routes: set[str] = set()
     queued_view_keys: dict[str, set[str]] = defaultdict(set)
     action_limited_routes: set[str] = set()
@@ -1134,6 +1199,8 @@ async def execute_scan(
         One scope/identity/depth policy applies to incremental menu observations
         and the final document/frame/popup collection alike.
         """
+        if not application_gate_confirmed or authentication_error is not None:
+            return []
         external_urls: set[str] = set()
         for route in routes:
             if (route.view_control and active_view_source
@@ -1253,11 +1320,94 @@ async def execute_scan(
     redirect_guards: list[RedirectResponseGuard] = []
     guard_install_tasks = weakref.WeakKeyDictionary()
 
-    await publish_progress(
-        "DISCOVERING",
-        discovered=len(discovered_routes),
-        queued=len(queue),
-    )
+    def reject_global_authentication(
+        classification: str | None, *, status: int | None, endpoint: str,
+        stage: str = "AUTHENTICATING", duration_ms: int | None = None,
+        method: str | None = None, policy_decision: str | None = None,
+    ) -> None:
+        nonlocal authentication_error
+        category = classification or "APPLICATION_NOT_READY"
+        if category in {"PASS", "APPLICATION_BOOTSTRAP_PENDING"}:
+            category = "APPLICATION_NOT_READY"
+        elif category in {"AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "MFA_REQUIRED", "AUTH_FAILED"}:
+            category = (
+                "SESSION_EXPIRED" if application_gate_confirmed and req.authentication.mode != "none"
+                else "AUTHENTICATION_FAILED"
+            )
+        elif category in {"AUTH_TIMEOUT", "TIMEOUT"}:
+            category = "AUTHENTICATION_TIMEOUT"
+        destination_host = normalized_host(urlparse(endpoint).hostname or "")
+        if (
+            destination_host in req.authentication_hosts
+            and not url_in_scan_scope(endpoint, root_host, req.allow_subdomains, approved_portal_hosts)
+            and (
+                status is not None and status >= 500
+                or category in {"HTTP_ERROR", "DNS_ERROR", "NETWORK_ERROR", "NAVIGATION_ERROR"}
+            )
+            and category not in {"AUTHENTICATION_BLOCKED", "TLS_ERROR", "AUTHENTICATION_CONFIGURATION_ERROR"}
+            and (status is None or status >= 500)
+        ):
+            category = "IDENTITY_PROVIDER_UNAVAILABLE"
+        evidence = next((
+            item for item in reversed(authentication_diagnostics)
+            if item.get("affects_authentication")
+        ), {}) if category == "AUTHENTICATION_BLOCKED" else {}
+        authentication_error = create_authentication_error(
+            category, stage=stage, http_status=evidence.get("http_status", status),
+            method=evidence.get("method") or method or "GET", endpoint=evidence.get("endpoint") or endpoint,
+            policy_decision=evidence.get("policy_decision") or evidence.get("policy_reason") or policy_decision,
+            duration_ms=duration_ms if duration_ms is not None else round((time.perf_counter() - scan_started) * 1000),
+        )
+        raise _AuthenticationGateFailure
+
+    def rejected_session_response() -> dict | None:
+        # The application must accept the session, not merely return a static
+        # HTML shell. Optional/public peripheral 401s are not proof of expiry;
+        # explicit session-required APIs and scoped auth exchanges are evidence.
+        return next((event for event in reversed(scan_api_events) if (
+            event.get("status") == 401 and not event.get("blocked_by_validator")
+            and event.get("phase") != "SESSION_REFRESH"
+            and (
+                event.get("importance") == "AUTHENTICATION"
+                or req.authentication.mode != "none" and event.get("importance") == "REQUIRED"
+            )
+        )), None)
+
+    def require_current_session() -> None:
+        """Stop further application work as soon as auth evidence is rejected."""
+        denied = next((item for item in reversed(authentication_diagnostics)
+                       if item.get("affects_authentication")), None)
+        if denied is not None:
+            reject_global_authentication(
+                "AUTHENTICATION_BLOCKED", status=denied.get("http_status"),
+                endpoint=denied.get("endpoint") or requested_target,
+            )
+        rejected = rejected_session_response()
+        if rejected is not None:
+            reject_global_authentication(
+                "SESSION_EXPIRED" if application_gate_confirmed or req.authentication.mode == "storage_state"
+                else "AUTHENTICATION_FAILED",
+                status=401, endpoint=rejected.get("url") or requested_target,
+                method=rejected.get("method"), policy_decision=rejected.get("policy_decision"),
+            )
+
+    def authentication_request_diagnostics() -> list[dict]:
+        evidence = list(authentication_diagnostics)
+        for event in scan_api_events:
+            if (
+                event.get("importance") == "AUTHENTICATION"
+                or event.get("phase") in {"AUTHENTICATION", "SESSION_REFRESH"}
+            ):
+                evidence.append({
+                    "category": (authentication_error or {}).get("category", "AUTHENTICATION_FAILED"),
+                    "stage": (authentication_error or {}).get("stage", "AUTHENTICATING"),
+                    "http_status": event.get("status"), "method": event.get("method"),
+                    "endpoint": event.get("url") or event.get("endpoint"),
+                    "policy_decision": event.get("policy_decision") or event.get("block_reason"),
+                    "duration_ms": event.get("duration_ms"),
+                })
+        return evidence
+
     @asynccontextmanager
     async def scan_deadline_scope():
         nonlocal total_timeout_reached, cancellation_requested
@@ -1273,6 +1423,9 @@ async def execute_scan(
             if active_route_identity is not None:
                 seen.discard(active_route_identity)
             log_event(logging.INFO, "SCAN_CANCELLED_DURING_BOOTSTRAP", scan_id=scan_id)
+        except _AuthenticationGateFailure:
+            # Browser/context cleanup completes before the failed, empty report.
+            pass
         except TimeoutError:
             if not budget.expired() and time.perf_counter() < deadline:
                 raise
@@ -1679,6 +1832,9 @@ async def execute_scan(
                         auth_diagnostic.update({
                             "route_id": route_id, "route_activation_id": activation_id,
                             "phase": phase, "policy_reason": reason.upper(),
+                            "method": request.method, "endpoint": safe_api_identity(request.url)[0],
+                            "policy_decision": "BLOCK",
+                            "duration_ms": (api_event or {}).get("duration_ms", 0),
                         })
                         if auth_diagnostic not in authentication_diagnostics:
                             authentication_diagnostics.append(auth_diagnostic)
@@ -2476,7 +2632,7 @@ async def execute_scan(
                     page = browser_pages.get(selected_page_key, primary_page)
                     active_browser_page_key = browser_page_keys.get(request_identity(page))
                     await publish_progress(
-                        "VALIDATING",
+                        "VALIDATING_ROUTES" if application_gate_confirmed else "AUTHENTICATING",
                         discovered=len(discovered_routes),
                         queued=len(queue) + 1,
                         validated=len(results),
@@ -2501,11 +2657,11 @@ async def execute_scan(
                         document_response_for(page)
                         if navigation_mode == POPUP_NAVIGATION else None
                     )
-                    observation_phase = (
-                        "APPLICATION_BOOTSTRAP"
-                        if not results and depth == 0
-                        else "ROUTE_VALIDATION"
-                    )
+                    # Passive bootstrap observation is not an API health check.
+                    # Only protocol-approved traffic is authentication traffic;
+                    # ordinary application calls retain their owning view when
+                    # the gate succeeds, and are withheld entirely if it fails.
+                    observation_phase = "ROUTE_VALIDATION" if application_gate_confirmed else "APPLICATION_BOOTSTRAP"
                     popup_origins[request_identity(page)] = (
                         active_route_id, active_route_activation_id, observation_phase,
                     )
@@ -2728,8 +2884,6 @@ async def execute_scan(
                                             urlparse(final_raw_url).hostname or ""
                                         ),
                                     )
-                                title = sanitize_text(await retry_dom_operation(dom_target, dom_target.title), limit=512)
-                                name_evidence = await collect_route_name_evidence(dom_target)
                                 final_in_scope = url_in_scan_scope(
                                     final_raw_url,
                                     root_host,
@@ -2757,6 +2911,13 @@ async def execute_scan(
                                     authentication_classification = "AUTH_TIMEOUT"
                                 if active_route_activation_id in authentication_denials:
                                     authentication_classification = "AUTHENTICATION_BLOCKED"
+                                if (
+                                    application_gate_confirmed and status == 403 and final_in_scope
+                                    and not password_form and not mfa_form
+                                    and authentication_classification != "AUTHENTICATION_BLOCKED"
+                                    and not auth_protocol_signal(final_raw_url, boundary_only=True)
+                                ):
+                                    authentication_classification = "AUTHORIZATION_DENIED"
                                 log_event(
                                     logging.INFO,
                                     (
@@ -2787,7 +2948,10 @@ async def execute_scan(
                                     browser_lifecycle.advance("SESSION_ESTABLISHED")
                                     browser_lifecycle.advance("APPLICATION_BOOTSTRAP")
                                 else:
-                                    browser_lifecycle.fail(authentication_classification or "AUTHENTICATION_INCOMPLETE")
+                                    browser_lifecycle.fail(
+                                        authentication_classification or "AUTHENTICATION_INCOMPLETE",
+                                        stage="ROUTE_VALIDATION" if authentication_classification == "AUTHORIZATION_DENIED" else None,
+                                    )
                                 render_start_ms = round((time.perf_counter() - started) * 1000)
                                 readiness_started = time.perf_counter()
                                 readiness_deadline = min(
@@ -2868,6 +3032,37 @@ async def execute_scan(
                                     configured_readiness=bool(req.readiness_selector or req.readiness_event),
                                     authentication_status=authentication_classification,
                                 )
+                                rejected_session = rejected_session_response()
+                                if rejected_session is not None:
+                                    reject_global_authentication(
+                                        "SESSION_EXPIRED" if application_gate_confirmed or req.authentication.mode == "storage_state"
+                                        else "AUTHENTICATION_FAILED",
+                                        status=401, endpoint=rejected_session.get("url") or final_raw_url,
+                                        method=rejected_session.get("method"),
+                                        policy_decision=rejected_session.get("policy_decision"),
+                                        duration_ms=round((time.perf_counter() - started) * 1000),
+                                    )
+                                if not application_gate_confirmed:
+                                    if not application_ready:
+                                        reject_global_authentication(
+                                            authentication_classification, status=status, endpoint=final_raw_url,
+                                            stage="APPLICATION_BOOTSTRAP" if authentication_classification == "PASS" else "AUTHENTICATING",
+                                            duration_ms=round((time.perf_counter() - started) * 1000),
+                                        )
+                                    await publish_progress("AUTHENTICATED")
+                                    await publish_progress("APPLICATION_READY")
+                                    application_gate_confirmed = True
+                                    discovered_routes.add(route_key)
+                                    queued_routes.add(route_key)
+                                    await publish_progress("DISCOVERING_ROUTES", discovered=len(discovered_routes), queued=len(queue))
+                                elif authentication_classification in {
+                                    "AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "AUTH_FAILED", "AUTH_TIMEOUT",
+                                    "SESSION_EXPIRED", "MFA_REQUIRED", "AUTHENTICATION_BLOCKED",
+                                }:
+                                    reject_global_authentication(
+                                        authentication_classification, status=status, endpoint=final_raw_url,
+                                        duration_ms=round((time.perf_counter() - started) * 1000),
+                                    )
                                 if application_ready and navigation_mode == DOCUMENT_NAVIGATION:
                                     # Only alias an actually observed successful document
                                     # redirect, never infer that '/' and 'index.html' are
@@ -2907,30 +3102,6 @@ async def execute_scan(
                                     for frame in page.frames
                                     if frame.url.startswith(("http://", "https://"))
                                 ]
-                                if req.check_links and final_in_scope and not application_ready:
-                                    # Readiness gates activation, not passive evidence.
-                                    # Preserve already rendered in-scope destinations
-                                    # without opening menus, clicking tabs, scrolling,
-                                    # following login links or sending extra requests.
-                                    observation_phase = "DISCOVERY"
-                                    discovery_started = time.perf_counter()
-                                    passive_routes = await discover_page_routes(page, 0)
-                                    external_links[:] = sorted(set(external_links).union(
-                                        enqueue_discovered_routes(passive_routes, depth, final_raw_url),
-                                    ))
-                                    navigation_actions["passive_routes_observed"] = len(passive_routes)
-                                    navigation_actions["activation_block_reason"] = (
-                                        authentication_classification
-                                        if authentication_classification != "PASS" else "APPLICATION_NOT_READY"
-                                    )
-                                    route_discovery_ms = round((time.perf_counter() - discovery_started) * 1000)
-                                    discovery_duration_ms += route_discovery_ms
-                                    observation_phase = "ROUTE_VALIDATION"
-                                    log_event(
-                                        logging.INFO, "PASSIVE_NAVIGATION_RETAINED", scan_id=scan_id,
-                                        routes_observed=len(passive_routes), routes_discovered=len(discovered_routes),
-                                        reason=navigation_actions["activation_block_reason"],
-                                    )
                                 if (
                                     req.check_links
                                     and final_in_scope
@@ -2941,19 +3112,21 @@ async def execute_scan(
                                     browser_lifecycle.advance("ROUTE_DISCOVERY")
                                     discovery_started = time.perf_counter()
                                     await publish_progress(
-                                        "DISCOVERING",
+                                        "DISCOVERING_ROUTES",
                                         discovered=len(discovered_routes),
                                         queued=len(queue),
                                         validated=len(results),
                                         current_route=active_route_id,
                                     )
                                     async def retain_panel_routes(routes):
+                                        require_current_session()
                                         external_links[:] = sorted(set(external_links).union(
                                             enqueue_discovered_routes(routes, depth, final_raw_url),
                                         ))
 
                                     async def observe_discovery_panel(target=page):
-                                        return await wait_for_render_settle(
+                                        require_current_session()
+                                        snapshot = await wait_for_render_settle(
                                             target,
                                             settle_ms=req.render_settle_ms,
                                             maximum_ms=max(0, round((route_deadline - time.perf_counter()) * 1000)),
@@ -2961,6 +3134,8 @@ async def execute_scan(
                                             minimum_observation_ms=req.min_observation_ms,
                                             network_quiet_ms=req.network_quiet_ms,
                                         )
+                                        require_current_session()
+                                        return snapshot
 
                                     # A zero action budget forbids activation, not
                                     # observation or accounting of unvisited controls.
@@ -3069,6 +3244,8 @@ async def execute_scan(
                                     )
                                     discovery_duration_ms += route_discovery_ms
                                     observation_phase = "ROUTE_VALIDATION"
+                        except _AuthenticationGateFailure:
+                            raise
                         except Exception as exc:
                             if isinstance(exc, TimeoutError) and observation_phase == "DISCOVERY":
                                 browser_lifecycle.fail("DISCOVERY_TIMEOUT")
@@ -3137,6 +3314,7 @@ async def execute_scan(
 
                     # Discovery may itself reveal a delayed sign-in exchange.
                     # Reconcile that evidence before classifying this route.
+                    require_current_session()
                     if active_route_activation_id in authentication_denials:
                         authentication_classification = "AUTHENTICATION_BLOCKED"
                         application_ready = False
@@ -3156,7 +3334,19 @@ async def execute_scan(
                             hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
                         )
 
+                    if not application_gate_confirmed or authentication_classification in {
+                        "AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "AUTH_FAILED", "AUTH_TIMEOUT",
+                        "SESSION_EXPIRED", "MFA_REQUIRED", "AUTHENTICATION_BLOCKED",
+                    }:
+                        reject_global_authentication(
+                            authentication_classification or error_classification,
+                            status=status, endpoint=final_raw_url,
+                            stage="APPLICATION_BOOTSTRAP" if authentication_classification == "PASS" else "AUTHENTICATING",
+                            duration_ms=round((time.perf_counter() - started) * 1000),
+                        )
+
                     health_validation_started = time.perf_counter()
+                    await publish_progress("VALIDATING_ROUTES", discovered=len(discovered_routes), validated=len(results))
                     if browser_lifecycle.failed_stage is None:
                         browser_lifecycle.advance("ROUTE_VALIDATION")
                     elapsed = round((time.perf_counter() - started) * 1000)
@@ -3538,7 +3728,7 @@ async def execute_scan(
                     results.append(result)
                     active_route_identity = None
                     await publish_progress(
-                        "VALIDATING",
+                        "VALIDATING_ROUTES",
                         discovered=len(discovered_routes),
                         queued=len(queue),
                         validated=len(results),
@@ -3666,6 +3856,31 @@ async def execute_scan(
                     await asyncio.gather(*tuple(guard_install_tasks.values()), return_exceptions=True)
                 for guard in redirect_guards:
                     await guard.close()
+
+    if authentication_error is None and any(item.get("affects_authentication") for item in authentication_diagnostics):
+        evidence = next(item for item in reversed(authentication_diagnostics) if item.get("affects_authentication"))
+        authentication_error = create_authentication_error(
+            "AUTHENTICATION_BLOCKED", stage="AUTHENTICATING", method=evidence.get("method"),
+            endpoint=evidence.get("endpoint"), policy_decision=evidence.get("policy_decision") or evidence.get("policy_reason"),
+            duration_ms=round((time.perf_counter() - scan_started) * 1000),
+        )
+    if authentication_error is None and not application_gate_confirmed and not cancellation_requested:
+        authentication_error = create_authentication_error(
+            "AUTHENTICATION_TIMEOUT" if total_timeout_reached or preflight_timeout_reached else "APPLICATION_NOT_READY",
+            stage="AUTHENTICATING", endpoint=requested_target,
+            duration_ms=round((time.perf_counter() - scan_started) * 1000),
+        )
+    rejected_session = rejected_session_response()
+    if authentication_error is None and rejected_session is not None:
+        authentication_error = create_authentication_error(
+            "SESSION_EXPIRED" if application_gate_confirmed or req.authentication.mode == "storage_state"
+            else "AUTHENTICATION_FAILED",
+            stage="AUTHENTICATING", http_status=401, method=rejected_session.get("method"),
+            endpoint=rejected_session.get("url"), policy_decision=rejected_session.get("policy_decision"),
+            duration_ms=round((time.perf_counter() - scan_started) * 1000),
+        )
+    if authentication_error is not None:
+        return await failed_authentication_report(authentication_error, authentication_request_diagnostics())
 
     await publish_progress(
         "FINALIZING",
@@ -4142,12 +4357,26 @@ async def execute_scan(
     summary["total_scan_duration_ms"] = round((time.perf_counter() - scan_started) * 1000)
     scan_timing["finalization_ms"] = summary["finalization_duration_ms"]
     scan_timing["total_scan_ms"] = summary["total_scan_duration_ms"]
+    report["scan_status"] = (
+        "CANCELLED" if cancellation_requested else
+        "PARTIAL" if summary.get("execution_status") not in {None, "COMPLETE", "COMPLETED"} else "COMPLETED"
+    )
+    report["outcome"] = report["scan_status"]
+    report["authentication_status"] = "AUTHENTICATED" if application_gate_confirmed else "NOT_STARTED"
+    summary["routes_tested"] = sum(item.get("page_load_status") != "NOT_TESTED" for item in results)
+    report["coverage"]["routes_tested"] = summary["routes_tested"]
+    await publish_progress(str(report["scan_status"]))
+    report["scan_lifecycle"] = scan_lifecycle
     return report
 
 
 async def _run_scan_job(job: ScanJob, req: ScanRequest) -> None:
     async def update_job(state: str, **values) -> None:
-        job.update(state, **values)
+        # Publish terminal state only after attaching the final report below.
+        # Otherwise a concurrent status poll can see FAILED/report_ready=false
+        # and discard the actionable authentication failure report.
+        if state not in TERMINAL_STATES:
+            job.update(state, **values)
 
     try:
         report = await execute_scan(
@@ -4160,6 +4389,7 @@ async def _run_scan_job(job: ScanJob, req: ScanRequest) -> None:
         summary = report.get("summary", {})
         termination_reason = summary.get("termination_reason")
         terminal_state = (
+            "FAILED" if report.get("scan_status") == "FAILED" else
             "CANCELLED" if termination_reason == "USER_CANCELLED" else
             "COMPLETED" if summary.get("scan_completeness") == "COMPLETE" else
             "PARTIAL"
@@ -4214,17 +4444,40 @@ async def create_scan(req: ScanRequest):
         root_host, _ = validate_http_url(req.target.strip())
     except DestinationError as exc:
         raise HTTPException(400, exc.public_message) from exc
-    authentication_approvals_for_scan(req, root_host)
-    # Reject unusable submitted credentials/profiles before queueing a scan.
+    configuration_error = None
+    # Retain an actionable failed job for unusable credentials/profiles without
+    # queueing browser work, using the same scan-ID/report contract as runtime failures.
     # A profile never implicitly approves any identity-provider destination.
-    auth_headers(req.authentication)
-    if req.authentication.mode == "storage_state":
-        storage_state_path(req.authentication.storage_profile)
+    try:
+        authentication_approvals_for_scan(req, root_host)
+        auth_headers(req.authentication)
+        if req.authentication.mode == "storage_state":
+            storage_state_path(req.authentication.storage_profile)
+    except (HTTPException, AuthenticationConfigurationError, OSError, ValueError):
+        configuration_error = create_authentication_error(
+            "AUTHENTICATION_CONFIGURATION_ERROR", stage="INITIALIZING", duration_ms=0,
+        )
     scan_id = str(uuid.uuid4())
     try:
         job = SCAN_REGISTRY.create(scan_id)
     except ScanCapacityError as exc:
         raise HTTPException(503, "Scan capacity is currently exhausted; retry later") from exc
+    if configuration_error is not None:
+        job.report = apply_global_authentication_failure({
+            "report_schema_version": REPORT_SCHEMA_VERSION, "validator_version": VALIDATOR_VERSION,
+            "build_identity": build_diagnostics(), "scan_id": scan_id, "run_id": scan_id,
+            "target": sanitized_url(req.target),
+            "scan_lifecycle": {"state": "FAILED", "events": [
+                {"state": "INITIALIZING", "elapsed_ms": 0}, {"state": "FAILED", "elapsed_ms": 0},
+            ]},
+        }, configuration_error)
+        job.update("FAILED")
+        log_event(logging.WARNING, "SCAN_AUTHENTICATION_FAILED", scan_id=scan_id,
+                  classification="AUTHENTICATION_CONFIGURATION_ERROR", stage="INITIALIZING")
+        return {
+            "scan_id": scan_id, "state": "FAILED", "status_url": f"/api/scans/{scan_id}",
+            "report_url": f"/api/scans/{scan_id}/report", "cancel_url": f"/api/scans/{scan_id}/cancel",
+        }
     job.task = asyncio.create_task(_run_scan_job(job, req.model_copy(deep=True)), name=f"portal-scan-{scan_id}")
     log_event(logging.INFO, "SCAN_CREATED", scan_id=scan_id)
     return {

@@ -110,11 +110,10 @@ async def test_route_timeout_bounds_a_real_main_document_request(production_spa,
 
     monkeypatch.setattr(handler, "do_GET", delayed_get)
     report = await execute_scan(scan_request(origin, max_pages=1))
-    result = report["results"][0]
-    assert result["classification"] == "TIMEOUT"
-    assert result["page_load_status"] == "FAILED_TO_LOAD"
-    assert result["validation_status"] == "NOT_TESTED"
-    assert 800 <= result["total_validation_ms"] < 1800
+    assert report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["category"] == "AUTHENTICATION_TIMEOUT"
+    assert report["results"] == report["route_inventory"] == []
+    assert 800 <= report["authentication_error"]["duration_ms"] < 1800
 
 
 @pytest.mark.asyncio
@@ -125,7 +124,7 @@ async def test_total_deadline_preserves_completed_results_and_timeout_counters(p
     completed_before_deadline = []
 
     async def progress(state, **values):
-        if state == "VALIDATING" and values.get("validated") == 1 and not completed_before_deadline:
+        if state == "VALIDATING_ROUTES" and values.get("validated") == 1 and not completed_before_deadline:
             completed_before_deadline.append(True)
             # Model an expensive downstream observer after a completed route;
             # even non-navigation work must respect the absolute scan deadline.
@@ -166,9 +165,10 @@ async def test_total_budget_starts_before_configuration_and_browser_launch(produ
     started = time.perf_counter()
     report = await execute_scan(scan_request(origin, total_timeout_ms=1000))
     assert time.perf_counter() - started < 2.5
-    assert report["summary"]["termination_reason"] == "SCAN_TIMEOUT"
+    assert report["summary"]["termination_reason"] == "AUTHENTICATION_TIMEOUT"
+    assert report["scan_status"] == "FAILED"
     assert report["summary"]["routes_validated"] == 0
-    assert report["summary"]["routes_not_tested"] == 1
+    assert report["summary"]["routes_not_tested"] == 0
     assert report["timings"]["browser_contexts"] == 0
 
 
