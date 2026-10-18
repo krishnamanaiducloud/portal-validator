@@ -147,7 +147,9 @@ if os.getenv("RELEASE_SMOKE_DEBUG") == "true":
 process = subprocess.Popen(command, stdout=log_stream, stderr=subprocess.STDOUT)
 startup_started = time.monotonic()
 try:
-    deadline = time.monotonic() + 60
+    startup_timeout = int(os.getenv("RELEASE_SMOKE_STARTUP_TIMEOUT", "60"))
+    assert 30 <= startup_timeout <= 600, "Invalid release-test startup deadline"
+    deadline = time.monotonic() + startup_timeout
     while True:
         try:
             with urlopen("http://127.0.0.1:8080/healthz?opaque=release-fixture-secret", timeout=2) as response:
