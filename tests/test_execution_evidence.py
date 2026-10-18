@@ -279,6 +279,14 @@ async def test_configured_readiness_observes_condition_without_inventing_load_fa
         render_settle_ms=100, min_observation_ms=100, network_quiet_ms=100,
         max_navigation_actions=0, max_discovery_scrolls=0, check_security_headers=False,
     ))
+    if not ready:
+        assert report["scan_status"] == "FAILED"
+        assert report["authentication_error"]["category"] == "APPLICATION_NOT_READY"
+        assert report["results"] == report["route_inventory"] == []
+        assert report["summary"]["routes_discovered"] == 0
+        assert report["coverage"]["discovery_status"] == "NOT_STARTED"
+        assert report["scan_configuration"]["readiness_selector_configured"] is True
+        return
     result = report["results"][0]
     assert result["page_load_status"] == "LOADED"
     assert result["render_health"]["configured_readiness_met"] is ready

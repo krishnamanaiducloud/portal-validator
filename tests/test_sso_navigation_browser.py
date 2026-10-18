@@ -305,9 +305,12 @@ async def test_real_cross_origin_oauth_saml_callback_preserves_session_and_crawl
         assert any(role == "portal" and method == "POST" and "portal_session=" in cookies
                    for role, method, _, cookies in requests)
     else:
-        expected = "SESSION_EXPIRED" if session == "expired" else "AUTH_REQUIRED"
-        assert report["results"][0]["authentication_status"] == expected
-        assert report["summary"]["coverage_status"] == "NONE"
+        expected = "SESSION_EXPIRED" if session == "expired" else "AUTHENTICATION_FAILED"
+        assert report["scan_status"] == "FAILED"
+        assert report["authentication_error"]["category"] == expected
+        assert report["results"] == report["route_inventory"] == []
+        assert report["summary"]["routes_discovered"] == 0
+        assert report["coverage"]["discovery_status"] == "NOT_STARTED"
         assert not any(role == "saml" and method == "POST" for role, method, _, _ in requests)
 
 
@@ -325,8 +328,11 @@ async def test_real_authentication_post_to_unapproved_identity_host_stays_blocke
         authentication={"mode": "storage_state", "storage_profile": "approved"},
     ))
     assert not any(role == "saml" and method == "POST" for role, method, _, _ in requests)
-    auth = next(item for item in report["api_inventory"] if item["endpoint"] == "/saml/consume")
-    assert auth["blocked_calls"] == 1 and auth["allowed_calls"] == 0
+    assert report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["category"] == "AUTHENTICATION_BLOCKED"
+    assert report["results"] == report["api_inventory"] == []
+    assert any(item["endpoint"].endswith("/saml/consume") and item["method"] == "POST"
+               for item in report["authentication_diagnostics"])
     assert not report["summary"]["coverage_complete"]
 
 
@@ -357,21 +363,23 @@ async def test_real_oauth_fetch_requires_separate_explicit_authentication_approv
         authentication_hosts=["localhost"] if approved else [],
     ))
     assert sum(role == "oauth" and method == "POST" for role, method, _, _ in requests) == int(approved)
-    event = next(item for item in report["api_inventory"] if item["endpoint"] == "/oauth/token")
-    assert event["allowed_calls"] == int(approved) and event["blocked_calls"] == int(not approved)
     if approved:
+        event = next(item for item in report["api_inventory"] if item["endpoint"] == "/oauth/token")
+        assert event["allowed_calls"] == 1 and event["blocked_calls"] == 0
         assert event["policies"] == ["AUTH_FLOW"] and "localhost" in resolved
         assert report["results"][0]["authentication_status"] == "PASS"
         assert report["authentication_diagnostics"] == []
     else:
-        assert report["results"][0]["authentication_status"] == "AUTHENTICATION_BLOCKED"
+        assert report["scan_status"] == "FAILED"
+        assert report["authentication_error"]["category"] == "AUTHENTICATION_BLOCKED"
+        assert report["results"] == report["route_inventory"] == report["api_inventory"] == []
         assert not report["summary"]["coverage_complete"]
-        diagnostic = report["results"][0]["authentication_diagnostics"][0]
+        diagnostic = report["authentication_diagnostics"][0]
         assert diagnostic["reason"] == "AUTHENTICATION_HOSTS_REQUIRED"
         assert diagnostic["destination_host"] == "localhost"
         assert diagnostic["affects_authentication"]
         assert report["authentication_diagnostics"] == [diagnostic]
-        assert report["api_request_occurrences"][0]["authentication_diagnostic"] == diagnostic
+        assert report["api_request_occurrences"] == []
     assert "fixture-private" not in json.dumps(report)
 
 
@@ -389,11 +397,11 @@ async def test_denied_oauth_during_bootstrap_cannot_prove_authenticated_shell(ss
         authentication_hosts=hosts,
     ))
     assert not any(role == "oauth" and method == "POST" for role, method, _, _ in requests)
-    result = report["results"][0]
-    assert result["authentication_status"] == "AUTHENTICATION_BLOCKED"
-    assert not result["application_ready"]
+    assert report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["category"] == "AUTHENTICATION_BLOCKED"
+    assert report["results"] == report["route_inventory"] == []
     assert not report["summary"]["coverage_complete"]
-    assert result["authentication_diagnostics"][0]["reason"] == expected
+    assert report["authentication_diagnostics"][0]["reason"] == expected
     assert "fixture-private" not in json.dumps(report)
 
 
@@ -415,12 +423,11 @@ async def test_denied_oauth_during_final_drain_reconciles_authentication_coverag
         min_observation_ms=0, render_settle_ms=0,
     ))
     assert not any(role == "oauth" and method == "POST" for role, method, _, _ in requests)
-    result = report["results"][0]
-    assert result["authentication_status"] == result["classification"] == "AUTHENTICATION_BLOCKED"
-    assert not result["application_ready"]
+    assert report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["category"] == "AUTHENTICATION_BLOCKED"
+    assert report["results"] == report["route_inventory"] == report["api_inventory"] == []
     assert not report["summary"]["coverage_complete"]
-    assert result["authentication_diagnostics"][0]["reason"] == "AUTHENTICATION_HOSTS_REQUIRED"
-    assert report["authentication_diagnostics"] == result["authentication_diagnostics"]
+    assert report["authentication_diagnostics"][0]["reason"] == "AUTHENTICATION_HOSTS_REQUIRED"
     assert "fixture-private" not in json.dumps(report)
 
 
@@ -462,7 +469,7 @@ async def test_popup_authentication_post_redirect_keeps_the_approved_sso_boundar
     ))
     assert sum(role == "saml" and method == "POST" for role, method, _, _ in requests) == int(approved), (
         [(role, method, path) for role, method, path, _ in requests],
-        report["results"][0].get("failed_resources"),
+        report.get("authentication_error"),
     )
     assert sum(role == "portal" and method == "POST" and path == "/callback"
                for role, method, path, _ in requests) == int(approved)
@@ -470,9 +477,12 @@ async def test_popup_authentication_post_redirect_keeps_the_approved_sso_boundar
         assert any(role == "portal" and method == "GET" and "portal_session=" in cookies
                    for role, method, _, cookies in requests)
         assert all(item["blocked_calls"] == 0 for item in report["api_inventory"])
+        assert report["results"][0]["page_load_status"] == "LOADED"
     else:
-        assert any(item["blocked_calls"] == 1 for item in report["api_inventory"])
-    assert report["results"][0]["page_load_status"] == "LOADED"
+        assert report["scan_status"] == "FAILED"
+        assert report["authentication_error"]["category"] == "AUTHENTICATION_BLOCKED"
+        assert report["results"] == report["api_inventory"] == []
+        assert report["authentication_diagnostics"]
     assert "fixture-private" not in json.dumps(report)
 
 
@@ -522,7 +532,9 @@ async def test_real_navigation_to_metadata_remains_ssrf_blocked(sso_portal):
     origins, _, resolved, _ = sso_portal
     report = await execute_scan(configuration(origins["portal"] + "/unsafe", max_pages=1))
     assert "169.254.169.254" in resolved
-    assert report["results"][0]["classification"] == "NETWORK_ERROR"
+    assert report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["category"] == "NETWORK_ERROR"
+    assert report["results"] == report["route_inventory"] == []
     assert not report["summary"]["coverage_complete"]
 
 
@@ -567,7 +579,9 @@ async def test_actual_configured_authorization_header_does_not_follow_unapproved
         authentication={"mode": "bearer", "token": "fixture-private-bearer"},
     ))
     assert not any(role == "oauth" for role, _, _, _ in requests)
-    assert report["results"][0]["classification"] == "NAVIGATION_ERROR"
+    assert report["scan_status"] == "FAILED"
+    assert report["authentication_error"]["category"] == "NAVIGATION_ERROR"
+    assert report["results"] == report["route_inventory"] == []
     assert "fixture-private" not in json.dumps(report)
 
 
