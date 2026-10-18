@@ -404,6 +404,10 @@ async def main():
         assert await page.locator("#failed-endpoint-list tr").count() == 1
         assert "/query" in await page.locator("#failed-endpoint-list").text_content()
         assert "/blocked/" not in await page.locator("#failed-endpoint-list").text_content()
+        # Blocked requests must remain visible without inflating target failure counts.
+        assert await page.locator("#request-issue-list tr").count() == 5
+        assert "/blocked/0" in await page.locator("#request-issue-list").inner_text()
+        assert "POLICY_BLOCKED" in await page.locator("#request-issue-list").inner_text()
         await page.evaluate("""() => {
           window.authDiagnosticOriginalReport = lastReport;
           renderReport({...lastReport, scan_configuration:{authentication_host_count:0},
@@ -469,6 +473,15 @@ async def main():
           renderFailedEndpoints();
         }""")
         assert await page.locator("#failed-endpoint-list tr").count() == 5
+        issue_text = await page.locator("#request-issue-list").inner_text()
+        for unresolved in ("/blocked/0", "/unfinished", "/policy-blocked.js", "/pending.js"):
+            assert unresolved in issue_text
+        assert "synthetic-private-value" not in issue_text
+        assert "POLICY_BLOCKED" in issue_text and "INCOMPLETE" in issue_text
+        await page.locator("#request-issue-list [data-request-issue]").first.click()
+        issue_evidence = await page.locator("#evidence-content").inner_text()
+        assert "synthetic-private-value" not in issue_evidence
+        await page.locator("#evidence-close").click()
         failed_text = await page.locator("#failed-endpoint-list").text_content()
         for evidence in ("502 (1)", "503 (1)", "HTTP_FAILURE", "NETWORK_FAILURE", "Health",
                          "2026-10-12T14:00:00Z", "2026-10-12T14:00:01Z", "Not recorded"):

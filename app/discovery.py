@@ -535,6 +535,13 @@ NAVIGATION_DOM_HELPERS = r"""
     return panel && !/[\s/?!]/.test(panel) && panel.length <= 160 ? panel : '';
   };
   const isMenuExpander = element => {
+    if (element.matches('summary')) {
+      const details = element.closest('details');
+      // Native disclosures are allowed only as genuine navigation containers;
+      // never click a general-purpose disclosure or a form action.
+      return !!details && !!composedClosest(element, 'header,nav,aside,[role="navigation"],[role="menu"]') &&
+        !!details.querySelector(routeSelector + ',[role="menuitem"]');
+    }
     const role = element.getAttribute('role');
     if (role === 'tab' || element.matches('[data-bs-toggle="tab"],[data-toggle="tab"]')) return false;
     if (element.hasAttribute('aria-expanded') || ['menu','true','tree','listbox'].includes(element.getAttribute('aria-haspopup')) ||
@@ -565,7 +572,7 @@ NAVIGATION_DOM_HELPERS = r"""
     return names;
   };
   const menuPanels = () => navigationRoots().flatMap(root => Array.from(root.querySelectorAll(
-    '[role="menu"],mat-menu,.mat-menu-panel,.mat-mdc-menu-panel'
+    '[role="menu"],mat-menu,.mat-menu-panel,.mat-mdc-menu-panel,.dropdown-menu'
   )));
   const bindNavigationPanel = (element, panel, opening) => {
     if (!panel || panel === element || panel.contains(element)) return;
@@ -585,6 +592,11 @@ NAVIGATION_DOM_HELPERS = r"""
     const labelled = element.id && menuPanels().filter(candidate => visibleControl(candidate) &&
       (candidate.getAttribute('aria-labelledby') || '').split(/\s+/).includes(element.id));
     if (labelled?.length === 1) return labelled[0];
+    // Bootstrap-style dropdowns often render as a unique adjacent panel
+    // without role=menu or aria-controls. Only use a visible semantic sibling.
+    const adjacent = Array.from(element.parentElement?.children || []).filter(candidate =>
+      candidate !== element && candidate.matches('.dropdown-menu,[role="menu"]') && visibleControl(candidate));
+    if (adjacent.length === 1) return adjacent[0];
     const opening = window.__portalValidatorMenuOpenings?.get(element);
     const revealed = opening && menuPanels().filter(candidate =>
       visibleControl(candidate) && !opening.panels.has(candidate));
@@ -603,8 +615,9 @@ NAVIGATION_DOM_HELPERS = r"""
     }
     const target = associatedMenuPanel(element);
     if (target) bindNavigationPanel(element, target, window.__portalValidatorMenuOpenings?.get(element));
-    return {expanded:element.getAttribute('aria-expanded') === 'true',
-      collapsed:element.getAttribute('aria-expanded') === 'false',
+    const nativeDetails = element.matches('summary') ? element.closest('details') : null;
+    return {expanded:nativeDetails ? nativeDetails.open : element.getAttribute('aria-expanded') === 'true',
+      collapsed:nativeDetails ? !nativeDetails.open : element.getAttribute('aria-expanded') === 'false',
       panelVisible:!!target && visibleControl(target)};
   };
   const describeView = (element, includeHidden = false) => {
@@ -759,7 +772,14 @@ EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
     '[aria-haspopup="menu"][aria-expanded="false"]',
     '[role="menuitem"]', '[role="tab"]',
     'nav [data-bs-target]', '[role="navigation"] [data-bs-target]',
-    'nav [data-target]', '[role="navigation"] [data-target]'
+    'nav [data-target]', '[role="navigation"] [data-target]',
+    'header [aria-expanded="false"][aria-controls]',
+    'header [aria-haspopup="menu"]', 'header [aria-haspopup="true"]',
+    'nav [data-bs-toggle="dropdown"]', 'header [data-bs-toggle="dropdown"]',
+    '[role="navigation"] [data-bs-toggle="dropdown"]',
+    'nav [data-toggle="dropdown"]', 'header [data-toggle="dropdown"]',
+    '[role="navigation"] [data-toggle="dropdown"]',
+    'nav summary', 'header summary', 'aside summary', '[role="navigation"] summary'
   ].join(',');
   // This set lives only for one bounded expansion pass. Retain it between
   // steps so Python can observe lazy panel requests and collect transient
@@ -847,8 +867,10 @@ MENU_READY_SCRIPT = r"""
 (element) => {
   /* NAVIGATION_DOM_HELPERS */
   const state = menuRevealed(element, false);
+  if (element.matches('summary')) return !!element.closest('details')?.open;
   const expectsMenu = ['menu','true'].includes(element.getAttribute('aria-haspopup')) ||
-    element.matches('[mat-menu-trigger-for],[matmenutriggerfor],.mat-menu-trigger,.mat-mdc-menu-trigger');
+    element.matches('[mat-menu-trigger-for],[matmenutriggerfor],.mat-menu-trigger,.mat-mdc-menu-trigger,'+
+      '[data-bs-toggle="dropdown"],[data-toggle="dropdown"]');
   // Framework triggers can set aria-expanded synchronously while fetching
   // their overlay. Do not move to another top-level menu before it exists.
   return expectsMenu ? state.panelVisible : state.expanded || state.panelVisible;
@@ -897,6 +919,12 @@ async def _reveal_navigation_menu(page, element, timeout_ms: int) -> tuple[bool,
             arg=element, timeout=remaining_ms(),
         )
     before = await element.evaluate(MENU_REVEALED_SCRIPT, True)
+    if before["expanded"] and not before["collapsed"]:
+        # An already opened native disclosure or asynchronously mounted
+        # menu must not be clicked again: that would close its real routes.
+        if not before["panelVisible"]:
+            await page.wait_for_function(MENU_READY_SCRIPT, arg=element, timeout=remaining_ms())
+        return False, False
     if before["panelVisible"] and not before["collapsed"]:
         return False, False
     await element.hover(timeout=remaining_ms())
@@ -1189,7 +1217,9 @@ RESTORE_MENU_ANCESTOR_SCRIPT = r"""
 (label) => {
   /* NAVIGATION_DOM_HELPERS */
   const matches = navigationRoots().flatMap(root => Array.from(root.querySelectorAll(
-    viewSelector + ',[aria-expanded][aria-controls],[aria-haspopup="menu"]'
+    viewSelector + ',[aria-expanded][aria-controls],[aria-haspopup="menu"],' +
+      'nav summary,header summary,aside summary,[role="navigation"] summary,' +
+      '[data-bs-toggle="dropdown"],[data-toggle="dropdown"]'
   ))).filter(element => visibleControl(element) && controlLabel(element) === label &&
     (isMenuExpander(element) || describeView(element)) && !unsafeAction(element) && !composedClosest(element, 'form') &&
     !element.hasAttribute('disabled') && element.getAttribute('aria-disabled') !== 'true' &&
@@ -1319,6 +1349,39 @@ async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> No
         await handle.dispose()
 
 
+async def restore_navigation_hierarchy(
+    page, hierarchy: tuple[str, ...], timeout_ms: int,
+) -> bool:
+    """Reopen only uniquely evidenced, harmless menu ancestors for a known link.
+
+    Do not discover or click arbitrary buttons as a substitute for a route.
+    This is navigation UI restoration, not form submission or POST replay.
+    """
+    if not hierarchy or len(hierarchy) > 10:
+        return False
+    deadline = asyncio.get_running_loop().time() + max(1, timeout_ms) / 1000
+    for label in hierarchy:
+        remaining_ms = max(1, int((deadline - asyncio.get_running_loop().time()) * 1000))
+        handle = await evaluate_dom(
+            page, RESTORE_MENU_ANCESTOR_SCRIPT, label, handle=True,
+            timeout_ms=remaining_ms,
+        )
+        try:
+            opener = handle.as_element()
+            if opener is not None:
+                if not await opener.evaluate(
+                    "element => {" + NAVIGATION_DOM_HELPERS + "return isMenuExpander(element);}",
+                ):
+                    # A non-expander route/view is never activated implicitly.
+                    return False
+                await _reveal_navigation_menu(page, opener, remaining_ms)
+            elif await handle.json_value() != "open":
+                return False
+        finally:
+            await handle.dispose()
+    return True
+
+
 def resolve_view_target(page, view_control: dict[str, str] | None = None):
     """Resolve an observed frame view without broadening its original boundary.
 
@@ -1353,6 +1416,7 @@ async def perform_route_navigation(
     view_control: dict[str, str] | None = None,
     source_document_url: str | None = None,
     source_route_url: str | None = None,
+    navigation_hierarchy: tuple[str, ...] = (),
     on_popup: Callable[[Any], Awaitable[None]] | None = None,
 ):
     """Navigate a document or transition an existing SPA document.
@@ -1577,6 +1641,18 @@ async def perform_route_navigation(
         source=source,
         timeout_ms=timeout_ms,
     )
+    if (not activated and source in {"a", "menuitem", "link"}
+            and navigation_hierarchy):
+        # Hidden Angular/Bootstrap menu anchors carry their click handlers in
+        # the actual DOM. Reopen the observed ancestor menu before using a
+        # history-only fallback, which cannot execute those handlers.
+        restored = await restore_navigation_hierarchy(
+            page, navigation_hierarchy, timeout_ms,
+        )
+        if restored:
+            activated = await activate_semantic_route(
+                page, url, label=label, source=source, timeout_ms=timeout_ms,
+            )
     transitioned = activated or await page.evaluate(
         SAME_DOCUMENT_TRANSITION_SCRIPT,
         {"target": url, "mode": mode},
