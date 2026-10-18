@@ -145,6 +145,7 @@ command = ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--
 if os.getenv("RELEASE_SMOKE_DEBUG") == "true":
     command = ["python", "-m", "debugpy", "--listen", "0.0.0.0:5678", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
 process = subprocess.Popen(command, stdout=log_stream, stderr=subprocess.STDOUT)
+startup_started = time.monotonic()
 try:
     deadline = time.monotonic() + 60
     while True:
@@ -160,6 +161,13 @@ try:
     with urlopen("http://127.0.0.1:8080/api/diagnostics/build", timeout=10) as response:
         assert json.load(response) == identity
     print("HTTP_HEALTH=" + json.dumps(health), flush=True)
+except Exception:
+    from app.security import sanitize_text
+    print("APPLICATION_STARTUP_STATE=" + json.dumps({
+        "returncode": process.poll(), "elapsed_ms": round((time.monotonic() - startup_started) * 1000),
+    }), flush=True)
+    print("APPLICATION_STARTUP_DIAGNOSTICS=" + sanitize_text(log_path.read_text(), limit=4000), flush=True)
+    raise
 finally:
     process.terminate()
     process.wait(timeout=30)

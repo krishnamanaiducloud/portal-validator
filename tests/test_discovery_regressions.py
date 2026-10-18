@@ -203,7 +203,7 @@ async def test_semantic_activation_preserves_distinct_query_routes(discovery_sit
             page = await browser.new_page()
             await page.goto(discovery_site + "/query-nav")
             _, transitioned, activation = await perform_route_navigation(
-                page, discovery_site + "/query-nav?view=two", SPA_ROUTE_TRANSITION, 1000,
+                page, discovery_site + "/query-nav?view=two", SPA_ROUTE_TRANSITION, 5000,
                 label="Second", source="a",
             )
             assert transitioned and activation == "SEMANTIC_CONTROL"

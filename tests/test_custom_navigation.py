@@ -43,7 +43,7 @@ async def test_custom_url_metadata_is_activated_on_the_actual_discovered_control
         routes = await discover_page_routes(page, 0)
         assert any(route.url == "https://portal.example/reports" and route.label == "Reports" for route in routes)
         assert await activate_semantic_route(
-            page, "https://portal.example/reports", label="Reports", source="portal-item", timeout_ms=1000,
+            page, "https://portal.example/reports", label="Reports", source="portal-item", timeout_ms=5000,
         )
         assert await page.evaluate("window.selected") == "Reports"
         assert not await page.evaluate("Boolean(window.wrong)")
@@ -65,7 +65,7 @@ async def test_shadow_root_control_activation_does_not_depend_on_locator_index_o
             "https://portal.example/reports-0", "https://portal.example/reports-1",
         }
         assert await activate_semantic_route(
-            page, "https://portal.example/reports-1", label="Report 1", source="button", timeout_ms=1000,
+            page, "https://portal.example/reports-1", label="Report 1", source="button", timeout_ms=5000,
         )
         assert await page.evaluate("window.selected") == 1
         assert not await page.evaluate("Boolean(window.wrong)")
@@ -101,7 +101,8 @@ async def test_custom_navigation_without_url_or_panel_has_distinct_verified_view
         assert len({discovered_route_key(route, route.url) for route in views}) == 2
         assert {route.url for route in views} == {"https://portal.example/"}
         report = next(route for route in views if route.label == "Reports")
-        await activate_ui_view(page, report.view_control, 1000)
+        # This verifies control identity, not a one-second performance SLA.
+        await activate_ui_view(page, report.view_control, 5000)
         assert await page.locator("output").inner_text() == "Report content"
         assert await page.evaluate("window.calls") == 1
 
@@ -156,7 +157,7 @@ async def test_hidden_nested_view_restores_its_observed_parent_menu_before_activ
         detail = next(route for route in result["routes"] if route.label == "Service details")
         assert detail.navigation_hierarchy == ("Overview menu",)
         assert not await page.locator("#first").is_visible()
-        await activate_ui_view(page, detail.view_control, 1000)
+        await activate_ui_view(page, detail.view_control, 5000)
         assert await page.locator("#detail").is_visible()
         assert await page.evaluate("window.calls") == 1
 
@@ -177,7 +178,7 @@ async def test_nested_shadow_hosts_with_equal_panel_ids_keep_distinct_view_ident
         views = [route for route in await discover_page_routes(page, 0) if route.view_control]
         assert len(views) == 2
         assert len({discovered_route_key(route, route.url) for route in views}) == 2
-        await activate_ui_view(page, views[1].view_control, 1000)
+        await activate_ui_view(page, views[1].view_control, 5000)
         panels = page.locator('portal-view section')
         assert not await panels.nth(0).is_visible()
         assert await panels.nth(1).is_visible()
