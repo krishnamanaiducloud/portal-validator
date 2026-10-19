@@ -237,15 +237,26 @@ async def test_route_403_is_authorization_denied_and_other_routes_continue(authe
 
 
 @pytest.mark.asyncio
-async def test_session_expiry_after_ready_route_atomically_invalidates_application_coverage(authentication_first_site):
+async def test_unrecoverable_session_expiry_after_ready_routes_keeps_validated_routes(authentication_first_site):
     await require_browser()
     origin, handler = authentication_first_site
     handler.include_denied = False
     handler.expire_session = True
-    report = await execute_scan(request_for(origin, authentication={"mode": "storage_state", "storage_profile": "authorized"}))
+    report = await execute_scan(request_for(
+        origin, authentication={"mode": "storage_state", "storage_profile": "authorized"},
+        session_recovery_attempts=1,
+    ))
     assert handler.receipts[("GET", "/02-authorized")] == 1
-    assert handler.receipts[("GET", "/03-expired")] == 1
-    assert_authentication_failure(report, "SESSION_EXPIRED")
+    # The expired route is retried once after a recovery attempt, then reported as not tested.
+    assert handler.receipts[("GET", "/03-expired")] == 2
+    assert report["scan_status"] == "PARTIAL"
+    assert report["summary"]["termination_reason"] == "SESSION_EXPIRED"
+    assert report["session_interruption"]["category"] == "SESSION_EXPIRED"
+    paths = {urlsplit(result["final_url"]).path or "/" for result in report["results"]}
+    assert paths == {"/", "/02-authorized"}
+    assert all(result["authentication_status"] == "PASS" for result in report["results"])
+    assert [item["reason"] for item in report["not_tested_routes"]] == ["NOT_TESTED_SESSION_EXPIRED"]
+    assert "fixture-private" not in json.dumps(report)
 
 
 @pytest.mark.asyncio

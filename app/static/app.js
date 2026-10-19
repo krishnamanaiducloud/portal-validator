@@ -1395,6 +1395,12 @@ function renderReport(report, context = null) {
     ['Discovered routes', report.summary.routes_discovered, '', 'discovered'], ['Validated routes', report.summary.routes_validated, '', 'validated'], ['Healthy', report.summary.healthy_routes, 'good', 'healthy'], ['Passed with warnings', report.summary.routes_with_warnings, report.summary.routes_with_warnings ? 'warn' : '', 'warnings'], ['Failed', report.summary.failed_pages, report.summary.failed_pages ? 'bad' : 'good', 'failed'], ['Auth issues', authIssues, authIssues ? 'auth' : '', 'auth'], ['Access / challenges', accessIssues, accessIssues ? 'warn' : '', 'access'], ['Not tested', notTested, notTested ? 'warn' : 'good', 'not-tested'], ['Unique APIs observed', report.summary.unique_apis || 0, '', 'apis'], ['API failures', report.summary.api_failures, report.summary.api_failures ? 'bad' : 'good', 'api-failures'], ['Resources observed', report.summary.unique_resources || 0, '', 'resources'], ['Resource failures', report.summary.resource_failures, report.summary.resource_failures ? 'warn' : 'good', 'resource-failures'], ['Console issues', report.summary.console_failures || 0, report.summary.console_failures ? 'warn' : 'good', 'console'], ['Slow routes', report.summary.slow_pages, report.summary.slow_pages ? 'warn' : 'good', 'slow'], ['Read-only blocks', report.summary.read_only_blocks, report.summary.read_only_blocks ? 'warn' : 'good', 'read-only'], ['Security recommendations', report.summary.security_recommendations || 0, report.summary.security_recommendations ? 'warn' : 'good', 'security'], ['Scan duration', duration, '', 'validated'],
   ];
   summaryMetrics.splice(8, 0, ['Business APIs', report.summary.business_apis ?? (report.business_api_inventory || []).length, '', 'business-apis']);
+  const interruption = report.session_interruption, recoveries = Number(report.session?.recoveries || 0);
+  if (interruption && report.summary.termination_reason === 'SESSION_EXPIRED') {
+    notify(`The session expired after ${report.summary.routes_validated} validated routes and could not be recovered. Validated routes are kept; the remaining routes were not tested. Refresh the SSO session profile and approve the identity provider host, then scan again.`, true);
+  } else if (recoveries) {
+    notify(`The session expired during the scan and was recovered ${recoveries} time${recoveries === 1 ? '' : 's'}; affected routes were validated again.`);
+  }
   if (report.scan_status === 'FAILED' && report.authentication_status === 'FAILED') summaryMetrics.unshift(
     ['Scan status','FAILED','bad','auth'],['Authentication status','FAILED','bad','auth'],['Tested routes',0,'','validated']);
   byId('summary').innerHTML = summaryMetrics.map(([label, value, kind, action]) => `<button type="button" class="metric ${kind}" data-summary-action="${action}" aria-label="Show ${escapeHtml(label)} evidence"><strong>${escapeHtml(value)}</strong><span>${escapeHtml(label)}</span></button>`).join('');
@@ -1657,6 +1663,7 @@ form.addEventListener('submit', async (event) => {
     payload.network_settle_cap_ms = Number(byId('network-settle-cap').value);
     payload.menu_settle_ms = Number(byId('menu-settle').value);
     payload.reexplore_navigation_each_route = byId('reexplore-navigation').checked;
+    payload.session_recovery_attempts = Number(byId('session-recovery-attempts').value);
     payload.approved_read_post_operations = approvedReadPostOperations();
     Object.assign(payload, phaseConfiguration());
     payload.large_resource_threshold_bytes = Number(byId('large-resource-threshold').value) * 1024;
@@ -1701,7 +1708,7 @@ const SCAN_SETTING_INPUTS = {max_pages:'pages',max_depth:'depth',max_redirects:'
   menu_settle_ms:'menu-settle',max_navigation_actions:'navigation-actions',max_discovery_scrolls:'discovery-scrolls',
   per_route_timeout_ms:'per-route-timeout',discovery_timeout_ms:'discovery-timeout',navigation_timeout_ms:'navigation-timeout',
   authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout',
-  session_refresh_interval_ms:'session-refresh-interval'};
+  session_refresh_interval_ms:'session-refresh-interval',session_recovery_attempts:'session-recovery-attempts'};
 requestJson('/api/scan-settings', {}, 'Scan settings request').then((data) => {
   for (const [name, id] of Object.entries(SCAN_SETTING_INPUTS)) {
     const setting = data.settings?.[name], input = byId(id);

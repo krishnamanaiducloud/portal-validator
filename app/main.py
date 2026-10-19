@@ -332,6 +332,10 @@ class ScanRequest(BaseModel):
     # Re-run a profile's configured silent session refresh during the scan this
     # often, on a separate tab. Overrides the profile's refresh interval_ms.
     session_refresh_interval_ms: int | None = Field(None, ge=1000, le=BROWSER_TIMER_LIMIT_MS)
+    # When the session expires after the application was ready, re-establish
+    # it (profile refresh + silent SSO) and retry the route this many times
+    # before stopping with the routes validated so far.
+    session_recovery_attempts: int = Field(3, ge=0)
     # Shared header/navigation/sidebar menus are explored once per scan.
     # Enable to re-explore them on every route (slower; for menus whose
     # content differs per route).
@@ -884,6 +888,15 @@ class _AuthenticationGateFailure(Exception):
     """Unwind browser work without treating bootstrap as an application route."""
 
 
+class _SessionExpiredDuringScan(_AuthenticationGateFailure):
+    """The session was rejected after the scan-wide gate had passed."""
+
+
+# Policy/configuration denials are not session loss: re-authenticating cannot
+# fix them, so they keep failing the whole scan closed.
+POLICY_AUTHENTICATION_FAILURES = frozenset({"AUTHENTICATION_BLOCKED", "AUTHENTICATION_CONFIGURATION_ERROR"})
+
+
 async def execute_scan(
     req: ScanRequest,
     *,
@@ -1360,6 +1373,12 @@ async def execute_scan(
     session_refresh: dict[str, object] = {"attempted": False}
     # True only while the validator opens its own (non-application) tab.
     internal_page_requested = False
+    # Evidence recorded before a successful session recovery is history, not
+    # proof that the recovered session is rejected.
+    session_evidence_start = 0
+    diagnostic_evidence_start = 0
+    session_recovery_attempts_used = 0
+    session_interruption: dict | None = None
     redirect_guards: list[RedirectResponseGuard] = []
     guard_install_tasks = weakref.WeakKeyDictionary()
 
@@ -1403,13 +1422,15 @@ async def execute_scan(
             policy_decision=evidence.get("policy_decision") or evidence.get("policy_reason") or policy_decision,
             duration_ms=duration_ms if duration_ms is not None else round((time.perf_counter() - scan_started) * 1000),
         )
+        if application_gate_confirmed and authentication_error["category"] not in POLICY_AUTHENTICATION_FAILURES:
+            raise _SessionExpiredDuringScan
         raise _AuthenticationGateFailure
 
     def rejected_session_response() -> dict | None:
         # The application must accept the session, not merely return a static
         # HTML shell. Optional/public peripheral 401s are not proof of expiry;
         # explicit session-required APIs and scoped auth exchanges are evidence.
-        return next((event for event in reversed(scan_api_events) if (
+        return next((event for event in reversed(scan_api_events[session_evidence_start:]) if (
             event.get("status") == 401 and not event.get("blocked_by_validator")
             and event.get("phase") != "SESSION_REFRESH"
             and (
@@ -1420,7 +1441,7 @@ async def execute_scan(
 
     def require_current_session() -> None:
         """Stop further application work as soon as auth evidence is rejected."""
-        denied = next((item for item in reversed(authentication_diagnostics)
+        denied = next((item for item in reversed(authentication_diagnostics[diagnostic_evidence_start:])
                        if item.get("affects_authentication")), None)
         if denied is not None:
             reject_global_authentication(
@@ -2673,6 +2694,90 @@ async def execute_scan(
                             pass
                         last_session_refresh = time.perf_counter()
                         authentication_duration_ms += round((last_session_refresh - started_refresh) * 1000)
+
+                async def recover_expired_session() -> bool:
+                    """Re-establish an expired session through the approved SSO flow.
+
+                    Runs the profile's silent refresh (if configured), then reopens the
+                    portal so the identity provider can silently re-issue tokens from
+                    its own session. Credentials are never entered or replayed.
+                    """
+                    nonlocal session_recovery_attempts_used, authentication_error, session_expired
+                    nonlocal session_evidence_start, diagnostic_evidence_start, session_interruption
+                    nonlocal observation_phase, current_tracker, navigation_policy_error
+                    session_interruption = authentication_error or session_interruption
+                    if session_recovery_attempts_used >= req.session_recovery_attempts or time.perf_counter() >= deadline:
+                        return False
+                    session_recovery_attempts_used += 1
+                    log_event(
+                        logging.WARNING, "SESSION_RECOVERY_STARTED", scan_id=scan_id,
+                        attempt=session_recovery_attempts_used,
+                        category=(authentication_error or {}).get("category"),
+                    )
+                    if refresh_config is not None:
+                        await run_periodic_session_refresh()
+                    previous_phase = observation_phase
+                    observation_phase = "SESSION_REFRESH"
+                    recovered = False
+                    try:
+                        budget_ms = max(1, min(
+                            req.authentication_timeout_ms or req.timeout_ms,
+                            round((deadline - time.perf_counter()) * 1000),
+                        ))
+                        current_tracker = NavigationTracker(req.max_redirects)
+                        navigation_policy_error = None
+                        response = await primary_page.goto(
+                            requested_target, wait_until="domcontentloaded", timeout=budget_ms,
+                        )
+                        settled = await settle_authentication_navigation(
+                            primary_page,
+                            in_portal_scope=lambda candidate: url_in_scan_scope(
+                                candidate, root_host, req.allow_subdomains, approved_portal_hosts,
+                            ),
+                            is_approved_authentication_host=lambda host: host in req.authentication_hosts,
+                            detect_signals=detect_auth_signals,
+                            timeout_ms=budget_ms,
+                            flow_active=authentication_navigation.active,
+                            status=response.status if response is not None else None,
+                        )
+                        if settled.get("stage") == "APPLICATION" and settled.get("completed"):
+                            readiness = await wait_for_render_settle(
+                                primary_page,
+                                settle_ms=req.render_settle_ms,
+                                maximum_ms=max(0, min(
+                                    req.readiness_timeout_ms or req.timeout_ms,
+                                    round((deadline - time.perf_counter()) * 1000),
+                                )),
+                                minimum_observation_ms=req.min_observation_ms,
+                                network_quiet_ms=req.network_quiet_ms,
+                                readiness_selector=req.readiness_selector,
+                                readiness_event=req.readiness_event,
+                                network_settle_cap_ms=req.network_settle_cap_ms,
+                            )
+                            password_form, mfa_form = await detect_auth_signals(primary_page)
+                            recovered = bool(
+                                application_shell_ready(readiness) and not password_form and not mfa_form
+                                and url_in_scan_scope(
+                                    primary_page.url, root_host, req.allow_subdomains, approved_portal_hosts,
+                                )
+                            )
+                    except (PlaywrightError, TimeoutError, DestinationError) as exc:
+                        log_event(logging.WARNING, "SESSION_RECOVERY_ERROR", scan_id=scan_id,
+                                  error=sanitized_diagnostic(str(exc)))
+                    finally:
+                        observation_phase = previous_phase
+                    if recovered:
+                        session_evidence_start = len(scan_api_events)
+                        diagnostic_evidence_start = len(authentication_diagnostics)
+                        authentication_error = None
+                        session_expired = False
+                        session_refresh["recoveries"] = int(session_refresh.get("recoveries", 0)) + 1
+                        log_event(logging.INFO, "SESSION_RECOVERED", scan_id=scan_id,
+                                  attempt=session_recovery_attempts_used)
+                    else:
+                        log_event(logging.WARNING, "SESSION_RECOVERY_FAILED", scan_id=scan_id,
+                                  attempt=session_recovery_attempts_used)
+                    return recovered
                 # Context observers see initial inline popup diagnostics before
                 # Playwright emits the Page event; per-page listeners are too late.
                 context.on("console", lambda message: record_console_error(message, message.page))
@@ -2709,1219 +2814,1229 @@ async def execute_scan(
                     observation_phase = "AUTHENTICATION"
                     authentication_duration_ms += round((time.perf_counter() - refresh_started) * 1000)
                 while queue and len(results) < req.max_pages:
-                    if cancel_event is not None and cancel_event.is_set():
-                        cancellation_requested = True
-                        break
-                    if time.perf_counter() >= deadline:
-                        total_timeout_reached = True
-                        break
-                    if (
-                        refresh_interval_s and application_gate_confirmed
-                        and time.perf_counter() - last_session_refresh >= refresh_interval_s
-                    ):
-                        await run_periodic_session_refresh()
-                    (
-                        url,
-                        depth,
-                        route_label,
-                        route_source,
-                        navigation_mode,
-                        discovered_from,
-                        discovery_type,
-                        route_label_source,
-                        route_accessible_name,
-                        view_control,
-                        parent_route_id,
-                    ) = queue.popleft()
-                    route_identity = normalize_route_url(
-                        url,
-                        query_policy=req.query_parameter_policy,
-                        allowed_query_parameters=set(req.allowed_query_parameters),
-                    ) or url
-                    route_key = discovered_route_key(DiscoveredRoute(
-                        url=url, label=route_label, source=route_source, view_control=view_control,
-                    ), route_identity)
-                    if route_key in seen or depth > req.max_depth:
-                        continue
-                    seen.add(route_key)
-                    active_route_identity = route_key
-                    active_route_id = route_key if view_control else sanitized_url(route_identity)
-                    active_view_source = url if view_control else None
-                    active_route_activation_id = f"activation-{len(results) + 1}"
-                    selected_page_key = route_page_keys.get(route_key)
-                    page = browser_pages.get(selected_page_key, primary_page)
-                    active_browser_page_key = browser_page_keys.get(request_identity(page))
-                    await publish_progress(
-                        "VALIDATING_ROUTES" if application_gate_confirmed else "AUTHENTICATING",
-                        discovered=len(discovered_routes),
-                        queued=len(queue) + 1,
-                        validated=len(results),
-                        healthy=sum(bool(item.get("passed")) for item in results),
-                        failed=sum(
-                            item.get("validation_status") == "FAIL"
-                            or item.get("page_load_status") == "FAILED_TO_LOAD"
-                            for item in results
-                        ),
-                        warnings=sum(
-                            item.get("classification") == "PASS_WITH_WARNINGS"
-                            for item in results
-                        ),
-                        current_route=active_route_id,
-                    )
-                    current_tracker = NavigationTracker(req.max_redirects)
-                    navigation_policy_error = None
-                    navigation_hosts.clear()
-                    # Session/authentication evidence belongs to the shared browser
-                    # context, not a single tab. Do not erase it between SPA routes.
-                    latest_document_response = (
-                        document_response_for(page)
-                        if navigation_mode == POPUP_NAVIGATION else None
-                    )
-                    # Passive bootstrap observation is not an API health check.
-                    # Only protocol-approved traffic is authentication traffic;
-                    # ordinary application calls retain their owning view when
-                    # the gate succeeds, and are withheld entirely if it fails.
-                    observation_phase = "ROUTE_VALIDATION" if application_gate_confirmed else "APPLICATION_BOOTSTRAP"
-                    popup_origins[request_identity(page)] = (
-                        active_route_id, active_route_activation_id, observation_phase,
-                    )
-                    adopt_page_observations(page)
-                    requested_url = sanitized_url(url)
-                    requested_host = normalized_host(urlparse(url).hostname or "")
-                    final_url: str | None = None
-                    final_raw_url = url
-                    websocket_start = len(websocket_events)
-                    event_stream_start = len(event_streams)
-                    download_start = len(download_events)
-                    started = time.perf_counter()
-                    route_deadline = min(deadline, started + (req.per_route_timeout_ms or req.timeout_ms) / 1000)
-                    status: int | None = None
-                    title: str | None = None
-                    error: str | None = None
-                    error_classification: str | None = None
-                    authentication_classification: str | None = None
-                    response_headers: dict[str, str] = {}
-                    route_transition_succeeded = False
-                    inherited_strict_tls = False
-                    security_headers_inherited = False
-                    links: list[str] = []
-                    discovered: list[DiscoveredRoute] = []
-                    external_links: list[str] = []
-                    redirects: list[dict] = []
-                    render_health: dict[str, object] | None = None
-                    application_ready = False
-                    dom_target = page
-                    auth_settle: dict[str, object] = {"stage": "NOT_TESTED", "completed": False}
-                    browser_lifecycle = BrowserLifecycle()
-                    browser_lifecycle.advance("INITIAL_NAVIGATION")
-                    name_evidence = {"primary_heading": "", "breadcrumb": ""}
-                    navigation_actions = {"activated": 0, "skipped": 0}
-                    route_discovery_ms = 0
-                    navigation_ms = 0
-                    navigation_policy_ms = 0
-                    navigation_policy_intervals.clear()
-                    render_start_ms = None
-                    frame_observations: list[dict[str, object]] = []
-                    final_in_scope = False
-                    remaining_ms = max(0, round((deadline - time.perf_counter()) * 1000))
-                    if remaining_ms == 0:
-                        error = "Total scan timeout exceeded"
-                        error_classification = "TIMEOUT"
-                        browser_lifecycle.fail("TIMEOUT")
-                    else:
-                        log_event(
-                            logging.INFO,
-                            (
-                                "SPA_ROUTE_TRANSITION_STARTED"
-                                if navigation_mode in SAME_DOCUMENT_NAVIGATIONS
-                                else "DOCUMENT_NAVIGATION_STARTED"
+                    try:
+                        if cancel_event is not None and cancel_event.is_set():
+                            cancellation_requested = True
+                            break
+                        if time.perf_counter() >= deadline:
+                            total_timeout_reached = True
+                            break
+                        if (
+                            refresh_interval_s and application_gate_confirmed
+                            and time.perf_counter() - last_session_refresh >= refresh_interval_s
+                        ):
+                            await run_periodic_session_refresh()
+                        (
+                            url,
+                            depth,
+                            route_label,
+                            route_source,
+                            navigation_mode,
+                            discovered_from,
+                            discovery_type,
+                            route_label_source,
+                            route_accessible_name,
+                            view_control,
+                            parent_route_id,
+                        ) = current_queue_entry = queue.popleft()
+                        route_identity = normalize_route_url(
+                            url,
+                            query_policy=req.query_parameter_policy,
+                            allowed_query_parameters=set(req.allowed_query_parameters),
+                        ) or url
+                        route_key = discovered_route_key(DiscoveredRoute(
+                            url=url, label=route_label, source=route_source, view_control=view_control,
+                        ), route_identity)
+                        if route_key in seen or depth > req.max_depth:
+                            continue
+                        seen.add(route_key)
+                        active_route_identity = route_key
+                        active_route_id = route_key if view_control else sanitized_url(route_identity)
+                        active_view_source = url if view_control else None
+                        active_route_activation_id = f"activation-{len(results) + 1}"
+                        selected_page_key = route_page_keys.get(route_key)
+                        page = browser_pages.get(selected_page_key, primary_page)
+                        active_browser_page_key = browser_page_keys.get(request_identity(page))
+                        await publish_progress(
+                            "VALIDATING_ROUTES" if application_gate_confirmed else "AUTHENTICATING",
+                            discovered=len(discovered_routes),
+                            queued=len(queue) + 1,
+                            validated=len(results),
+                            healthy=sum(bool(item.get("passed")) for item in results),
+                            failed=sum(
+                                item.get("validation_status") == "FAIL"
+                                or item.get("page_load_status") == "FAILED_TO_LOAD"
+                                for item in results
                             ),
-                            scan_id=scan_id,
-                            requested_url=url,
-                            hostname=requested_host,
-                            page_number=len(results) + 1,
-                            crawl_depth=depth,
-                            navigation_type=navigation_mode,
+                            warnings=sum(
+                                item.get("classification") == "PASS_WITH_WARNINGS"
+                                for item in results
+                            ),
+                            current_route=active_route_id,
                         )
-                        try:
-                            async with asyncio.timeout_at(route_deadline) as route_scope:
-                                dom_target = resolve_view_target(page, view_control)
-                                semantic_popup = None
+                        current_tracker = NavigationTracker(req.max_redirects)
+                        navigation_policy_error = None
+                        navigation_hosts.clear()
+                        # Session/authentication evidence belongs to the shared browser
+                        # context, not a single tab. Do not erase it between SPA routes.
+                        latest_document_response = (
+                            document_response_for(page)
+                            if navigation_mode == POPUP_NAVIGATION else None
+                        )
+                        # Passive bootstrap observation is not an API health check.
+                        # Only protocol-approved traffic is authentication traffic;
+                        # ordinary application calls retain their owning view when
+                        # the gate succeeds, and are withheld entirely if it fails.
+                        observation_phase = "ROUTE_VALIDATION" if application_gate_confirmed else "APPLICATION_BOOTSTRAP"
+                        popup_origins[request_identity(page)] = (
+                            active_route_id, active_route_activation_id, observation_phase,
+                        )
+                        adopt_page_observations(page)
+                        requested_url = sanitized_url(url)
+                        requested_host = normalized_host(urlparse(url).hostname or "")
+                        final_url: str | None = None
+                        final_raw_url = url
+                        websocket_start = len(websocket_events)
+                        event_stream_start = len(event_streams)
+                        download_start = len(download_events)
+                        started = time.perf_counter()
+                        route_deadline = min(deadline, started + (req.per_route_timeout_ms or req.timeout_ms) / 1000)
+                        status: int | None = None
+                        title: str | None = None
+                        error: str | None = None
+                        error_classification: str | None = None
+                        authentication_classification: str | None = None
+                        response_headers: dict[str, str] = {}
+                        route_transition_succeeded = False
+                        inherited_strict_tls = False
+                        security_headers_inherited = False
+                        links: list[str] = []
+                        discovered: list[DiscoveredRoute] = []
+                        external_links: list[str] = []
+                        redirects: list[dict] = []
+                        render_health: dict[str, object] | None = None
+                        application_ready = False
+                        dom_target = page
+                        auth_settle: dict[str, object] = {"stage": "NOT_TESTED", "completed": False}
+                        browser_lifecycle = BrowserLifecycle()
+                        browser_lifecycle.advance("INITIAL_NAVIGATION")
+                        name_evidence = {"primary_heading": "", "breadcrumb": ""}
+                        navigation_actions = {"activated": 0, "skipped": 0}
+                        route_discovery_ms = 0
+                        navigation_ms = 0
+                        navigation_policy_ms = 0
+                        navigation_policy_intervals.clear()
+                        render_start_ms = None
+                        frame_observations: list[dict[str, object]] = []
+                        final_in_scope = False
+                        remaining_ms = max(0, round((deadline - time.perf_counter()) * 1000))
+                        if remaining_ms == 0:
+                            error = "Total scan timeout exceeded"
+                            error_classification = "TIMEOUT"
+                            browser_lifecycle.fail("TIMEOUT")
+                        else:
+                            log_event(
+                                logging.INFO,
+                                (
+                                    "SPA_ROUTE_TRANSITION_STARTED"
+                                    if navigation_mode in SAME_DOCUMENT_NAVIGATIONS
+                                    else "DOCUMENT_NAVIGATION_STARTED"
+                                ),
+                                scan_id=scan_id,
+                                requested_url=url,
+                                hostname=requested_host,
+                                page_number=len(results) + 1,
+                                crawl_depth=depth,
+                                navigation_type=navigation_mode,
+                            )
+                            try:
+                                async with asyncio.timeout_at(route_deadline) as route_scope:
+                                    dom_target = resolve_view_target(page, view_control)
+                                    semantic_popup = None
 
-                                async def select_semantic_popup(popup):
-                                    nonlocal semantic_popup
-                                    semantic_popup = popup
+                                    async def select_semantic_popup(popup):
+                                        nonlocal semantic_popup
+                                        semantic_popup = popup
 
-                                response, route_transition_succeeded, activation_method = await perform_route_navigation(
-                                    page,
-                                    url,
-                                    navigation_mode,
-                                    min(req.navigation_timeout_ms or req.timeout_ms, remaining_ms),
-                                    label=route_label,
-                                    source=route_source,
-                                    view_control=view_control,
-                                    source_document_url=route_document_sources.get(route_key),
-                                    source_route_url=discovered_from,
-                                    navigation_hierarchy=tuple(
-                                        route_metadata.get(route_key, {}).get("navigation_hierarchy", ())
-                                    ),
-                                    on_popup=select_semantic_popup,
-                                )
-                                if semantic_popup is not None:
-                                    page = semantic_popup
-                                    dom_target = page
-                                    active_browser_page_key = browser_page_keys.get(request_identity(page))
-                                    route_page_keys[route_key] = active_browser_page_key
-                                    popup_origins[request_identity(page)] = (
-                                        active_route_id, active_route_activation_id, observation_phase,
+                                    response, route_transition_succeeded, activation_method = await perform_route_navigation(
+                                        page,
+                                        url,
+                                        navigation_mode,
+                                        min(req.navigation_timeout_ms or req.timeout_ms, remaining_ms),
+                                        label=route_label,
+                                        source=route_source,
+                                        view_control=view_control,
+                                        source_document_url=route_document_sources.get(route_key),
+                                        source_route_url=discovered_from,
+                                        navigation_hierarchy=tuple(
+                                            route_metadata.get(route_key, {}).get("navigation_hierarchy", ())
+                                        ),
+                                        on_popup=select_semantic_popup,
                                     )
-                                    latest_document_response = document_response_for(page)
-                                    adopt_page_observations(page)
-                                if navigation_mode == POPUP_NAVIGATION or semantic_popup is not None:
-                                    response = latest_document_response
-                                    if response is None:
-                                        raise RuntimeError("Observed popup has no captured main-document HTTP response")
-                                navigation_ms = round((time.perf_counter() - started) * 1000)
-                                navigation_policy_ms = navigation_policy_time_ms(started, time.perf_counter())
-                                navigation_duration_ms += navigation_ms
-                                browser_lifecycle.advance("AUTHENTICATING")
-                                require_bootstrap_readiness = bool(
-                                    not results and (
-                                        req.authentication.mode != "none" or req.readiness_selector
-                                        or req.readiness_event or authentication_navigation.active
-                                    )
-                                )
-
-                                async def bootstrap_application_ready(target):
-                                    snapshot = await capture_render_health(target)
-                                    snapshot.update(await configured_readiness_conditions(
-                                        target, readiness_selector=req.readiness_selector,
-                                        readiness_event=req.readiness_event,
-                                    ))
-                                    return application_shell_ready(snapshot)
-
-                                auth_settle = await settle_authentication_navigation(
-                                    page,
-                                    in_portal_scope=lambda candidate: url_in_scan_scope(
-                                        candidate, root_host, req.allow_subdomains, approved_portal_hosts,
-                                    ),
-                                    is_approved_authentication_host=lambda host: host in req.authentication_hosts,
-                                    detect_signals=detect_auth_signals,
-                                    timeout_ms=max(1, min(
-                                        req.authentication_timeout_ms or req.timeout_ms,
-                                        round((route_deadline - time.perf_counter()) * 1000),
-                                    )),
-                                    flow_active=authentication_navigation.active,
-                                    status=response.status if response is not None else None,
-                                    current_status=lambda: (
-                                        latest_document_response.status if latest_document_response is not None
-                                        else response.status if response is not None else None
-                                    ),
-                                    application_ready=(
-                                        bootstrap_application_ready if require_bootstrap_readiness else None
-                                    ),
-                                    application_readiness_timeout_ms=req.readiness_timeout_ms,
-                                    cancel_event=cancel_event,
-                                )
-                                authentication_duration_ms += int(auth_settle["elapsed_ms"])
-                                # This policy records authentication evidence for
-                                # the shared browser context, not just this page.
-                                # The main application can settle while a popup's
-                                # approved SSO POST/callback is still in flight.
-                                # Every POST still requires protocol evidence,
-                                # approved destination and normal network checks.
-                                # goto() may return an intermediate auto-post/callback
-                                # document. Use the actual final main-document evidence.
-                                if latest_document_response is not None and navigation_mode not in SAME_DOCUMENT_NAVIGATIONS:
-                                    response = latest_document_response
-                                if not route_transition_succeeded and auth_settle["completed"]:
-                                    # The final application's own Navigation Timing
-                                    # includes a slow document reached after SSO,
-                                    # but not our auth polling/diagnostic overhead.
-                                    document_timing = await document_navigation_timing(page)
-                                    if document_timing:
-                                        navigation_ms, document_start, document_end = document_timing
-                                        navigation_policy_ms = navigation_policy_time_ms(document_start, document_end)
-                                log_event(
-                                    logging.INFO, "AUTHENTICATION_OBSERVATION_COMPLETED",
-                                    scan_id=scan_id, stage=auth_settle["stage"],
-                                    hostname=auth_settle["final_host"],
-                                    elapsed_ms=auth_settle["elapsed_ms"],
-                                )
-                                log_event(
-                                    logging.INFO,
-                                    "ROUTE_ACTIVATION_COMPLETED",
-                                    scan_id=scan_id,
-                                    current_route=active_route_id,
-                                    activation_method=activation_method,
-                                )
-                                final_raw_url = dom_target.url
-                                final_url = sanitized_url(final_raw_url)
-                                if response is not None:
-                                    await reconcile_http_redirect_chain(response, current_tracker)
-                                redirects = current_tracker.redirects()
-                                for redirect in redirects:
-                                    log_event(logging.INFO, "REDIRECT_DETECTED", scan_id=scan_id, **redirect)
-                                    if not redirect["same_origin"]:
-                                        log_event(logging.INFO, "CROSS_ORIGIN_REDIRECT", scan_id=scan_id, **redirect)
-                                if response is not None:
-                                    status = response.status
-                                    response_headers = {
-                                        name.lower(): value
-                                        for name, value in (await response.all_headers()).items()
-                                    }
-                                    document_evidence[origin_for_url(final_raw_url)] = {
-                                        "response_headers": response_headers.copy(),
-                                        "strict_tls": urlparse(final_raw_url).scheme == "https",
-                                    }
-                                else:
-                                    evidence = document_evidence.get(origin_for_url(final_raw_url))
-                                    if evidence is None:
-                                        raise RuntimeError(
-                                            "Same-document route has no validated document context"
+                                    if semantic_popup is not None:
+                                        page = semantic_popup
+                                        dom_target = page
+                                        active_browser_page_key = browser_page_keys.get(request_identity(page))
+                                        route_page_keys[route_key] = active_browser_page_key
+                                        popup_origins[request_identity(page)] = (
+                                            active_route_id, active_route_activation_id, observation_phase,
                                         )
-                                    response_headers = dict(evidence["response_headers"])
-                                    inherited_strict_tls = bool(evidence["strict_tls"])
-                                    security_headers_inherited = True
-                                if (
-                                    url_in_scan_scope(
+                                        latest_document_response = document_response_for(page)
+                                        adopt_page_observations(page)
+                                    if navigation_mode == POPUP_NAVIGATION or semantic_popup is not None:
+                                        response = latest_document_response
+                                        if response is None:
+                                            raise RuntimeError("Observed popup has no captured main-document HTTP response")
+                                    navigation_ms = round((time.perf_counter() - started) * 1000)
+                                    navigation_policy_ms = navigation_policy_time_ms(started, time.perf_counter())
+                                    navigation_duration_ms += navigation_ms
+                                    browser_lifecycle.advance("AUTHENTICATING")
+                                    require_bootstrap_readiness = bool(
+                                        not results and (
+                                            req.authentication.mode != "none" or req.readiness_selector
+                                            or req.readiness_event or authentication_navigation.active
+                                        )
+                                    )
+
+                                    async def bootstrap_application_ready(target):
+                                        snapshot = await capture_render_health(target)
+                                        snapshot.update(await configured_readiness_conditions(
+                                            target, readiness_selector=req.readiness_selector,
+                                            readiness_event=req.readiness_event,
+                                        ))
+                                        return application_shell_ready(snapshot)
+
+                                    auth_settle = await settle_authentication_navigation(
+                                        page,
+                                        in_portal_scope=lambda candidate: url_in_scan_scope(
+                                            candidate, root_host, req.allow_subdomains, approved_portal_hosts,
+                                        ),
+                                        is_approved_authentication_host=lambda host: host in req.authentication_hosts,
+                                        detect_signals=detect_auth_signals,
+                                        timeout_ms=max(1, min(
+                                            req.authentication_timeout_ms or req.timeout_ms,
+                                            round((route_deadline - time.perf_counter()) * 1000),
+                                        )),
+                                        flow_active=authentication_navigation.active,
+                                        status=response.status if response is not None else None,
+                                        current_status=lambda: (
+                                            latest_document_response.status if latest_document_response is not None
+                                            else response.status if response is not None else None
+                                        ),
+                                        application_ready=(
+                                            bootstrap_application_ready if require_bootstrap_readiness else None
+                                        ),
+                                        application_readiness_timeout_ms=req.readiness_timeout_ms,
+                                        cancel_event=cancel_event,
+                                    )
+                                    authentication_duration_ms += int(auth_settle["elapsed_ms"])
+                                    # This policy records authentication evidence for
+                                    # the shared browser context, not just this page.
+                                    # The main application can settle while a popup's
+                                    # approved SSO POST/callback is still in flight.
+                                    # Every POST still requires protocol evidence,
+                                    # approved destination and normal network checks.
+                                    # goto() may return an intermediate auto-post/callback
+                                    # document. Use the actual final main-document evidence.
+                                    if latest_document_response is not None and navigation_mode not in SAME_DOCUMENT_NAVIGATIONS:
+                                        response = latest_document_response
+                                    if not route_transition_succeeded and auth_settle["completed"]:
+                                        # The final application's own Navigation Timing
+                                        # includes a slow document reached after SSO,
+                                        # but not our auth polling/diagnostic overhead.
+                                        document_timing = await document_navigation_timing(page)
+                                        if document_timing:
+                                            navigation_ms, document_start, document_end = document_timing
+                                            navigation_policy_ms = navigation_policy_time_ms(document_start, document_end)
+                                    log_event(
+                                        logging.INFO, "AUTHENTICATION_OBSERVATION_COMPLETED",
+                                        scan_id=scan_id, stage=auth_settle["stage"],
+                                        hostname=auth_settle["final_host"],
+                                        elapsed_ms=auth_settle["elapsed_ms"],
+                                    )
+                                    log_event(
+                                        logging.INFO,
+                                        "ROUTE_ACTIVATION_COMPLETED",
+                                        scan_id=scan_id,
+                                        current_route=active_route_id,
+                                        activation_method=activation_method,
+                                    )
+                                    final_raw_url = dom_target.url
+                                    final_url = sanitized_url(final_raw_url)
+                                    if response is not None:
+                                        await reconcile_http_redirect_chain(response, current_tracker)
+                                    redirects = current_tracker.redirects()
+                                    for redirect in redirects:
+                                        log_event(logging.INFO, "REDIRECT_DETECTED", scan_id=scan_id, **redirect)
+                                        if not redirect["same_origin"]:
+                                            log_event(logging.INFO, "CROSS_ORIGIN_REDIRECT", scan_id=scan_id, **redirect)
+                                    if response is not None:
+                                        status = response.status
+                                        response_headers = {
+                                            name.lower(): value
+                                            for name, value in (await response.all_headers()).items()
+                                        }
+                                        document_evidence[origin_for_url(final_raw_url)] = {
+                                            "response_headers": response_headers.copy(),
+                                            "strict_tls": urlparse(final_raw_url).scheme == "https",
+                                        }
+                                    else:
+                                        evidence = document_evidence.get(origin_for_url(final_raw_url))
+                                        if evidence is None:
+                                            raise RuntimeError(
+                                                "Same-document route has no validated document context"
+                                            )
+                                        response_headers = dict(evidence["response_headers"])
+                                        inherited_strict_tls = bool(evidence["strict_tls"])
+                                        security_headers_inherited = True
+                                    if (
+                                        url_in_scan_scope(
+                                            final_raw_url,
+                                            root_host,
+                                            req.allow_subdomains,
+                                            approved_portal_hosts,
+                                        )
+                                        and await acknowledge_configured_access_gate(
+                                            page,
+                                            read_only_policy,
+                                            final_raw_url,
+                                            acknowledged_access_gates,
+                                        )
+                                    ):
+                                        final_raw_url = page.url
+                                        final_url = sanitized_url(final_raw_url)
+                                        log_event(
+                                            logging.INFO,
+                                            "ACCESS_GATE_ACKNOWLEDGED",
+                                            scan_id=scan_id,
+                                            hostname=normalized_host(
+                                                urlparse(final_raw_url).hostname or ""
+                                            ),
+                                        )
+                                    final_in_scope = url_in_scan_scope(
                                         final_raw_url,
                                         root_host,
                                         req.allow_subdomains,
                                         approved_portal_hosts,
                                     )
-                                    and await acknowledge_configured_access_gate(
-                                        page,
-                                        read_only_policy,
-                                        final_raw_url,
-                                        acknowledged_access_gates,
-                                    )
-                                ):
-                                    final_raw_url = page.url
-                                    final_url = sanitized_url(final_raw_url)
-                                    log_event(
-                                        logging.INFO,
-                                        "ACCESS_GATE_ACKNOWLEDGED",
-                                        scan_id=scan_id,
-                                        hostname=normalized_host(
-                                            urlparse(final_raw_url).hostname or ""
-                                        ),
-                                    )
-                                final_in_scope = url_in_scan_scope(
-                                    final_raw_url,
-                                    root_host,
-                                    req.allow_subdomains,
-                                    approved_portal_hosts,
-                                )
-                                if view_control and final_in_scope:
-                                    observed_view_url = normalize_route_url(
-                                        final_raw_url, query_policy=req.query_parameter_policy,
-                                        allowed_query_parameters=set(req.allowed_query_parameters),
-                                    )
-                                    if observed_view_url and observed_view_url != route_identity:
-                                        view_navigation_aliases[observed_view_url] = route_key
-                                password_form, mfa_form = await detect_auth_signals(dom_target)
-                                authentication_classification = classify_authentication(
-                                    authentication_mode=req.authentication.mode,
-                                    status=status,
-                                    final_url=final_raw_url,
-                                    target_in_scope=final_in_scope,
-                                    error_classification=None,
-                                    password_form=password_form,
-                                    mfa_form=mfa_form,
-                                )
-                                if auth_settle["timed_out"] and auth_settle["stage"] != "APPLICATION_BOOTSTRAP_PENDING":
-                                    authentication_classification = "AUTH_TIMEOUT"
-                                if active_route_activation_id in authentication_denials:
-                                    authentication_classification = "AUTHENTICATION_BLOCKED"
-                                if (
-                                    application_gate_confirmed and status == 403 and final_in_scope
-                                    and not password_form and not mfa_form
-                                    and authentication_classification != "AUTHENTICATION_BLOCKED"
-                                    and not auth_protocol_signal(final_raw_url, boundary_only=True)
-                                ):
-                                    authentication_classification = "AUTHORIZATION_DENIED"
-                                log_event(
-                                    logging.INFO,
-                                    (
-                                        "SPA_ROUTE_TRANSITIONED"
-                                        if route_transition_succeeded
-                                        else "DOCUMENT_NAVIGATION_COMPLETED"
-                                    ),
-                                    scan_id=scan_id,
-                                    final_url=final_raw_url,
-                                    hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
-                                    http_status=status,
-                                    redirect_count=len(redirects),
-                                    classification=authentication_classification,
-                                    navigation_type=navigation_mode,
-                                )
-                                if authentication_classification != "PASS":
-                                    log_event(
-                                        logging.WARNING,
-                                        authentication_classification,
-                                        scan_id=scan_id,
-                                        final_url=final_raw_url,
-                                    )
-                                log_event(logging.INFO, "PAGE_VALIDATION_STARTED", scan_id=scan_id, final_url=final_raw_url)
-                                if authentication_classification == "PASS":
-                                    # A stable scoped document plus absence of
-                                    # login/MFA evidence establishes the session;
-                                    # rendered application readiness is separate.
-                                    browser_lifecycle.advance("SESSION_ESTABLISHED")
-                                    browser_lifecycle.advance("APPLICATION_BOOTSTRAP")
-                                else:
-                                    browser_lifecycle.fail(
-                                        authentication_classification or "AUTHENTICATION_INCOMPLETE",
-                                        stage="ROUTE_VALIDATION" if authentication_classification == "AUTHORIZATION_DENIED" else None,
-                                    )
-                                render_start_ms = round((time.perf_counter() - started) * 1000)
-                                readiness_started = time.perf_counter()
-                                # At bootstrap a never-settling resource (pixel, long
-                                # poll) must not consume the whole route budget: keep
-                                # headroom so the scan-wide gate decides on observed
-                                # readiness instead of failing on a route timeout.
-                                route_budget_s = (req.per_route_timeout_ms or req.timeout_ms) / 1000
-                                gate_reserve_s = 0.0 if application_gate_confirmed else min(
-                                    2.0, max(0.25, route_budget_s * 0.2),
-                                )
-                                readiness_deadline = max(readiness_started, min(
-                                    route_deadline - gate_reserve_s,
-                                    readiness_started + (req.readiness_timeout_ms or req.timeout_ms) / 1000,
-                                ))
-                                render_health = await wait_for_render_settle(
-                                    dom_target,
-                                    settle_ms=req.render_settle_ms,
-                                    maximum_ms=max(0, round((readiness_deadline - time.perf_counter()) * 1000)),
-                                    network_activity=route_activity_snapshot,
-                                    minimum_observation_ms=req.min_observation_ms,
-                                    network_quiet_ms=req.network_quiet_ms,
-                                    readiness_selector=req.readiness_selector if dom_target == page else None,
-                                    readiness_event=req.readiness_event if dom_target == page else None,
-                                    view_control=view_control,
-                                    network_settle_cap_ms=req.network_settle_cap_ms,
-                                ) if authentication_classification == "PASS" else None
-                                if dom_target != page and render_health is not None and (req.readiness_selector or req.readiness_event):
-                                    # The configured application-shell selector lives
-                                    # in the parent; child views must additionally
-                                    # satisfy their own visible render readiness.
-                                    render_health["configured_readiness_met"] = False
-                                    parent_readiness_ms = max(0, round((readiness_deadline - time.perf_counter()) * 1000))
-                                    if parent_readiness_ms:
-                                        try:
-                                            render_health.update(await configured_readiness_conditions(
-                                                page, readiness_selector=req.readiness_selector,
-                                                readiness_event=req.readiness_event,
-                                                timeout_ms=parent_readiness_ms,
-                                                wait_until_met=True,
-                                            ))
-                                        except TimeoutError:
-                                            # Exhausting a readiness observation does
-                                            # not turn a completed view activation into
-                                            # an invented document-navigation timeout.
-                                            pass
-                                readiness_duration_ms += round((time.perf_counter() - readiness_started) * 1000)
-                                # Authentication observation precedes render settling.
-                                # A delayed client redirect/login must not be mistaken
-                                # for an authenticated application shell afterwards.
-                                if authentication_classification == "PASS":
-                                    final_raw_url = dom_target.url
-                                    final_url = sanitized_url(final_raw_url)
-                                    final_in_scope = url_in_scan_scope(
-                                        final_raw_url, root_host, req.allow_subdomains, approved_portal_hosts,
-                                    )
+                                    if view_control and final_in_scope:
+                                        observed_view_url = normalize_route_url(
+                                            final_raw_url, query_policy=req.query_parameter_policy,
+                                            allowed_query_parameters=set(req.allowed_query_parameters),
+                                        )
+                                        if observed_view_url and observed_view_url != route_identity:
+                                            view_navigation_aliases[observed_view_url] = route_key
                                     password_form, mfa_form = await detect_auth_signals(dom_target)
                                     authentication_classification = classify_authentication(
-                                        authentication_mode=req.authentication.mode, status=status,
-                                        final_url=final_raw_url, target_in_scope=final_in_scope,
-                                        error_classification=None, password_form=password_form, mfa_form=mfa_form,
+                                        authentication_mode=req.authentication.mode,
+                                        status=status,
+                                        final_url=final_raw_url,
+                                        target_in_scope=final_in_scope,
+                                        error_classification=None,
+                                        password_form=password_form,
+                                        mfa_form=mfa_form,
                                     )
-                                if active_route_activation_id in authentication_denials:
-                                    authentication_classification = "AUTHENTICATION_BLOCKED"
-                                application_ready = bool(
-                                    authentication_classification == "PASS" and final_in_scope
-                                    and application_shell_ready(render_health)
-                                )
-                                if application_ready:
-                                    browser_lifecycle.advance("APPLICATION_READY")
-                                    # Bootstrap headings/titles may still describe a
-                                    # loading surface immediately after navigation.
-                                    # Name the rendered destination, not that placeholder.
-                                    title = sanitize_text(
-                                        await retry_dom_operation(dom_target, dom_target.title), limit=512,
+                                    if auth_settle["timed_out"] and auth_settle["stage"] != "APPLICATION_BOOTSTRAP_PENDING":
+                                        authentication_classification = "AUTH_TIMEOUT"
+                                    if active_route_activation_id in authentication_denials:
+                                        authentication_classification = "AUTHENTICATION_BLOCKED"
+                                    if (
+                                        application_gate_confirmed and status == 403 and final_in_scope
+                                        and not password_form and not mfa_form
+                                        and authentication_classification != "AUTHENTICATION_BLOCKED"
+                                        and not auth_protocol_signal(final_raw_url, boundary_only=True)
+                                    ):
+                                        authentication_classification = "AUTHORIZATION_DENIED"
+                                    log_event(
+                                        logging.INFO,
+                                        (
+                                            "SPA_ROUTE_TRANSITIONED"
+                                            if route_transition_succeeded
+                                            else "DOCUMENT_NAVIGATION_COMPLETED"
+                                        ),
+                                        scan_id=scan_id,
+                                        final_url=final_raw_url,
+                                        hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
+                                        http_status=status,
+                                        redirect_count=len(redirects),
+                                        classification=authentication_classification,
+                                        navigation_type=navigation_mode,
                                     )
-                                    name_evidence = await collect_route_name_evidence(dom_target)
-                                elif authentication_classification != "PASS":
-                                    browser_lifecycle.fail(
-                                        authentication_classification or "AUTHENTICATION_INCOMPLETE", stage="AUTHENTICATING",
+                                    if authentication_classification != "PASS":
+                                        log_event(
+                                            logging.WARNING,
+                                            authentication_classification,
+                                            scan_id=scan_id,
+                                            final_url=final_raw_url,
+                                        )
+                                    log_event(logging.INFO, "PAGE_VALIDATION_STARTED", scan_id=scan_id, final_url=final_raw_url)
+                                    if authentication_classification == "PASS":
+                                        # A stable scoped document plus absence of
+                                        # login/MFA evidence establishes the session;
+                                        # rendered application readiness is separate.
+                                        browser_lifecycle.advance("SESSION_ESTABLISHED")
+                                        browser_lifecycle.advance("APPLICATION_BOOTSTRAP")
+                                    else:
+                                        browser_lifecycle.fail(
+                                            authentication_classification or "AUTHENTICATION_INCOMPLETE",
+                                            stage="ROUTE_VALIDATION" if authentication_classification == "AUTHORIZATION_DENIED" else None,
+                                        )
+                                    render_start_ms = round((time.perf_counter() - started) * 1000)
+                                    readiness_started = time.perf_counter()
+                                    # At bootstrap a never-settling resource (pixel, long
+                                    # poll) must not consume the whole route budget: keep
+                                    # headroom so the scan-wide gate decides on observed
+                                    # readiness instead of failing on a route timeout.
+                                    route_budget_s = (req.per_route_timeout_ms or req.timeout_ms) / 1000
+                                    gate_reserve_s = 0.0 if application_gate_confirmed else min(
+                                        2.0, max(0.25, route_budget_s * 0.2),
                                     )
-                                else:
-                                    browser_lifecycle.fail("APPLICATION_NOT_READY")
-                                log_event(
-                                    logging.INFO if application_ready else logging.WARNING,
-                                    "APPLICATION_SHELL_READY" if application_ready else "APPLICATION_SHELL_NOT_READY",
-                                    scan_id=scan_id, hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
-                                    configured_readiness=bool(req.readiness_selector or req.readiness_event),
-                                    authentication_status=authentication_classification,
-                                )
-                                rejected_session = rejected_session_response()
-                                if rejected_session is not None:
-                                    reject_global_authentication(
-                                        "SESSION_EXPIRED" if application_gate_confirmed or req.authentication.mode == "storage_state"
-                                        else "AUTHENTICATION_FAILED",
-                                        status=401, endpoint=rejected_session.get("url") or final_raw_url,
-                                        method=rejected_session.get("method"),
-                                        policy_decision=rejected_session.get("policy_decision"),
-                                        duration_ms=round((time.perf_counter() - started) * 1000),
+                                    readiness_deadline = max(readiness_started, min(
+                                        route_deadline - gate_reserve_s,
+                                        readiness_started + (req.readiness_timeout_ms or req.timeout_ms) / 1000,
+                                    ))
+                                    render_health = await wait_for_render_settle(
+                                        dom_target,
+                                        settle_ms=req.render_settle_ms,
+                                        maximum_ms=max(0, round((readiness_deadline - time.perf_counter()) * 1000)),
+                                        network_activity=route_activity_snapshot,
+                                        minimum_observation_ms=req.min_observation_ms,
+                                        network_quiet_ms=req.network_quiet_ms,
+                                        readiness_selector=req.readiness_selector if dom_target == page else None,
+                                        readiness_event=req.readiness_event if dom_target == page else None,
+                                        view_control=view_control,
+                                        network_settle_cap_ms=req.network_settle_cap_ms,
+                                    ) if authentication_classification == "PASS" else None
+                                    if dom_target != page and render_health is not None and (req.readiness_selector or req.readiness_event):
+                                        # The configured application-shell selector lives
+                                        # in the parent; child views must additionally
+                                        # satisfy their own visible render readiness.
+                                        render_health["configured_readiness_met"] = False
+                                        parent_readiness_ms = max(0, round((readiness_deadline - time.perf_counter()) * 1000))
+                                        if parent_readiness_ms:
+                                            try:
+                                                render_health.update(await configured_readiness_conditions(
+                                                    page, readiness_selector=req.readiness_selector,
+                                                    readiness_event=req.readiness_event,
+                                                    timeout_ms=parent_readiness_ms,
+                                                    wait_until_met=True,
+                                                ))
+                                            except TimeoutError:
+                                                # Exhausting a readiness observation does
+                                                # not turn a completed view activation into
+                                                # an invented document-navigation timeout.
+                                                pass
+                                    readiness_duration_ms += round((time.perf_counter() - readiness_started) * 1000)
+                                    # Authentication observation precedes render settling.
+                                    # A delayed client redirect/login must not be mistaken
+                                    # for an authenticated application shell afterwards.
+                                    if authentication_classification == "PASS":
+                                        final_raw_url = dom_target.url
+                                        final_url = sanitized_url(final_raw_url)
+                                        final_in_scope = url_in_scan_scope(
+                                            final_raw_url, root_host, req.allow_subdomains, approved_portal_hosts,
+                                        )
+                                        password_form, mfa_form = await detect_auth_signals(dom_target)
+                                        authentication_classification = classify_authentication(
+                                            authentication_mode=req.authentication.mode, status=status,
+                                            final_url=final_raw_url, target_in_scope=final_in_scope,
+                                            error_classification=None, password_form=password_form, mfa_form=mfa_form,
+                                        )
+                                    if active_route_activation_id in authentication_denials:
+                                        authentication_classification = "AUTHENTICATION_BLOCKED"
+                                    application_ready = bool(
+                                        authentication_classification == "PASS" and final_in_scope
+                                        and application_shell_ready(render_health)
                                     )
-                                if not application_gate_confirmed:
-                                    if not application_ready:
+                                    if application_ready:
+                                        browser_lifecycle.advance("APPLICATION_READY")
+                                        # Bootstrap headings/titles may still describe a
+                                        # loading surface immediately after navigation.
+                                        # Name the rendered destination, not that placeholder.
+                                        title = sanitize_text(
+                                            await retry_dom_operation(dom_target, dom_target.title), limit=512,
+                                        )
+                                        name_evidence = await collect_route_name_evidence(dom_target)
+                                    elif authentication_classification != "PASS":
+                                        browser_lifecycle.fail(
+                                            authentication_classification or "AUTHENTICATION_INCOMPLETE", stage="AUTHENTICATING",
+                                        )
+                                    else:
+                                        browser_lifecycle.fail("APPLICATION_NOT_READY")
+                                    log_event(
+                                        logging.INFO if application_ready else logging.WARNING,
+                                        "APPLICATION_SHELL_READY" if application_ready else "APPLICATION_SHELL_NOT_READY",
+                                        scan_id=scan_id, hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
+                                        configured_readiness=bool(req.readiness_selector or req.readiness_event),
+                                        authentication_status=authentication_classification,
+                                    )
+                                    rejected_session = rejected_session_response()
+                                    if rejected_session is not None:
                                         reject_global_authentication(
-                                            authentication_classification, status=status, endpoint=final_raw_url,
-                                            stage="APPLICATION_BOOTSTRAP" if authentication_classification == "PASS" else "AUTHENTICATING",
+                                            "SESSION_EXPIRED" if application_gate_confirmed or req.authentication.mode == "storage_state"
+                                            else "AUTHENTICATION_FAILED",
+                                            status=401, endpoint=rejected_session.get("url") or final_raw_url,
+                                            method=rejected_session.get("method"),
+                                            policy_decision=rejected_session.get("policy_decision"),
                                             duration_ms=round((time.perf_counter() - started) * 1000),
                                         )
-                                    await publish_progress("AUTHENTICATED")
-                                    await publish_progress("APPLICATION_READY")
-                                    application_gate_confirmed = True
-                                    discovered_routes.add(route_key)
-                                    queued_routes.add(route_key)
-                                    await publish_progress("DISCOVERING_ROUTES", discovered=len(discovered_routes), queued=len(queue))
-                                elif authentication_classification in {
-                                    "AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "AUTH_FAILED", "AUTH_TIMEOUT",
-                                    "SESSION_EXPIRED", "MFA_REQUIRED", "AUTHENTICATION_BLOCKED",
-                                }:
-                                    reject_global_authentication(
-                                        authentication_classification, status=status, endpoint=final_raw_url,
-                                        duration_ms=round((time.perf_counter() - started) * 1000),
+                                    if not application_gate_confirmed:
+                                        if not application_ready:
+                                            reject_global_authentication(
+                                                authentication_classification, status=status, endpoint=final_raw_url,
+                                                stage="APPLICATION_BOOTSTRAP" if authentication_classification == "PASS" else "AUTHENTICATING",
+                                                duration_ms=round((time.perf_counter() - started) * 1000),
+                                            )
+                                        await publish_progress("AUTHENTICATED")
+                                        await publish_progress("APPLICATION_READY")
+                                        application_gate_confirmed = True
+                                        discovered_routes.add(route_key)
+                                        queued_routes.add(route_key)
+                                        await publish_progress("DISCOVERING_ROUTES", discovered=len(discovered_routes), queued=len(queue))
+                                    elif authentication_classification in {
+                                        "AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "AUTH_FAILED", "AUTH_TIMEOUT",
+                                        "SESSION_EXPIRED", "MFA_REQUIRED", "AUTHENTICATION_BLOCKED",
+                                    }:
+                                        reject_global_authentication(
+                                            authentication_classification, status=status, endpoint=final_raw_url,
+                                            duration_ms=round((time.perf_counter() - started) * 1000),
+                                        )
+                                    if application_ready and navigation_mode == DOCUMENT_NAVIGATION:
+                                        # Only alias an actually observed successful document
+                                        # redirect, never infer that '/' and 'index.html' are
+                                        # equivalent for every application.
+                                        actual_document = normalize_route_url(
+                                            final_raw_url, query_policy=req.query_parameter_policy,
+                                            allowed_query_parameters=set(req.allowed_query_parameters),
+                                        )
+                                        if actual_document and actual_document != route_identity:
+                                            document_navigation_aliases[actual_document] = route_key
+                                    log_event(
+                                        logging.INFO,
+                                        "ROUTE_SETTLE_COMPLETED",
+                                        scan_id=scan_id,
+                                        current_route=active_route_id,
+                                        settle_reason=(render_health or {}).get("settle_reason"),
+                                        settle_elapsed_ms=(render_health or {}).get("settle_elapsed_ms"),
+                                        network_pending=(render_health or {}).get("network_pending"),
                                     )
-                                if application_ready and navigation_mode == DOCUMENT_NAVIGATION:
-                                    # Only alias an actually observed successful document
-                                    # redirect, never infer that '/' and 'index.html' are
-                                    # equivalent for every application.
-                                    actual_document = normalize_route_url(
-                                        final_raw_url, query_policy=req.query_parameter_policy,
-                                        allowed_query_parameters=set(req.allowed_query_parameters),
-                                    )
-                                    if actual_document and actual_document != route_identity:
-                                        document_navigation_aliases[actual_document] = route_key
-                                log_event(
-                                    logging.INFO,
-                                    "ROUTE_SETTLE_COMPLETED",
-                                    scan_id=scan_id,
-                                    current_route=active_route_id,
-                                    settle_reason=(render_health or {}).get("settle_reason"),
-                                    settle_elapsed_ms=(render_health or {}).get("settle_elapsed_ms"),
-                                    network_pending=(render_health or {}).get("network_pending"),
-                                )
-                                frame_observations = [
-                                    {
-                                        "url": sanitized_url(frame.url),
-                                        "main_frame": frame == page.main_frame,
-                                        "same_origin": origin_for_url(frame.url) == origin_for_url(final_raw_url),
-                                        "observation": (
-                                            "MAIN_DOCUMENT" if frame == page.main_frame else
-                                            "SAME_ORIGIN_FRAME" if origin_for_url(frame.url) == origin_for_url(final_raw_url) else
-                                            "CROSS_ORIGIN_FRAME_OBSERVED"
-                                        ),
-                                        "in_portal_scope": url_in_scan_scope(
-                                            frame.url,
+                                    frame_observations = [
+                                        {
+                                            "url": sanitized_url(frame.url),
+                                            "main_frame": frame == page.main_frame,
+                                            "same_origin": origin_for_url(frame.url) == origin_for_url(final_raw_url),
+                                            "observation": (
+                                                "MAIN_DOCUMENT" if frame == page.main_frame else
+                                                "SAME_ORIGIN_FRAME" if origin_for_url(frame.url) == origin_for_url(final_raw_url) else
+                                                "CROSS_ORIGIN_FRAME_OBSERVED"
+                                            ),
+                                            "in_portal_scope": url_in_scan_scope(
+                                                frame.url,
+                                                root_host,
+                                                req.allow_subdomains,
+                                                approved_portal_hosts,
+                                            ),
+                                        }
+                                        for frame in page.frames
+                                        if frame.url.startswith(("http://", "https://"))
+                                    ]
+                                    if (
+                                        req.check_links
+                                        and final_in_scope
+                                        and authentication_classification == "PASS"
+                                        and application_ready
+                                    ):
+                                        observation_phase = "DISCOVERY"
+                                        browser_lifecycle.advance("ROUTE_DISCOVERY")
+                                        discovery_started = time.perf_counter()
+                                        # Validation is complete; discovery gets its own
+                                        # budget instead of the route's remaining time.
+                                        route_deadline = min(deadline, discovery_started + (
+                                            req.discovery_timeout_ms or req.navigation_timeout_ms or req.timeout_ms
+                                        ) / 1000)
+                                        route_scope.reschedule(route_deadline)
+                                        await publish_progress(
+                                            "DISCOVERING_ROUTES",
+                                            discovered=len(discovered_routes),
+                                            queued=len(queue),
+                                            validated=len(results),
+                                            current_route=active_route_id,
+                                        )
+                                        async def retain_panel_routes(routes):
+                                            require_current_session()
+                                            external_links[:] = sorted(set(external_links).union(
+                                                enqueue_discovered_routes(routes, depth, final_raw_url),
+                                            ))
+
+                                        async def observe_discovery_panel(target=page):
+                                            require_current_session()
+                                            snapshot = await wait_for_render_settle(
+                                                target,
+                                                settle_ms=req.menu_settle_ms,
+                                                maximum_ms=max(0, round((route_deadline - time.perf_counter()) * 1000)),
+                                                network_activity=route_activity_snapshot,
+                                                minimum_observation_ms=min(req.min_observation_ms, req.menu_settle_ms),
+                                                network_quiet_ms=min(req.network_quiet_ms, req.menu_settle_ms),
+                                                network_settle_cap_ms=req.network_settle_cap_ms,
+                                            )
+                                            require_current_session()
+                                            return snapshot
+
+                                        # A zero action budget forbids activation, not
+                                        # observation or accounting of unvisited controls.
+                                        navigation_actions = await expand_safe_navigation(
+                                            page,
+                                            req.max_navigation_actions,
+                                            timeout_ms=max(1, min(
+                                                req.navigation_timeout_ms or req.timeout_ms,
+                                                round((route_deadline - time.perf_counter()) * 1000),
+                                            )),
+                                            wait_after_action=observe_discovery_panel,
+                                            maximum_scrolls=req.max_discovery_scrolls,
+                                            on_routes_discovered=retain_panel_routes,
+                                            explored_controls=explored_navigation_controls,
+                                        )
+                                        safe_routes = list(navigation_actions.pop("routes", []))
+                                        if navigation_actions["activated"]:
+                                            log_event(
+                                                logging.INFO,
+                                                "NAVIGATION_MENU_EXPANDED",
+                                                scan_id=scan_id,
+                                                count=navigation_actions["activated"],
+                                            )
+                                        if navigation_actions["skipped"]:
+                                            log_event(
+                                                logging.INFO,
+                                                "UNSAFE_CONTROL_SKIPPED",
+                                                scan_id=scan_id,
+                                                count=navigation_actions["skipped"],
+                                            )
+                                        discovered = safe_routes + await discover_page_routes(
+                                            page,
+                                            req.max_discovery_scrolls,
+                                        )
+                                        for frame in page.frames:
+                                            if (frame == page.main_frame
+                                                or origin_for_url(frame.url) != origin_for_url(final_raw_url)
+                                                or not url_in_scan_scope(
+                                                frame.url, root_host, req.allow_subdomains,
+                                                approved_portal_hosts,
+                                            )):
+                                                continue
+                                            try:
+                                                frame_actions = await expand_safe_navigation(
+                                                    frame,
+                                                    max(0, req.max_navigation_actions - int(navigation_actions["activated"])),
+                                                    timeout_ms=max(1, min(
+                                                        req.navigation_timeout_ms or req.timeout_ms,
+                                                        round((route_deadline - time.perf_counter()) * 1000),
+                                                    )),
+                                                    maximum_scrolls=req.max_discovery_scrolls,
+                                                    wait_after_action=lambda target=frame: observe_discovery_panel(target),
+                                                    on_routes_discovered=retain_panel_routes,
+                                                    explored_controls=explored_navigation_controls,
+                                                )
+                                                frame_routes = list(frame_actions.pop("routes", []))
+                                                for metric in ("activated", "skipped", "inspected", "remaining", "discovered", "unresolved", "view_controls", "menus_expanded"):
+                                                    navigation_actions[metric] = int(navigation_actions.get(metric, 0)) + int(frame_actions.get(metric, 0))
+                                                navigation_actions["limit_reached"] = bool(
+                                                    navigation_actions.get("limit_reached") or frame_actions.get("limit_reached")
+                                                )
+                                            except PlaywrightError:
+                                                # A detached frame must not discard routes already
+                                                # discovered in healthy documents.
+                                                log_event(logging.INFO, "FRAME_DISCOVERY_UNAVAILABLE", scan_id=scan_id)
+                                                navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + 1
+                                                continue
+                                            discovered.extend(frame_routes)
+                                        # A popup may finish after a route's early
+                                        # collection window. Retain every observed
+                                        # page; ordinary route deduplication applies.
+                                        if popup_tasks:
+                                            _, pending_popups = await asyncio.wait(
+                                                tuple(popup_tasks), timeout=max(0, route_deadline - time.perf_counter()),
+                                            )
+                                            if pending_popups:
+                                                navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + len(pending_popups)
+                                        discovered.extend(popup_routes)
+                                        new_popup_failures = popup_observation_failures - accounted_popup_observation_failures
+                                        accounted_popup_observation_failures = popup_observation_failures
+                                        navigation_actions["popup_observation_failures"] = new_popup_failures
+                                        navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + new_popup_failures
+                                        unique_discovered: dict[str, DiscoveredRoute] = {}
+                                        for route in discovered:
+                                            identity = normalize_route_url(
+                                                route.url,
+                                                query_policy=req.query_parameter_policy,
+                                                allowed_query_parameters=set(req.allowed_query_parameters),
+                                            )
+                                            if identity is not None:
+                                                key = discovered_route_key(route, identity)
+                                                existing = unique_discovered.get(key)
+                                                if (existing is None or (not existing.label and route.label)
+                                                        or len(route.navigation_hierarchy) > len(existing.navigation_hierarchy)):
+                                                    unique_discovered[key] = route
+                                        discovered = list(unique_discovered.values())
+                                        download_routes = [
+                                            route for route in discovered
+                                            if route.navigation_mode == DOWNLOAD_OBSERVED
+                                        ]
+                                        navigation_actions["downloads_observed"] = len(download_routes)
+                                        if final_in_scope:
+                                            external_links[:] = sorted(set(external_links).union(
+                                                enqueue_discovered_routes(discovered, depth, final_raw_url),
+                                            ))
+                                        route_discovery_ms = round(
+                                            (time.perf_counter() - discovery_started) * 1000
+                                        )
+                                        discovery_duration_ms += route_discovery_ms
+                                        observation_phase = "ROUTE_VALIDATION"
+                            except _AuthenticationGateFailure:
+                                raise
+                            except Exception as exc:
+                                if isinstance(exc, TimeoutError) and observation_phase == "DISCOVERY":
+                                    browser_lifecycle.fail("DISCOVERY_TIMEOUT")
+                                    # The document already loaded. Exhausting a
+                                    # menu's observation budget is incomplete
+                                    # discovery, not a main-document load failure.
+                                    # Earlier panel observations are already queued.
+                                    navigation_actions["timed_out"] = True
+                                    route_discovery_ms = round((time.perf_counter() - discovery_started) * 1000)
+                                    discovery_duration_ms += route_discovery_ms
+                                    observation_phase = "ROUTE_VALIDATION"
+                                    log_event(logging.WARNING, "ROUTE_DISCOVERY_TIMEOUT", scan_id=scan_id,
+                                              current_route=active_route_id, queued=len(queue))
+                                elif isinstance(exc, PlaywrightError) and observation_phase == "DISCOVERY":
+                                    browser_lifecycle.fail("DISCOVERY_FAILED")
+                                    # The document loaded successfully. A persistent
+                                    # browser/DOM discovery failure must be visible,
+                                    # not silently healthy or a fabricated load failure.
+                                    navigation_actions["error"] = sanitized_diagnostic(str(exc))
+                                    navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + 1
+                                    route_discovery_ms = round((time.perf_counter() - discovery_started) * 1000)
+                                    discovery_duration_ms += route_discovery_ms
+                                    observation_phase = "ROUTE_VALIDATION"
+                                    log_event(logging.ERROR, "ROUTE_DISCOVERY_FAILED", scan_id=scan_id,
+                                              current_route=active_route_id, error=navigation_actions["error"])
+                                else:
+                                    if isinstance(exc, TimeoutError):
+                                        error = "Configured maximum time per route exceeded"
+                                        error_classification = "TIMEOUT"
+                                    elif navigation_policy_error is not None:
+                                        error = navigation_policy_error.public_message
+                                        error_classification = navigation_policy_error.classification
+                                    else:
+                                        error = sanitized_diagnostic(str(exc))
+                                        error_classification = classify_navigation_error(error)
+                                    final_raw_url = page.url if page.url.startswith(("http://", "https://")) else url
+                                    final_url = sanitized_url(final_raw_url)
+                                    redirects = current_tracker.redirects()
+                                    authentication_classification = classify_authentication(
+                                        authentication_mode=req.authentication.mode,
+                                        status=status,
+                                        final_url=final_raw_url,
+                                        target_in_scope=url_in_scan_scope(
+                                            final_raw_url,
                                             root_host,
                                             req.allow_subdomains,
                                             approved_portal_hosts,
                                         ),
-                                    }
-                                    for frame in page.frames
-                                    if frame.url.startswith(("http://", "https://"))
-                                ]
-                                if (
-                                    req.check_links
-                                    and final_in_scope
-                                    and authentication_classification == "PASS"
-                                    and application_ready
-                                ):
-                                    observation_phase = "DISCOVERY"
-                                    browser_lifecycle.advance("ROUTE_DISCOVERY")
-                                    discovery_started = time.perf_counter()
-                                    # Validation is complete; discovery gets its own
-                                    # budget instead of the route's remaining time.
-                                    route_deadline = min(deadline, discovery_started + (
-                                        req.discovery_timeout_ms or req.navigation_timeout_ms or req.timeout_ms
-                                    ) / 1000)
-                                    route_scope.reschedule(route_deadline)
-                                    await publish_progress(
-                                        "DISCOVERING_ROUTES",
-                                        discovered=len(discovered_routes),
-                                        queued=len(queue),
-                                        validated=len(results),
-                                        current_route=active_route_id,
+                                        error_classification=error_classification,
                                     )
-                                    async def retain_panel_routes(routes):
-                                        require_current_session()
-                                        external_links[:] = sorted(set(external_links).union(
-                                            enqueue_discovered_routes(routes, depth, final_raw_url),
-                                        ))
-
-                                    async def observe_discovery_panel(target=page):
-                                        require_current_session()
-                                        snapshot = await wait_for_render_settle(
-                                            target,
-                                            settle_ms=req.menu_settle_ms,
-                                            maximum_ms=max(0, round((route_deadline - time.perf_counter()) * 1000)),
-                                            network_activity=route_activity_snapshot,
-                                            minimum_observation_ms=min(req.min_observation_ms, req.menu_settle_ms),
-                                            network_quiet_ms=min(req.network_quiet_ms, req.menu_settle_ms),
-                                            network_settle_cap_ms=req.network_settle_cap_ms,
-                                        )
-                                        require_current_session()
-                                        return snapshot
-
-                                    # A zero action budget forbids activation, not
-                                    # observation or accounting of unvisited controls.
-                                    navigation_actions = await expand_safe_navigation(
-                                        page,
-                                        req.max_navigation_actions,
-                                        timeout_ms=max(1, min(
-                                            req.navigation_timeout_ms or req.timeout_ms,
-                                            round((route_deadline - time.perf_counter()) * 1000),
-                                        )),
-                                        wait_after_action=observe_discovery_panel,
-                                        maximum_scrolls=req.max_discovery_scrolls,
-                                        on_routes_discovered=retain_panel_routes,
-                                        explored_controls=explored_navigation_controls,
+                                    if active_route_activation_id in authentication_denials:
+                                        authentication_classification = "AUTHENTICATION_BLOCKED"
+                                    browser_lifecycle.fail(
+                                        authentication_classification
+                                        if authentication_classification not in {None, "PASS"}
+                                        else error_classification or "NAVIGATION_ERROR",
                                     )
-                                    safe_routes = list(navigation_actions.pop("routes", []))
-                                    if navigation_actions["activated"]:
-                                        log_event(
-                                            logging.INFO,
-                                            "NAVIGATION_MENU_EXPANDED",
-                                            scan_id=scan_id,
-                                            count=navigation_actions["activated"],
-                                        )
-                                    if navigation_actions["skipped"]:
-                                        log_event(
-                                            logging.INFO,
-                                            "UNSAFE_CONTROL_SKIPPED",
-                                            scan_id=scan_id,
-                                            count=navigation_actions["skipped"],
-                                        )
-                                    discovered = safe_routes + await discover_page_routes(
-                                        page,
-                                        req.max_discovery_scrolls,
+                                    log_event(
+                                        logging.ERROR,
+                                        error_classification,
+                                        scan_id=scan_id,
+                                        requested_url=url,
+                                        final_url=final_raw_url,
+                                        error=error,
                                     )
-                                    for frame in page.frames:
-                                        if (frame == page.main_frame
-                                            or origin_for_url(frame.url) != origin_for_url(final_raw_url)
-                                            or not url_in_scan_scope(
-                                            frame.url, root_host, req.allow_subdomains,
-                                            approved_portal_hosts,
-                                        )):
-                                            continue
-                                        try:
-                                            frame_actions = await expand_safe_navigation(
-                                                frame,
-                                                max(0, req.max_navigation_actions - int(navigation_actions["activated"])),
-                                                timeout_ms=max(1, min(
-                                                    req.navigation_timeout_ms or req.timeout_ms,
-                                                    round((route_deadline - time.perf_counter()) * 1000),
-                                                )),
-                                                maximum_scrolls=req.max_discovery_scrolls,
-                                                wait_after_action=lambda target=frame: observe_discovery_panel(target),
-                                                on_routes_discovered=retain_panel_routes,
-                                                explored_controls=explored_navigation_controls,
-                                            )
-                                            frame_routes = list(frame_actions.pop("routes", []))
-                                            for metric in ("activated", "skipped", "inspected", "remaining", "discovered", "unresolved", "view_controls", "menus_expanded"):
-                                                navigation_actions[metric] = int(navigation_actions.get(metric, 0)) + int(frame_actions.get(metric, 0))
-                                            navigation_actions["limit_reached"] = bool(
-                                                navigation_actions.get("limit_reached") or frame_actions.get("limit_reached")
-                                            )
-                                        except PlaywrightError:
-                                            # A detached frame must not discard routes already
-                                            # discovered in healthy documents.
-                                            log_event(logging.INFO, "FRAME_DISCOVERY_UNAVAILABLE", scan_id=scan_id)
-                                            navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + 1
-                                            continue
-                                        discovered.extend(frame_routes)
-                                    # A popup may finish after a route's early
-                                    # collection window. Retain every observed
-                                    # page; ordinary route deduplication applies.
-                                    if popup_tasks:
-                                        _, pending_popups = await asyncio.wait(
-                                            tuple(popup_tasks), timeout=max(0, route_deadline - time.perf_counter()),
-                                        )
-                                        if pending_popups:
-                                            navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + len(pending_popups)
-                                    discovered.extend(popup_routes)
-                                    new_popup_failures = popup_observation_failures - accounted_popup_observation_failures
-                                    accounted_popup_observation_failures = popup_observation_failures
-                                    navigation_actions["popup_observation_failures"] = new_popup_failures
-                                    navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + new_popup_failures
-                                    unique_discovered: dict[str, DiscoveredRoute] = {}
-                                    for route in discovered:
-                                        identity = normalize_route_url(
-                                            route.url,
-                                            query_policy=req.query_parameter_policy,
-                                            allowed_query_parameters=set(req.allowed_query_parameters),
-                                        )
-                                        if identity is not None:
-                                            key = discovered_route_key(route, identity)
-                                            existing = unique_discovered.get(key)
-                                            if (existing is None or (not existing.label and route.label)
-                                                    or len(route.navigation_hierarchy) > len(existing.navigation_hierarchy)):
-                                                unique_discovered[key] = route
-                                    discovered = list(unique_discovered.values())
-                                    download_routes = [
-                                        route for route in discovered
-                                        if route.navigation_mode == DOWNLOAD_OBSERVED
-                                    ]
-                                    navigation_actions["downloads_observed"] = len(download_routes)
-                                    if final_in_scope:
-                                        external_links[:] = sorted(set(external_links).union(
-                                            enqueue_discovered_routes(discovered, depth, final_raw_url),
-                                        ))
-                                    route_discovery_ms = round(
-                                        (time.perf_counter() - discovery_started) * 1000
-                                    )
-                                    discovery_duration_ms += route_discovery_ms
-                                    observation_phase = "ROUTE_VALIDATION"
-                        except _AuthenticationGateFailure:
-                            raise
-                        except Exception as exc:
-                            if isinstance(exc, TimeoutError) and observation_phase == "DISCOVERY":
-                                browser_lifecycle.fail("DISCOVERY_TIMEOUT")
-                                # The document already loaded. Exhausting a
-                                # menu's observation budget is incomplete
-                                # discovery, not a main-document load failure.
-                                # Earlier panel observations are already queued.
-                                navigation_actions["timed_out"] = True
-                                route_discovery_ms = round((time.perf_counter() - discovery_started) * 1000)
-                                discovery_duration_ms += route_discovery_ms
-                                observation_phase = "ROUTE_VALIDATION"
-                                log_event(logging.WARNING, "ROUTE_DISCOVERY_TIMEOUT", scan_id=scan_id,
-                                          current_route=active_route_id, queued=len(queue))
-                            elif isinstance(exc, PlaywrightError) and observation_phase == "DISCOVERY":
-                                browser_lifecycle.fail("DISCOVERY_FAILED")
-                                # The document loaded successfully. A persistent
-                                # browser/DOM discovery failure must be visible,
-                                # not silently healthy or a fabricated load failure.
-                                navigation_actions["error"] = sanitized_diagnostic(str(exc))
-                                navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + 1
-                                route_discovery_ms = round((time.perf_counter() - discovery_started) * 1000)
-                                discovery_duration_ms += route_discovery_ms
-                                observation_phase = "ROUTE_VALIDATION"
-                                log_event(logging.ERROR, "ROUTE_DISCOVERY_FAILED", scan_id=scan_id,
-                                          current_route=active_route_id, error=navigation_actions["error"])
-                            else:
-                                if isinstance(exc, TimeoutError):
-                                    error = "Configured maximum time per route exceeded"
-                                    error_classification = "TIMEOUT"
-                                elif navigation_policy_error is not None:
-                                    error = navigation_policy_error.public_message
-                                    error_classification = navigation_policy_error.classification
-                                else:
-                                    error = sanitized_diagnostic(str(exc))
-                                    error_classification = classify_navigation_error(error)
-                                final_raw_url = page.url if page.url.startswith(("http://", "https://")) else url
-                                final_url = sanitized_url(final_raw_url)
-                                redirects = current_tracker.redirects()
-                                authentication_classification = classify_authentication(
-                                    authentication_mode=req.authentication.mode,
-                                    status=status,
-                                    final_url=final_raw_url,
-                                    target_in_scope=url_in_scan_scope(
-                                        final_raw_url,
-                                        root_host,
-                                        req.allow_subdomains,
-                                        approved_portal_hosts,
-                                    ),
-                                    error_classification=error_classification,
-                                )
-                                if active_route_activation_id in authentication_denials:
-                                    authentication_classification = "AUTHENTICATION_BLOCKED"
-                                browser_lifecycle.fail(
-                                    authentication_classification
-                                    if authentication_classification not in {None, "PASS"}
-                                    else error_classification or "NAVIGATION_ERROR",
-                                )
-                                log_event(
-                                    logging.ERROR,
-                                    error_classification,
-                                    scan_id=scan_id,
-                                    requested_url=url,
-                                    final_url=final_raw_url,
-                                    error=error,
-                                )
 
-                    # Discovery may itself reveal a delayed sign-in exchange.
-                    # Reconcile that evidence before classifying this route.
-                    require_current_session()
-                    if active_route_activation_id in authentication_denials:
-                        authentication_classification = "AUTHENTICATION_BLOCKED"
-                        application_ready = False
-                        browser_lifecycle.fail("AUTHENTICATION_BLOCKED", stage="AUTHENTICATING")
-                    if (
-                        authentication_classification == "AUTH_REQUIRED"
-                        and req.authentication.mode != "none"
-                        and any(item.get("authentication_status") == "PASS" for item in results)
-                    ):
-                        authentication_classification = "SESSION_EXPIRED"
-                    if authentication_classification == "SESSION_EXPIRED":
-                        session_expired = True
-                        log_event(
-                            logging.WARNING,
-                            "SESSION_EXPIRED",
-                            scan_id=scan_id,
-                            hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
-                        )
+                        # Discovery may itself reveal a delayed sign-in exchange.
+                        # Reconcile that evidence before classifying this route.
+                        require_current_session()
+                        if active_route_activation_id in authentication_denials:
+                            authentication_classification = "AUTHENTICATION_BLOCKED"
+                            application_ready = False
+                            browser_lifecycle.fail("AUTHENTICATION_BLOCKED", stage="AUTHENTICATING")
+                        if (
+                            authentication_classification == "AUTH_REQUIRED"
+                            and req.authentication.mode != "none"
+                            and any(item.get("authentication_status") == "PASS" for item in results)
+                        ):
+                            authentication_classification = "SESSION_EXPIRED"
+                        if authentication_classification == "SESSION_EXPIRED":
+                            session_expired = True
+                            log_event(
+                                logging.WARNING,
+                                "SESSION_EXPIRED",
+                                scan_id=scan_id,
+                                hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
+                            )
 
-                    if not application_gate_confirmed or authentication_classification in {
-                        "AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "AUTH_FAILED", "AUTH_TIMEOUT",
-                        "SESSION_EXPIRED", "MFA_REQUIRED", "AUTHENTICATION_BLOCKED",
-                    }:
-                        reject_global_authentication(
-                            authentication_classification or error_classification,
-                            status=status, endpoint=final_raw_url,
-                            stage="APPLICATION_BOOTSTRAP" if authentication_classification == "PASS" else "AUTHENTICATING",
-                            duration_ms=round((time.perf_counter() - started) * 1000),
-                        )
+                        if not application_gate_confirmed or authentication_classification in {
+                            "AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "AUTH_FAILED", "AUTH_TIMEOUT",
+                            "SESSION_EXPIRED", "MFA_REQUIRED", "AUTHENTICATION_BLOCKED",
+                        }:
+                            reject_global_authentication(
+                                authentication_classification or error_classification,
+                                status=status, endpoint=final_raw_url,
+                                stage="APPLICATION_BOOTSTRAP" if authentication_classification == "PASS" else "AUTHENTICATING",
+                                duration_ms=round((time.perf_counter() - started) * 1000),
+                            )
 
-                    health_validation_started = time.perf_counter()
-                    await publish_progress("VALIDATING_ROUTES", discovered=len(discovered_routes), validated=len(results))
-                    if browser_lifecycle.failed_stage is None:
-                        browser_lifecycle.advance("ROUTE_VALIDATION")
-                    elapsed = round((time.perf_counter() - started) * 1000)
-                    route_validation_ms = max(0, elapsed - route_discovery_ms)
-                    performance_timing = route_performance_timing(
-                        navigation_ms=navigation_ms,
-                        navigation_policy_ms=navigation_policy_ms,
-                        render_health=render_health,
-                        total_validation_ms=route_validation_ms,
-                        render_start_ms=render_start_ms,
-                    )
-                    page_console = list(dict.fromkeys(
-                        event["message"] for event in console_errors
-                        if event.get("route_activation_id") == active_route_activation_id
-                    )) if req.check_console else []
-                    page_script_errors = list(dict.fromkeys(
-                        event["message"] for event in page_errors
-                        if event.get("route_activation_id") == active_route_activation_id
-                    )) if req.check_console else []
-                    page_failures = [
-                        failure for failure in failed_resources
-                        if failure.get("route_activation_id") == active_route_activation_id
-                    ] if req.check_resources else []
-                    page_api_events = [
-                        event for event in api_events
-                        if event.get("route_activation_id") == active_route_activation_id
-                    ]
-                    page_resource_events = [
-                        event for event in resource_events
-                        if event.get("route_activation_id") == active_route_activation_id
-                    ] if req.check_resources else []
-                    if render_health is not None and req.check_resources and time.perf_counter() < route_deadline:
-                        timing_budget = asyncio.timeout_at(route_deadline)
-                        try:
-                            async with timing_budget:
-                                await enrich_resource_timings(page, page_resource_events + page_api_events)
-                        except TimeoutError:
-                            if not timing_budget.expired():
-                                raise
-                            # Optional size diagnostics cannot extend a route's
-                            # work budget or invent a main-document failure.
-                            log_event(logging.INFO, "RESOURCE_TIMING_BUDGET_EXHAUSTED", scan_id=scan_id)
-                    page_resource_details, _ = build_resource_report(
-                        page_resource_events + page_api_events,
-                        large_resource_threshold_bytes=req.large_resource_threshold_bytes,
-                        large_image_threshold_bytes=req.large_image_threshold_bytes,
-                        large_js_threshold_bytes=req.large_js_threshold_bytes,
-                        large_css_font_threshold_bytes=req.large_css_font_threshold_bytes,
-                    )
-                    page_websockets = websocket_events[websocket_start:] if req.check_resources else []
-                    page_event_streams = event_streams[event_stream_start:] if req.check_resources else []
-                    page_downloads = download_events[download_start:]
-                    page_frame_events = [event for event in frame_events if event.get("route_activation_id") == active_route_activation_id]
-                    subresource_failures = sum(not failure["main_document"] for failure in page_failures)
-                    unexpected_subresource_failures = sum(
-                        not failure["main_document"] and not failure.get("blocked_by_validator")
-                        for failure in page_failures
-                    )
-                    if unexpected_subresource_failures:
-                        log_event(
-                            logging.WARNING,
-                            "SUBRESOURCE_FAILURES",
-                            scan_id=scan_id,
-                            hostname=requested_host,
-                            count=unexpected_subresource_failures,
+                        health_validation_started = time.perf_counter()
+                        await publish_progress("VALIDATING_ROUTES", discovered=len(discovered_routes), validated=len(results))
+                        if browser_lifecycle.failed_stage is None:
+                            browser_lifecycle.advance("ROUTE_VALIDATION")
+                        elapsed = round((time.perf_counter() - started) * 1000)
+                        route_validation_ms = max(0, elapsed - route_discovery_ms)
+                        performance_timing = route_performance_timing(
+                            navigation_ms=navigation_ms,
+                            navigation_policy_ms=navigation_policy_ms,
+                            render_health=render_health,
+                            total_validation_ms=route_validation_ms,
+                            render_start_ms=render_start_ms,
                         )
-                    validator_skips = subresource_failures - unexpected_subresource_failures
-                    if validator_skips:
-                        log_event(
-                            logging.INFO,
-                            "VALIDATOR_RESOURCE_SKIPS",
-                            scan_id=scan_id,
-                            hostname=requested_host,
-                            count=validator_skips,
+                        page_console = list(dict.fromkeys(
+                            event["message"] for event in console_errors
+                            if event.get("route_activation_id") == active_route_activation_id
+                        )) if req.check_console else []
+                        page_script_errors = list(dict.fromkeys(
+                            event["message"] for event in page_errors
+                            if event.get("route_activation_id") == active_route_activation_id
+                        )) if req.check_console else []
+                        page_failures = [
+                            failure for failure in failed_resources
+                            if failure.get("route_activation_id") == active_route_activation_id
+                        ] if req.check_resources else []
+                        page_api_events = [
+                            event for event in api_events
+                            if event.get("route_activation_id") == active_route_activation_id
+                        ]
+                        page_resource_events = [
+                            event for event in resource_events
+                            if event.get("route_activation_id") == active_route_activation_id
+                        ] if req.check_resources else []
+                        if render_health is not None and req.check_resources and time.perf_counter() < route_deadline:
+                            timing_budget = asyncio.timeout_at(route_deadline)
+                            try:
+                                async with timing_budget:
+                                    await enrich_resource_timings(page, page_resource_events + page_api_events)
+                            except TimeoutError:
+                                if not timing_budget.expired():
+                                    raise
+                                # Optional size diagnostics cannot extend a route's
+                                # work budget or invent a main-document failure.
+                                log_event(logging.INFO, "RESOURCE_TIMING_BUDGET_EXHAUSTED", scan_id=scan_id)
+                        page_resource_details, _ = build_resource_report(
+                            page_resource_events + page_api_events,
+                            large_resource_threshold_bytes=req.large_resource_threshold_bytes,
+                            large_image_threshold_bytes=req.large_image_threshold_bytes,
+                            large_js_threshold_bytes=req.large_js_threshold_bytes,
+                            large_css_font_threshold_bytes=req.large_css_font_threshold_bytes,
                         )
-                    header_names = SECURITY_HEADERS
-                    if urlparse(final_url or requested_url).scheme != "https":
-                        header_names = tuple(name for name in SECURITY_HEADERS if name != "strict-transport-security")
-                    security_headers_tested = bool(
-                        req.check_security_headers
-                        and (status is not None or security_headers_inherited)
-                    )
-                    header_report = {
-                        name: response_headers.get(name) for name in header_names
-                    } if security_headers_tested else {}
-                    missing_headers = [name for name, value in header_report.items() if not value]
-                    render_classification: str | None = None
-                    health_findings: list[dict] = []
-                    if render_health is not None:
-                        render_classification, health_findings = assess_page_health(
-                            render_health,
-                            load_ms=int(performance_timing["application_load_ms"]),
-                            slow_page_threshold_ms=req.slow_page_threshold_ms,
-                            performance_enabled=req.check_performance,
+                        page_websockets = websocket_events[websocket_start:] if req.check_resources else []
+                        page_event_streams = event_streams[event_stream_start:] if req.check_resources else []
+                        page_downloads = download_events[download_start:]
+                        page_frame_events = [event for event in frame_events if event.get("route_activation_id") == active_route_activation_id]
+                        subresource_failures = sum(not failure["main_document"] for failure in page_failures)
+                        unexpected_subresource_failures = sum(
+                            not failure["main_document"] and not failure.get("blocked_by_validator")
+                            for failure in page_failures
                         )
-                        if not render_health.get("configured_readiness_met", True):
-                            health_findings.append(finding(
-                                "READINESS_NOT_REACHED", "ERROR",
-                                "The configured readiness selector or event was not reached within its budget.",
-                                blocking=True,
-                            ))
-                        elif not application_ready and authentication_classification == "PASS":
-                            health_findings.append(finding(
-                                "APPLICATION_VIEW_NOT_READY", "ERROR",
-                                "The application view did not reach observable rendered readiness; navigation discovery was not performed.",
-                                blocking=True,
-                            ))
-                    health_findings.extend(api_health_findings([
-                        event for event in page_api_events
-                        if not event.get("blocked_by_validator")
-                    ]))
-                    health_findings.extend(realtime_health_findings(
-                        page_websockets,
-                        page_event_streams,
-                    ))
-                    health_findings.extend(large_resource_findings(page_resource_details))
-                    if navigation_actions.get("skipped", 0):
-                        limitation = finding(
-                            "DISCOVERED_BUT_NOT_SAFELY_ACTIVATABLE",
-                            "INFO",
-                            "Navigation-like controls were not activated because they could not be proven safe.",
+                        if unexpected_subresource_failures:
+                            log_event(
+                                logging.WARNING,
+                                "SUBRESOURCE_FAILURES",
+                                scan_id=scan_id,
+                                hostname=requested_host,
+                                count=unexpected_subresource_failures,
+                            )
+                        validator_skips = subresource_failures - unexpected_subresource_failures
+                        if validator_skips:
+                            log_event(
+                                logging.INFO,
+                                "VALIDATOR_RESOURCE_SKIPS",
+                                scan_id=scan_id,
+                                hostname=requested_host,
+                                count=validator_skips,
+                            )
+                        header_names = SECURITY_HEADERS
+                        if urlparse(final_url or requested_url).scheme != "https":
+                            header_names = tuple(name for name in SECURITY_HEADERS if name != "strict-transport-security")
+                        security_headers_tested = bool(
+                            req.check_security_headers
+                            and (status is not None or security_headers_inherited)
                         )
-                        limitation["count"] = int(navigation_actions["skipped"])
-                        health_findings.append(limitation)
-                    if navigation_actions.get("timed_out"):
-                        health_findings.append(finding(
-                            "DISCOVERY_TIMEOUT", "WARNING",
-                            "Navigation discovery reached the configured route budget; earlier observed routes were retained.",
+                        header_report = {
+                            name: response_headers.get(name) for name in header_names
+                        } if security_headers_tested else {}
+                        missing_headers = [name for name, value in header_report.items() if not value]
+                        render_classification: str | None = None
+                        health_findings: list[dict] = []
+                        if render_health is not None:
+                            render_classification, health_findings = assess_page_health(
+                                render_health,
+                                load_ms=int(performance_timing["application_load_ms"]),
+                                slow_page_threshold_ms=req.slow_page_threshold_ms,
+                                performance_enabled=req.check_performance,
+                            )
+                            if not render_health.get("configured_readiness_met", True):
+                                health_findings.append(finding(
+                                    "READINESS_NOT_REACHED", "ERROR",
+                                    "The configured readiness selector or event was not reached within its budget.",
+                                    blocking=True,
+                                ))
+                            elif not application_ready and authentication_classification == "PASS":
+                                health_findings.append(finding(
+                                    "APPLICATION_VIEW_NOT_READY", "ERROR",
+                                    "The application view did not reach observable rendered readiness; navigation discovery was not performed.",
+                                    blocking=True,
+                                ))
+                        health_findings.extend(api_health_findings([
+                            event for event in page_api_events
+                            if not event.get("blocked_by_validator")
+                        ]))
+                        health_findings.extend(realtime_health_findings(
+                            page_websockets,
+                            page_event_streams,
                         ))
-                    if navigation_actions.get("error"):
-                        health_findings.append(finding(
-                            "DISCOVERY_FAILED", "WARNING",
-                            "Navigation discovery failed after bounded browser-context recovery; coverage is incomplete.",
-                            reason=navigation_actions["error"],
-                        ))
-                    if navigation_actions.get("remaining", 0):
-                        limitation = finding(
-                            "NAVIGATION_ACTION_LIMIT", "WARNING",
-                            "Visible navigation controls remain unexplored within the configured action budget.",
+                        health_findings.extend(large_resource_findings(page_resource_details))
+                        if navigation_actions.get("skipped", 0):
+                            limitation = finding(
+                                "DISCOVERED_BUT_NOT_SAFELY_ACTIVATABLE",
+                                "INFO",
+                                "Navigation-like controls were not activated because they could not be proven safe.",
+                            )
+                            limitation["count"] = int(navigation_actions["skipped"])
+                            health_findings.append(limitation)
+                        if navigation_actions.get("timed_out"):
+                            health_findings.append(finding(
+                                "DISCOVERY_TIMEOUT", "WARNING",
+                                "Navigation discovery reached the configured route budget; earlier observed routes were retained.",
+                            ))
+                        if navigation_actions.get("error"):
+                            health_findings.append(finding(
+                                "DISCOVERY_FAILED", "WARNING",
+                                "Navigation discovery failed after bounded browser-context recovery; coverage is incomplete.",
+                                reason=navigation_actions["error"],
+                            ))
+                        if navigation_actions.get("remaining", 0):
+                            limitation = finding(
+                                "NAVIGATION_ACTION_LIMIT", "WARNING",
+                                "Visible navigation controls remain unexplored within the configured action budget.",
+                            )
+                            limitation["count"] = int(navigation_actions["remaining"])
+                            health_findings.append(limitation)
+                        if navigation_actions.get("downloads_observed", 0) or page_downloads:
+                            observed_download = finding(
+                                "DOWNLOAD_OBSERVED",
+                                "INFO",
+                                "A download destination was observed and was not opened or processed.",
+                            )
+                            observed_download["count"] = (
+                                int(navigation_actions.get("downloads_observed", 0))
+                                + len(page_downloads)
+                            )
+                            health_findings.append(observed_download)
+                        cross_origin_frames = sum(
+                            observation.get("observation") == "CROSS_ORIGIN_FRAME_OBSERVED"
+                            for observation in frame_observations
                         )
-                        limitation["count"] = int(navigation_actions["remaining"])
-                        health_findings.append(limitation)
-                    if navigation_actions.get("downloads_observed", 0) or page_downloads:
-                        observed_download = finding(
-                            "DOWNLOAD_OBSERVED",
-                            "INFO",
-                            "A download destination was observed and was not opened or processed.",
+                        if cross_origin_frames:
+                            frame_finding = finding(
+                                "CROSS_ORIGIN_FRAME_OBSERVED",
+                                "INFO",
+                                "A cross-origin frame loaded; its document is reported separately from portal crawl scope.",
+                            )
+                            frame_finding["count"] = cross_origin_frames
+                            health_findings.append(frame_finding)
+                        classification = classify_page_result(
+                            url=final_url or requested_url,
+                            status=status,
+                            error=error,
+                            missing_security_headers=missing_headers,
+                            console_errors=page_console,
+                            page_errors=page_script_errors,
+                            failed_resources=page_failures,
+                            security_headers_tested=security_headers_tested,
+                            authentication_classification=authentication_classification or error_classification,
+                            render_classification=render_classification,
+                            additional_findings=health_findings,
+                            route_transition_succeeded=route_transition_succeeded,
+                            navigation_mode=navigation_mode,
+                            inherited_strict_tls=inherited_strict_tls,
+                            security_headers_inherited=security_headers_inherited,
+                            include_security_header_findings=not security_headers_inherited,
                         )
-                        observed_download["count"] = (
-                            int(navigation_actions.get("downloads_observed", 0))
-                            + len(page_downloads)
-                        )
-                        health_findings.append(observed_download)
-                    cross_origin_frames = sum(
-                        observation.get("observation") == "CROSS_ORIGIN_FRAME_OBSERVED"
-                        for observation in frame_observations
-                    )
-                    if cross_origin_frames:
-                        frame_finding = finding(
-                            "CROSS_ORIGIN_FRAME_OBSERVED",
-                            "INFO",
-                            "A cross-origin frame loaded; its document is reported separately from portal crawl scope.",
-                        )
-                        frame_finding["count"] = cross_origin_frames
-                        health_findings.append(frame_finding)
-                    classification = classify_page_result(
-                        url=final_url or requested_url,
-                        status=status,
-                        error=error,
-                        missing_security_headers=missing_headers,
-                        console_errors=page_console,
-                        page_errors=page_script_errors,
-                        failed_resources=page_failures,
-                        security_headers_tested=security_headers_tested,
-                        authentication_classification=authentication_classification or error_classification,
-                        render_classification=render_classification,
-                        additional_findings=health_findings,
-                        route_transition_succeeded=route_transition_succeeded,
-                        navigation_mode=navigation_mode,
-                        inherited_strict_tls=inherited_strict_tls,
-                        security_headers_inherited=security_headers_inherited,
-                        include_security_header_findings=not security_headers_inherited,
-                    )
-                    api_failure_count = sum(
-                        bool(event.get("error"))
-                        or (isinstance(event.get("status"), int) and event["status"] >= 400)
-                        for event in page_api_events
-                        if not event.get("blocked_by_validator")
-                    )
-                    failed_api_events = [
-                        event for event in page_api_events
-                        if not event.get("blocked_by_validator") and (
+                        api_failure_count = sum(
                             bool(event.get("error"))
                             or (isinstance(event.get("status"), int) and event["status"] >= 400)
+                            for event in page_api_events
+                            if not event.get("blocked_by_validator")
                         )
-                    ]
-                    failed_required_api_count = sum(
-                        event.get("importance") == "REQUIRED" for event in failed_api_events
-                    )
-                    failed_optional_api_count = len(failed_api_events) - failed_required_api_count
-                    api_network_failure_count = sum(
-                        bool(event.get("error")) for event in failed_api_events
-                    )
-                    read_only_blocks = sum(
-                        bool(event.get("blocked_by_validator"))
-                        and event.get("block_reason") == "READ_ONLY_MUTATION_BLOCKED"
-                        for event in page_api_events
-                    )
-                    api_coverage = summarize_route_api_coverage(page_api_events)
-                    final_identity = normalize_route_url(
-                        final_raw_url,
-                        query_policy=req.query_parameter_policy,
-                        allowed_query_parameters=set(req.allowed_query_parameters),
-                    ) or route_identity
-                    identity = route_identity_fields(
-                        final_identity,
-                        query_policy=req.query_parameter_policy,
-                        allowed_query_parameters=set(req.allowed_query_parameters),
-                    )
-                    requested_identity = route_identity_fields(
-                        route_identity,
-                        query_policy=req.query_parameter_policy,
-                        allowed_query_parameters=set(req.allowed_query_parameters),
-                    )
-                    display_url = sanitized_url(final_identity)
-                    route_name, route_name_source, route_name_confidence = resolve_route_name(
-                        navigation_label=route_label,
-                        accessible_name=route_accessible_name,
-                        primary_heading=name_evidence.get("primary_heading"),
-                        breadcrumb=name_evidence.get("breadcrumb"),
-                        metadata_name=None,
-                        document_title=title,
-                        display_path=identity["display_path"],
-                    )
-                    route_name_by_id[active_route_id] = route_name
-                    navigation_hierarchy: list[str] = []
-                    hierarchy_cursor = parent_route_id
-                    hierarchy_seen: set[str] = set()
-                    while hierarchy_cursor and hierarchy_cursor not in hierarchy_seen:
-                        hierarchy_seen.add(hierarchy_cursor)
-                        navigation_hierarchy.insert(
-                            0,
-                            route_name_by_id.get(hierarchy_cursor, hierarchy_cursor),
+                        failed_api_events = [
+                            event for event in page_api_events
+                            if not event.get("blocked_by_validator") and (
+                                bool(event.get("error"))
+                                or (isinstance(event.get("status"), int) and event["status"] >= 400)
+                            )
+                        ]
+                        failed_required_api_count = sum(
+                            event.get("importance") == "REQUIRED" for event in failed_api_events
                         )
-                        hierarchy_cursor = route_parent_ids.get(hierarchy_cursor)
-                    menu_hierarchy = route_metadata.get(route_key, {}).get("navigation_hierarchy", [])
-                    for menu_label in menu_hierarchy:
-                        if not navigation_hierarchy or navigation_hierarchy[-1] != menu_label:
-                            navigation_hierarchy.append(menu_label)
-                    navigation_hierarchy.append(route_name)
-                    provenance = route_provenance.get(route_key, {"observations": 1, "sources": []})
-                    health_validation_ms = round((time.perf_counter() - health_validation_started) * 1000)
-                    route_validation_ms = max(0, round((time.perf_counter() - started) * 1000) - route_discovery_ms)
-                    performance_timing = route_performance_timing(
-                        navigation_ms=navigation_ms,
-                        navigation_policy_ms=navigation_policy_ms,
-                        render_health=render_health,
-                        total_validation_ms=route_validation_ms,
-                        render_start_ms=render_start_ms,
-                    )
-                    performance_timing["route_transition_ms"] = navigation_ms if route_transition_succeeded else 0
-                    performance_timing["health_validation_ms"] = health_validation_ms
-                    performance_timing["discovery_ms"] = route_discovery_ms
-                    validation_duration_ms += route_validation_ms
-                    browser_lifecycle.advance("REPORT")
-                    result = {
-                        "route_id": active_route_id,
-                        "view_type": "UI_TAB" if view_control else "URL_ROUTE",
-                        "route_activation_id": active_route_activation_id,
-                        "url": display_url,
-                        "requested_url": requested_url,
-                        "discovered_url": sanitized_url(route_identity),
-                        "final_url": final_url,
-                        "origin": identity["origin"],
-                        "host": identity["host"],
-                        "hostname": identity["host"],
-                        "pathname": identity["pathname"],
-                        "query_sanitized": identity["query_sanitized"],
-                        "search": identity["query_sanitized"],
-                        "fragment": identity["fragment"],
-                        "hash": identity["fragment"],
-                        "spa_route": identity["spa_route"],
-                        "canonical_route": requested_identity["canonical_route"],
-                        "display_path": identity["display_path"],
-                        "route_display_path": identity["display_path"],
-                        "depth": depth,
-                        "crawl_depth": depth,
-                        "navigation_depth": depth,
-                        "route_label": route_label,
-                        "navigation_label": route_label,
-                        "accessible_name": route_accessible_name,
-                        "route_label_source": route_label_source,
-                        "route_name": route_name,
-                        "route_name_source": route_name_source,
-                        "route_name_confidence": route_name_confidence,
-                        "document_title": title,
-                        "route_source": route_source,
-                        "discovery_type": discovery_type,
-                        "discovery_sources": provenance.get("sources", []),
-                        "duplicate_discovery_count": max(
-                            0, int(provenance.get("observations", 1)) - 1
-                        ),
-                        "discovered_from": sanitized_url(discovered_from) if discovered_from else None,
-                        "parent_route_id": parent_route_id,
-                        "parent_route_name": menu_hierarchy[-1] if menu_hierarchy else route_name_by_id.get(parent_route_id) if parent_route_id else None,
-                        "navigation_hierarchy": navigation_hierarchy,
-                        "expected_origin": sanitized_url(url, include_path=False),
-                        "normalized_route_identity": active_route_id,
-                        "navigation_type": navigation_mode,
-                        "status": status,
-                        "same_document_transition": route_transition_succeeded,
-                        "http_status_display": "N/A (UI view)" if view_control else "N/A (SPA)" if route_transition_succeeded else status,
-                        "title": title,
-                        "load_ms": performance_timing["application_load_ms"] if req.check_performance else None,
-                        **performance_timing,
-                        "timings": dict(performance_timing),
-                        "error": error,
-                        "redirect_count": len(redirects),
-                        "redirects": redirects,
-                        "links_found": len(links),
-                        "routes_discovered": len(discovered),
-                        "external_links_found": len(external_links),
-                        "external_links": external_links[:100],
-                        "console_errors": page_console,
-                        "page_errors": page_script_errors,
-                        "failed_resources": page_failures,
-                        "resource_failure_count": unexpected_subresource_failures,
-                        "api_requests": page_api_events,
-                        "api_failures": api_failure_count,
-                        "failed_api_count": api_failure_count,
-                        "failed_required_api_count": failed_required_api_count,
-                        "failed_optional_api_count": failed_optional_api_count,
-                        "api_network_failure_count": api_network_failure_count,
-                        **api_coverage,
-                        "route_render_coverage": (
-                            "ROUTE_RENDERED" if render_health is not None else "NOT_RENDERED"
-                        ),
-                        "resources": page_resource_events,
-                        "websockets": page_websockets,
-                        "event_streams": page_event_streams,
-                        "downloads": page_downloads,
-                        "frames": frame_observations,
-                        "frame_navigations": page_frame_events,
-                        "render_health": render_health,
-                        "application_ready": application_ready,
-                        "application_readiness": (
-                            "READY" if application_ready else "NOT_TESTED" if render_health is None
-                            else "CONFIGURED_CONDITION_NOT_REACHED" if not render_health.get("configured_readiness_met", True)
-                            else "RENDER_NOT_READY"
-                        ),
-                        "authentication_observation": auth_settle,
-                        "authentication_diagnostics": [
-                            item for item in authentication_diagnostics
-                            if item.get("route_activation_id") == active_route_activation_id
-                        ],
-                        "browser_lifecycle": browser_lifecycle.snapshot(),
-                        "failed_lifecycle_stage": browser_lifecycle.failed_stage,
-                        "lifecycle_failure_reason": browser_lifecycle.failure_reason,
-                        "slow": req.check_performance and int(performance_timing["application_load_ms"]) > req.slow_page_threshold_ms,
-                        "discovery_ms": route_discovery_ms,
-                        "validation_ms": route_validation_ms,
-                        "navigation_actions": navigation_actions,
-                        "navigation_controls_discovered": int(navigation_actions.get("discovered", navigation_actions.get("inspected", 0))),
-                        "navigation_controls_activated": int(navigation_actions.get("activated", 0)),
-                        "navigation_controls_unresolved": (
-                            int(navigation_actions.get("unresolved", navigation_actions.get("skipped", 0)))
-                            + int(bool(navigation_actions.get("timed_out")))
-                        ),
-                        "unsafe_actions_skipped": navigation_actions["skipped"],
-                        "discovery_limitations": (
-                            int(navigation_actions.get("unresolved", navigation_actions.get("skipped", 0)))
-                            + int(bool(navigation_actions.get("timed_out")))
-                        ),
-                        "read_only_blocks": read_only_blocks,
-                        "security_headers": header_report,
-                        "missing_security_headers": missing_headers,
-                        **classification,
-                    }
-                    results.append(result)
-                    active_route_identity = None
-                    await publish_progress(
-                        "VALIDATING_ROUTES",
-                        discovered=len(discovered_routes),
-                        queued=len(queue),
-                        validated=len(results),
-                        healthy=sum(bool(item.get("passed")) for item in results),
-                        failed=sum(
-                            item.get("validation_status") == "FAIL"
-                            or item.get("page_load_status") == "FAILED_TO_LOAD"
-                            for item in results
-                        ),
-                        warnings=sum(
-                            item.get("classification") == "PASS_WITH_WARNINGS"
-                            for item in results
-                        ),
-                        current_route=active_route_id,
-                    )
-                    log_event(
-                        logging.INFO,
-                        (
-                            "ROUTE_VALIDATED" if result["page_load_status"] == "LOADED" else
-                            "ROUTE_SKIPPED" if result["page_load_status"] == "NOT_TESTED" else
-                            "ROUTE_FAILED"
-                        ),
-                        scan_id=scan_id,
-                        final_url=final_raw_url,
-                        classification=result["classification"],
-                        elapsed_ms=elapsed,
-                    )
-                    if (session_expired or authentication_classification in {
-                        "AUTHENTICATION_BLOCKED", "AUTHENTICATION_REQUIRED", "AUTH_REQUIRED",
-                        "AUTH_FAILED", "AUTH_TIMEOUT", "MFA_REQUIRED",
-                    } or (len(results) == 1 and not application_ready)):
-                        discovery_stop_reason = (
-                            "SESSION_EXPIRED" if session_expired else
-                            authentication_classification if authentication_classification not in {None, "PASS"} else
-                            browser_lifecycle.failure_reason or error_classification or "APPLICATION_NOT_READY"
+                        failed_optional_api_count = len(failed_api_events) - failed_required_api_count
+                        api_network_failure_count = sum(
+                            bool(event.get("error")) for event in failed_api_events
                         )
-                        break
-                    if not queue and popup_tasks and req.check_links:
-                        _, pending_popups = await asyncio.wait(
-                            tuple(popup_tasks), timeout=max(0, min(
-                                (req.authentication_timeout_ms or req.timeout_ms) / 1000,
-                                deadline - time.perf_counter(),
-                            )),
+                        read_only_blocks = sum(
+                            bool(event.get("blocked_by_validator"))
+                            and event.get("block_reason") == "READ_ONLY_MUTATION_BLOCKED"
+                            for event in page_api_events
                         )
-                        enqueue_discovered_routes(popup_routes, depth, final_raw_url)
-                        if pending_popups:
-                            navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + len(pending_popups)
-                            navigation_actions["popup_observation_pending"] = len(pending_popups)
-                            result["navigation_controls_unresolved"] += len(pending_popups)
-                            result["discovery_limitations"] += len(pending_popups)
-                    if time.perf_counter() >= deadline:
-                        total_timeout_reached = bool(queue)
+                        api_coverage = summarize_route_api_coverage(page_api_events)
+                        final_identity = normalize_route_url(
+                            final_raw_url,
+                            query_policy=req.query_parameter_policy,
+                            allowed_query_parameters=set(req.allowed_query_parameters),
+                        ) or route_identity
+                        identity = route_identity_fields(
+                            final_identity,
+                            query_policy=req.query_parameter_policy,
+                            allowed_query_parameters=set(req.allowed_query_parameters),
+                        )
+                        requested_identity = route_identity_fields(
+                            route_identity,
+                            query_policy=req.query_parameter_policy,
+                            allowed_query_parameters=set(req.allowed_query_parameters),
+                        )
+                        display_url = sanitized_url(final_identity)
+                        route_name, route_name_source, route_name_confidence = resolve_route_name(
+                            navigation_label=route_label,
+                            accessible_name=route_accessible_name,
+                            primary_heading=name_evidence.get("primary_heading"),
+                            breadcrumb=name_evidence.get("breadcrumb"),
+                            metadata_name=None,
+                            document_title=title,
+                            display_path=identity["display_path"],
+                        )
+                        route_name_by_id[active_route_id] = route_name
+                        navigation_hierarchy: list[str] = []
+                        hierarchy_cursor = parent_route_id
+                        hierarchy_seen: set[str] = set()
+                        while hierarchy_cursor and hierarchy_cursor not in hierarchy_seen:
+                            hierarchy_seen.add(hierarchy_cursor)
+                            navigation_hierarchy.insert(
+                                0,
+                                route_name_by_id.get(hierarchy_cursor, hierarchy_cursor),
+                            )
+                            hierarchy_cursor = route_parent_ids.get(hierarchy_cursor)
+                        menu_hierarchy = route_metadata.get(route_key, {}).get("navigation_hierarchy", [])
+                        for menu_label in menu_hierarchy:
+                            if not navigation_hierarchy or navigation_hierarchy[-1] != menu_label:
+                                navigation_hierarchy.append(menu_label)
+                        navigation_hierarchy.append(route_name)
+                        provenance = route_provenance.get(route_key, {"observations": 1, "sources": []})
+                        health_validation_ms = round((time.perf_counter() - health_validation_started) * 1000)
+                        route_validation_ms = max(0, round((time.perf_counter() - started) * 1000) - route_discovery_ms)
+                        performance_timing = route_performance_timing(
+                            navigation_ms=navigation_ms,
+                            navigation_policy_ms=navigation_policy_ms,
+                            render_health=render_health,
+                            total_validation_ms=route_validation_ms,
+                            render_start_ms=render_start_ms,
+                        )
+                        performance_timing["route_transition_ms"] = navigation_ms if route_transition_succeeded else 0
+                        performance_timing["health_validation_ms"] = health_validation_ms
+                        performance_timing["discovery_ms"] = route_discovery_ms
+                        validation_duration_ms += route_validation_ms
+                        browser_lifecycle.advance("REPORT")
+                        result = {
+                            "route_id": active_route_id,
+                            "view_type": "UI_TAB" if view_control else "URL_ROUTE",
+                            "route_activation_id": active_route_activation_id,
+                            "url": display_url,
+                            "requested_url": requested_url,
+                            "discovered_url": sanitized_url(route_identity),
+                            "final_url": final_url,
+                            "origin": identity["origin"],
+                            "host": identity["host"],
+                            "hostname": identity["host"],
+                            "pathname": identity["pathname"],
+                            "query_sanitized": identity["query_sanitized"],
+                            "search": identity["query_sanitized"],
+                            "fragment": identity["fragment"],
+                            "hash": identity["fragment"],
+                            "spa_route": identity["spa_route"],
+                            "canonical_route": requested_identity["canonical_route"],
+                            "display_path": identity["display_path"],
+                            "route_display_path": identity["display_path"],
+                            "depth": depth,
+                            "crawl_depth": depth,
+                            "navigation_depth": depth,
+                            "route_label": route_label,
+                            "navigation_label": route_label,
+                            "accessible_name": route_accessible_name,
+                            "route_label_source": route_label_source,
+                            "route_name": route_name,
+                            "route_name_source": route_name_source,
+                            "route_name_confidence": route_name_confidence,
+                            "document_title": title,
+                            "route_source": route_source,
+                            "discovery_type": discovery_type,
+                            "discovery_sources": provenance.get("sources", []),
+                            "duplicate_discovery_count": max(
+                                0, int(provenance.get("observations", 1)) - 1
+                            ),
+                            "discovered_from": sanitized_url(discovered_from) if discovered_from else None,
+                            "parent_route_id": parent_route_id,
+                            "parent_route_name": menu_hierarchy[-1] if menu_hierarchy else route_name_by_id.get(parent_route_id) if parent_route_id else None,
+                            "navigation_hierarchy": navigation_hierarchy,
+                            "expected_origin": sanitized_url(url, include_path=False),
+                            "normalized_route_identity": active_route_id,
+                            "navigation_type": navigation_mode,
+                            "status": status,
+                            "same_document_transition": route_transition_succeeded,
+                            "http_status_display": "N/A (UI view)" if view_control else "N/A (SPA)" if route_transition_succeeded else status,
+                            "title": title,
+                            "load_ms": performance_timing["application_load_ms"] if req.check_performance else None,
+                            **performance_timing,
+                            "timings": dict(performance_timing),
+                            "error": error,
+                            "redirect_count": len(redirects),
+                            "redirects": redirects,
+                            "links_found": len(links),
+                            "routes_discovered": len(discovered),
+                            "external_links_found": len(external_links),
+                            "external_links": external_links[:100],
+                            "console_errors": page_console,
+                            "page_errors": page_script_errors,
+                            "failed_resources": page_failures,
+                            "resource_failure_count": unexpected_subresource_failures,
+                            "api_requests": page_api_events,
+                            "api_failures": api_failure_count,
+                            "failed_api_count": api_failure_count,
+                            "failed_required_api_count": failed_required_api_count,
+                            "failed_optional_api_count": failed_optional_api_count,
+                            "api_network_failure_count": api_network_failure_count,
+                            **api_coverage,
+                            "route_render_coverage": (
+                                "ROUTE_RENDERED" if render_health is not None else "NOT_RENDERED"
+                            ),
+                            "resources": page_resource_events,
+                            "websockets": page_websockets,
+                            "event_streams": page_event_streams,
+                            "downloads": page_downloads,
+                            "frames": frame_observations,
+                            "frame_navigations": page_frame_events,
+                            "render_health": render_health,
+                            "application_ready": application_ready,
+                            "application_readiness": (
+                                "READY" if application_ready else "NOT_TESTED" if render_health is None
+                                else "CONFIGURED_CONDITION_NOT_REACHED" if not render_health.get("configured_readiness_met", True)
+                                else "RENDER_NOT_READY"
+                            ),
+                            "authentication_observation": auth_settle,
+                            "authentication_diagnostics": [
+                                item for item in authentication_diagnostics
+                                if item.get("route_activation_id") == active_route_activation_id
+                            ],
+                            "browser_lifecycle": browser_lifecycle.snapshot(),
+                            "failed_lifecycle_stage": browser_lifecycle.failed_stage,
+                            "lifecycle_failure_reason": browser_lifecycle.failure_reason,
+                            "slow": req.check_performance and int(performance_timing["application_load_ms"]) > req.slow_page_threshold_ms,
+                            "discovery_ms": route_discovery_ms,
+                            "validation_ms": route_validation_ms,
+                            "navigation_actions": navigation_actions,
+                            "navigation_controls_discovered": int(navigation_actions.get("discovered", navigation_actions.get("inspected", 0))),
+                            "navigation_controls_activated": int(navigation_actions.get("activated", 0)),
+                            "navigation_controls_unresolved": (
+                                int(navigation_actions.get("unresolved", navigation_actions.get("skipped", 0)))
+                                + int(bool(navigation_actions.get("timed_out")))
+                            ),
+                            "unsafe_actions_skipped": navigation_actions["skipped"],
+                            "discovery_limitations": (
+                                int(navigation_actions.get("unresolved", navigation_actions.get("skipped", 0)))
+                                + int(bool(navigation_actions.get("timed_out")))
+                            ),
+                            "read_only_blocks": read_only_blocks,
+                            "security_headers": header_report,
+                            "missing_security_headers": missing_headers,
+                            **classification,
+                        }
+                        results.append(result)
+                        active_route_identity = None
+                        await publish_progress(
+                            "VALIDATING_ROUTES",
+                            discovered=len(discovered_routes),
+                            queued=len(queue),
+                            validated=len(results),
+                            healthy=sum(bool(item.get("passed")) for item in results),
+                            failed=sum(
+                                item.get("validation_status") == "FAIL"
+                                or item.get("page_load_status") == "FAILED_TO_LOAD"
+                                for item in results
+                            ),
+                            warnings=sum(
+                                item.get("classification") == "PASS_WITH_WARNINGS"
+                                for item in results
+                            ),
+                            current_route=active_route_id,
+                        )
+                        log_event(
+                            logging.INFO,
+                            (
+                                "ROUTE_VALIDATED" if result["page_load_status"] == "LOADED" else
+                                "ROUTE_SKIPPED" if result["page_load_status"] == "NOT_TESTED" else
+                                "ROUTE_FAILED"
+                            ),
+                            scan_id=scan_id,
+                            final_url=final_raw_url,
+                            classification=result["classification"],
+                            elapsed_ms=elapsed,
+                        )
+                        if (session_expired or authentication_classification in {
+                            "AUTHENTICATION_BLOCKED", "AUTHENTICATION_REQUIRED", "AUTH_REQUIRED",
+                            "AUTH_FAILED", "AUTH_TIMEOUT", "MFA_REQUIRED",
+                        } or (len(results) == 1 and not application_ready)):
+                            discovery_stop_reason = (
+                                "SESSION_EXPIRED" if session_expired else
+                                authentication_classification if authentication_classification not in {None, "PASS"} else
+                                browser_lifecycle.failure_reason or error_classification or "APPLICATION_NOT_READY"
+                            )
+                            break
+                        if not queue and popup_tasks and req.check_links:
+                            _, pending_popups = await asyncio.wait(
+                                tuple(popup_tasks), timeout=max(0, min(
+                                    (req.authentication_timeout_ms or req.timeout_ms) / 1000,
+                                    deadline - time.perf_counter(),
+                                )),
+                            )
+                            enqueue_discovered_routes(popup_routes, depth, final_raw_url)
+                            if pending_popups:
+                                navigation_actions["unresolved"] = int(navigation_actions.get("unresolved", 0)) + len(pending_popups)
+                                navigation_actions["popup_observation_pending"] = len(pending_popups)
+                                result["navigation_controls_unresolved"] += len(pending_popups)
+                                result["discovery_limitations"] += len(pending_popups)
+                        if time.perf_counter() >= deadline:
+                            total_timeout_reached = bool(queue)
+                            break
+                    except _SessionExpiredDuringScan:
+                        # The route was interrupted by session loss; it is retried
+                        # after recovery or reported as not tested, never as health.
+                        seen.discard(route_key)
+                        if await recover_expired_session():
+                            queue.appendleft(current_queue_entry)
+                            continue
+                        session_expired = True
                         break
                 if (
                     req.authentication.mode == "storage_state"
@@ -3998,8 +4113,13 @@ async def execute_scan(
                 for guard in redirect_guards:
                     await guard.close()
 
-    if authentication_error is None and any(item.get("affects_authentication") for item in authentication_diagnostics):
-        evidence = next(item for item in reversed(authentication_diagnostics) if item.get("affects_authentication"))
+    if authentication_error is None and any(
+        item.get("affects_authentication") for item in authentication_diagnostics[diagnostic_evidence_start:]
+    ):
+        evidence = next(
+            item for item in reversed(authentication_diagnostics[diagnostic_evidence_start:])
+            if item.get("affects_authentication")
+        )
         authentication_error = create_authentication_error(
             "AUTHENTICATION_BLOCKED", stage="AUTHENTICATING", method=evidence.get("method"),
             endpoint=evidence.get("endpoint"), policy_decision=evidence.get("policy_decision") or evidence.get("policy_reason"),
@@ -4020,6 +4140,19 @@ async def execute_scan(
             endpoint=rejected_session.get("url"), policy_decision=rejected_session.get("policy_decision"),
             duration_ms=round((time.perf_counter() - scan_started) * 1000),
         )
+    if (
+        authentication_error is not None and application_gate_confirmed
+        and authentication_error["category"] not in POLICY_AUTHENTICATION_FAILURES
+        and any(result.get("authentication_status") == "PASS" for result in results)
+    ):
+        # The session was lost after the application was ready and could not
+        # be recovered. Routes validated while it was valid remain accurate;
+        # the rest are NOT_TESTED_SESSION_EXPIRED, never silently dropped.
+        session_interruption = session_interruption or authentication_error
+        session_expired = True
+        authentication_error = None
+        log_event(logging.WARNING, "SCAN_STOPPED_SESSION_EXPIRED", scan_id=scan_id,
+                  validated_routes=len(results), category=session_interruption.get("category"))
     if authentication_error is not None:
         return await failed_authentication_report(authentication_error, authentication_request_diagnostics())
 
@@ -4354,7 +4487,7 @@ async def execute_scan(
         "check_links", "check_console", "check_resources", "check_performance", "check_security_headers",
         "allow_subdomains", "allow_private_networks", "max_navigation_actions", "max_discovery_scrolls",
         "discovery_timeout_ms", "network_settle_cap_ms", "menu_settle_ms", "reexplore_navigation_each_route",
-        "session_refresh_interval_ms",
+        "session_refresh_interval_ms", "session_recovery_attempts",
     })
     scan_configuration["authentication_mode"] = req.authentication.mode
     scan_configuration["readiness_selector_configured"] = bool(req.readiness_selector)
@@ -4474,6 +4607,7 @@ async def execute_scan(
             for route in sorted(depth_limited_routes | action_limited_routes)
         ],
         "session": session_refresh,
+        "session_interruption": session_interruption,
         "safety": {
             "crawl_scope": root_host,
             "navigation_redirects": "cross-origin-with-network-policy",
@@ -4502,7 +4636,8 @@ async def execute_scan(
     scan_timing["total_scan_ms"] = summary["total_scan_duration_ms"]
     report["scan_status"] = (
         "CANCELLED" if cancellation_requested else
-        "PARTIAL" if summary.get("execution_status") not in {None, "COMPLETE", "COMPLETED"} else "COMPLETED"
+        "PARTIAL" if summary.get("execution_status") not in {None, "COMPLETE", "COMPLETED"}
+        or summary.get("termination_reason") == "SESSION_EXPIRED" else "COMPLETED"
     )
     report["outcome"] = report["scan_status"]
     report["authentication_status"] = "AUTHENTICATED" if application_gate_confirmed else "NOT_STARTED"
