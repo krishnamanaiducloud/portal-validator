@@ -19,6 +19,10 @@ from app.navigation import AuthenticationNavigationPolicy, oauth_refresh_grant_s
 from test_public_access_scan import require_browser
 
 
+# Mutable per-test fixture behaviour (reset by monkeypatch in each test).
+FIXTURE_OPTIONS = {"renew_on_root": True}
+
+
 def serve(handler):
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = Thread(target=server.serve_forever, daemon=True)
@@ -61,9 +65,11 @@ def renewal_site(tmp_path, monkeypatch):
                 body = (f'''<!doctype html><title>Renewing workspace</title>
                     <main><h1>Renewing workspace {path}</h1><nav>{links}</nav></main>
                     <script>
-                    fetch("{idp}/oauth2/token", {{method: "POST",
+                    ({'Promise.resolve()' if FIXTURE_OPTIONS["renew_on_root"] or path != "/" else 'Promise.reject()'})
+                    .then(() => fetch("{idp}/oauth2/token", {{method: "POST",
                       headers: {{"Content-Type": "application/x-www-form-urlencoded"}},
-                      body: "grant_type=refresh_token&refresh_token=fixture-refresh&client_id=portal"}})
+                      body: "grant_type=refresh_token&refresh_token=fixture-refresh&client_id=portal"}}))
+                      .catch(() => null)
                       .then(() => fetch("/api/data"))
                       .then(() => new Promise(resolve => {{
                         const open = indexedDB.open("auth", 1);
@@ -211,3 +217,23 @@ async def test_renewed_indexeddb_token_is_kept_for_the_next_scan(renewal_site):
     runtime_state = (home / ".portal-validator" / "sessions" / "renewing.json").read_text(encoding="utf-8")
     assert "renewed-indexeddb-token" in runtime_state
     assert "renewed-indexeddb-token" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_renewal_blocked_after_the_application_was_ready_does_not_fail_the_scan(renewal_site, monkeypatch):
+    """The 1.13.2 failure: a later route's token renewal to an unapproved
+    identity host was blocked and the whole scan ended as an authentication
+    failure with zero routes."""
+    await require_browser()
+    monkeypatch.setitem(FIXTURE_OPTIONS, "renew_on_root", False)
+    origin, _profiles, receipts, _home = renewal_site
+    report = await execute_scan(renewal_request(origin, authentication_hosts=[]))
+    assert refresh_posts(receipts) == 0, "An unapproved identity host must stay blocked"
+    assert report["scan_status"] != "FAILED", report.get("authentication_error")
+    assert report["authentication_status"] == "AUTHENTICATED"
+    results = {urlsplit(result["final_url"]).path: result for result in report["results"]}
+    assert results["/"]["authentication_status"] == "PASS"
+    assert len(results) >= 3
+    blocks = report["mid_scan_authentication_blocks"]
+    assert blocks and all(item["destination_host"] == "localhost" for item in blocks)
+    assert "fixture-refresh" not in json.dumps(report)

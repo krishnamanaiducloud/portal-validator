@@ -100,6 +100,7 @@ from app.network import (
     policy_hostname,
 )
 from app.reporting import (
+    _safe_authentication_diagnostics,
     aggregate_api_events,
     aggregate_api_inventory,
     aggregate_report,
@@ -1379,6 +1380,10 @@ async def execute_scan(
     diagnostic_evidence_start = 0
     session_recovery_attempts_used = 0
     session_interruption: dict | None = None
+    # The activation whose readiness passed the scan-wide gate. Only blocked
+    # authentication evidence belonging to it (or seen before the gate)
+    # invalidates the whole scan; later blocks affect their own route only.
+    bootstrap_activation_id: str | None = None
     redirect_guards: list[RedirectResponseGuard] = []
     guard_install_tasks = weakref.WeakKeyDictionary()
 
@@ -1439,10 +1444,17 @@ async def execute_scan(
             )
         )), None)
 
+    def scan_blocking_denials() -> list[dict]:
+        return [
+            item for item in authentication_diagnostics[diagnostic_evidence_start:]
+            if item.get("affects_authentication") and (
+                not application_gate_confirmed or item.get("route_activation_id") == bootstrap_activation_id
+            )
+        ]
+
     def require_current_session() -> None:
         """Stop further application work as soon as auth evidence is rejected."""
-        denied = next((item for item in reversed(authentication_diagnostics[diagnostic_evidence_start:])
-                       if item.get("affects_authentication")), None)
+        denied = next(reversed(scan_blocking_denials()), None)
         if denied is not None:
             reject_global_authentication(
                 "AUTHENTICATION_BLOCKED", status=denied.get("http_status"),
@@ -3290,12 +3302,13 @@ async def execute_scan(
                                         await publish_progress("AUTHENTICATED")
                                         await publish_progress("APPLICATION_READY")
                                         application_gate_confirmed = True
+                                        bootstrap_activation_id = active_route_activation_id
                                         discovered_routes.add(route_key)
                                         queued_routes.add(route_key)
                                         await publish_progress("DISCOVERING_ROUTES", discovered=len(discovered_routes), queued=len(queue))
                                     elif authentication_classification in {
                                         "AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "AUTH_FAILED", "AUTH_TIMEOUT",
-                                        "SESSION_EXPIRED", "MFA_REQUIRED", "AUTHENTICATION_BLOCKED",
+                                        "SESSION_EXPIRED", "MFA_REQUIRED",
                                     }:
                                         reject_global_authentication(
                                             authentication_classification, status=status, endpoint=final_raw_url,
@@ -3583,7 +3596,7 @@ async def execute_scan(
 
                         if not application_gate_confirmed or authentication_classification in {
                             "AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "AUTH_FAILED", "AUTH_TIMEOUT",
-                            "SESSION_EXPIRED", "MFA_REQUIRED", "AUTHENTICATION_BLOCKED",
+                            "SESSION_EXPIRED", "MFA_REQUIRED",
                         }:
                             reject_global_authentication(
                                 authentication_classification or error_classification,
@@ -4003,8 +4016,10 @@ async def execute_scan(
                             classification=result["classification"],
                             elapsed_ms=elapsed,
                         )
+                        # A blocked authentication request on a later route affects
+                        # that route only; bootstrap blocks fail through the gate.
                         if (session_expired or authentication_classification in {
-                            "AUTHENTICATION_BLOCKED", "AUTHENTICATION_REQUIRED", "AUTH_REQUIRED",
+                            "AUTHENTICATION_REQUIRED", "AUTH_REQUIRED",
                             "AUTH_FAILED", "AUTH_TIMEOUT", "MFA_REQUIRED",
                         } or (len(results) == 1 and not application_ready)):
                             discovery_stop_reason = (
@@ -4113,13 +4128,8 @@ async def execute_scan(
                 for guard in redirect_guards:
                     await guard.close()
 
-    if authentication_error is None and any(
-        item.get("affects_authentication") for item in authentication_diagnostics[diagnostic_evidence_start:]
-    ):
-        evidence = next(
-            item for item in reversed(authentication_diagnostics[diagnostic_evidence_start:])
-            if item.get("affects_authentication")
-        )
+    if authentication_error is None and scan_blocking_denials():
+        evidence = scan_blocking_denials()[-1]
         authentication_error = create_authentication_error(
             "AUTHENTICATION_BLOCKED", stage="AUTHENTICATING", method=evidence.get("method"),
             endpoint=evidence.get("endpoint"), policy_decision=evidence.get("policy_decision") or evidence.get("policy_reason"),
@@ -4608,6 +4618,11 @@ async def execute_scan(
         ],
         "session": session_refresh,
         "session_interruption": session_interruption,
+        "mid_scan_authentication_blocks": _safe_authentication_diagnostics([
+            item for item in authentication_diagnostics
+            if item.get("affects_authentication") and application_gate_confirmed
+            and item.get("route_activation_id") != bootstrap_activation_id
+        ]),
         "safety": {
             "crawl_scope": root_host,
             "navigation_redirects": "cross-origin-with-network-policy",
