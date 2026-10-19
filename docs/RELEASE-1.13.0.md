@@ -75,6 +75,40 @@ Updated regressions: `tests/test_app.py`,
 `tests/test_scan_deadlines.py`, `tests/test_sso_navigation_browser.py`,
 `tests/ui_check.py`, and `tests/release_image_smoke.py`.
 
+## Integrated remediation branches
+
+- PR #1 (`fix/generic-auth-ops-request-visibility`): generic native
+  disclosure, Bootstrap-style dropdown and header-menu discovery, observed
+  menu-ancestry restoration, blocked/incomplete request visibility, the
+  operator authentication-policy helper and its CI workflow.
+- PR #2 (`fix/auth-fail-closed-scan-report`): superseded by the scan-wide gate
+  above. Its job-level regression (a failed scan never exposes a previous
+  scan's routes) is retained in `tests/test_auth_fail_closed_scan.py` against
+  the `authentication_error` contract; its parallel report helper and duplicate
+  workflow were not merged.
+
+## Additional fixes
+
+- `MFA_REQUIRED` is a distinct authentication failure category with its own
+  remediation instead of being folded into `AUTHENTICATION_REQUIRED`.
+- A policy-blocked authentication request is reported once in
+  `authentication_diagnostics`, carrying the scan's failure category.
+- At bootstrap, render settling keeps headroom inside the route budget, so a
+  never-completing resource (tracking pixel, long poll) no longer turns a
+  visibly ready public application into a gate timeout with zero routes.
+- Authentication observation tolerates multi-hop client redirects that replace
+  the document more often than the bounded DOM retry count.
+- A navigation trigger whose `aria-expanded="true"` is stale after its panel
+  was hidden or replaced is reopened after a short bounded mount window,
+  instead of consuming the whole discovery budget. This restores nested menu
+  and Material overlay discovery.
+- `tests/test_broad_authenticated_discovery.py` scans a synthetic
+  cookie-authenticated portal with more than 44 views (native disclosures, Bootstrap
+  dropdown, sidebar, history and hash routes, URL-less tabs), asserts at least
+  44 activated and validated views, per-view API initialisation and HTTP 500
+  attribution to the initiating view, and zero routes without the session.
+- Production base images are re-pinned to current Chainguard digests.
+
 ## Verification
 
 ```powershell
