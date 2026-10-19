@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = '1.13.2';
+const FRONTEND_VERSION = '1.13.3';
 // The server pins this exact deferred script with SRI and a hash-versioned URL.
 // Capture currentScript now; it is unavailable in subsequent async callbacks.
 const frontendScript = document.currentScript;
@@ -164,7 +164,30 @@ const accessOutcomes = new Set(['ACCESS_RESTRICTED','CHALLENGE_REQUIRED']);
 const failureOutcomes = new Set(['TLS_ERROR','DNS_ERROR','NETWORK_ERROR','HTTP_ERROR','AUTHORIZATION_DENIED','TIMEOUT','NAVIGATION_ERROR','VALIDATION_FAILED','PAGE_RENDER_ERROR','FAIL']);
 const passOutcomes = new Set(['PASS','PASS_WITH_WARNINGS']);
 const terminalStates = new Set(['COMPLETED','PARTIAL','FAILED','CANCELLED']);
-const numericRouteKeys = new Set(['status','load_ms','api_failures','resource_failure_count','console_count','warning_findings']);
+const numericRouteKeys = new Set(['status','load_ms','api_failures','resource_failure_count','console_count','warning_findings','details']);
+
+// Sort on the value each cell displays; arrays and objects compare as text.
+function displayedSortValue(value) {
+  if (Array.isArray(value)) return value.map((part) => typeof part === 'object' && part ? (part.source || part.type || JSON.stringify(part)) : part).join(', ');
+  if (value && typeof value === 'object') return Object.keys(value).sort().join(', ');
+  return value;
+}
+
+function routeSortValue(item, key) {
+  if (key === 'route_name') return item.route_name || item.route_label;
+  if (key === 'display_path') return routeDisplay(item).path;
+  if (key === 'navigation_hierarchy') return item.navigation_hierarchy?.length ? item.navigation_hierarchy.join(' › ') : [item.parent_route_name,item.route_name || item.route_label].filter(Boolean).join(' › ');
+  if (key === 'discovery_sources') return routeDiscoverySources(item);
+  // Details opens the route evidence and timing breakdown; sort by route time.
+  if (key === 'details') return item.total_validation_ms ?? item.performance_timing?.total_validation_ms ?? item.elapsed_ms;
+  return displayedSortValue(item[key]);
+}
+
+function apiSortValue(item, key) {
+  if (key === 'policies') return apiDisplayPolicies(item).join(', ');
+  if (key === 'traffic_role') return item.traffic_role || 'UNCLASSIFIED';
+  return displayedSortValue(item[key]);
+}
 const numericApiKeys = new Set(['calls','status_2xx','status_3xx','status_4xx','status_5xx','network_failures','route_count','allowed_calls','blocked_count','application_bootstrap_phase_count','authentication_phase_count','route_validation_phase_count','session_refresh_phase_count','average_duration_ms','worst_duration_ms','failure_count']);
 const numericResourceKeys = new Set(['transfer_size_bytes','encoded_body_size_bytes','decoded_body_size_bytes','duration_ms','status']);
 const numericIssueKeys = new Set(['affected']);
@@ -732,8 +755,8 @@ function renderRows() {
   });
   rows.sort((left, right) => {
     const key = routeSort.key;
-    const leftValue = key === 'route_name' ? (left.route_name || left.route_label) : key === 'display_path' ? routeDisplay(left).path : left[key];
-    const rightValue = key === 'route_name' ? (right.route_name || right.route_label) : key === 'display_path' ? routeDisplay(right).path : right[key];
+    const leftValue = routeSortValue(left, key);
+    const rightValue = routeSortValue(right, key);
     return compareValues(leftValue, rightValue, numericRouteKeys.has(key)) * routeSort.direction;
   });
   updateAriaSort('[data-sort]', routeSort, 'sort');
@@ -960,7 +983,7 @@ function renderApiInventory() {
       && (failureType === 'all' || apiFailureTypes(item).includes(failureType))
       && (!failedOnly || targetFailure);
   });
-  visible.sort((left, right) => compareValues(left[apiSort.key], right[apiSort.key], numericApiKeys.has(apiSort.key)) * apiSort.direction);
+  visible.sort((left, right) => compareValues(apiSortValue(left, apiSort.key), apiSortValue(right, apiSort.key), numericApiKeys.has(apiSort.key)) * apiSort.direction);
   updateAriaSort('[data-api-sort]', apiSort, 'apiSort');
   byId('api-count').textContent = visible.length === inventory.length ? `${inventory.length} unique APIs observed` : `${visible.length} of ${inventory.length} unique APIs observed`;
   visible = paginateTable('api', visible);
@@ -1398,6 +1421,9 @@ function renderReport(report, context = null) {
   const interruption = report.session_interruption, recoveries = Number(report.session?.recoveries || 0);
   if (interruption && report.summary.termination_reason === 'SESSION_EXPIRED') {
     notify(`The session expired after ${report.summary.routes_validated} validated routes and could not be recovered. Validated routes are kept; the remaining routes were not tested. Refresh the SSO session profile and approve the identity provider host, then scan again.`, true);
+  } else if ((report.mid_scan_authentication_blocks || []).length) {
+    const hosts = [...new Set(report.mid_scan_authentication_blocks.map((item) => item.destination_host).filter(Boolean))];
+    notify(`Session renewal requests were blocked during the scan${hosts.length ? ` (identity host: ${hosts.join(', ')})` : ''}. Add the identity provider host to Authentication hosts so the application can renew its session.`, true);
   } else if (recoveries) {
     notify(`The session expired during the scan and was recovered ${recoveries} time${recoveries === 1 ? '' : 's'}; affected routes were validated again.`);
   }
@@ -1536,17 +1562,17 @@ if (!byId('api-route-filter')) {
 }
 
 const apiPolicyHeader = document.createElement('th');
-apiPolicyHeader.textContent = 'Policy';
+apiPolicyHeader.setAttribute('aria-sort', 'none');
+apiPolicyHeader.innerHTML = '<button type="button" data-api-sort="policies">Policy</button>';
 const apiRoleHeader = document.createElement('th');
-apiRoleHeader.textContent = 'Traffic role';
+apiRoleHeader.setAttribute('aria-sort', 'none');
+apiRoleHeader.innerHTML = '<button type="button" data-api-sort="traffic_role">Traffic role</button>';
 document.querySelector('#api-table-wrap thead tr').append(apiRoleHeader);
 document.querySelector('#api-table-wrap thead tr').append(apiPolicyHeader);
 for (const [key,label] of tableColumns.api.slice(21)) {
   const header = document.createElement('th');
-  if (key === 'failure_count') {
-    header.setAttribute('aria-sort', 'none');
-    header.innerHTML = `<button type="button" data-api-sort="${key}">${label}</button>`;
-  } else header.textContent = label;
+  header.setAttribute('aria-sort', 'none');
+  header.innerHTML = `<button type="button" data-api-sort="${key}">${label}</button>`;
   document.querySelector('#api-table-wrap thead tr').append(header);
 }
 const apiRoleLabel = document.createElement('label');
@@ -1572,7 +1598,8 @@ byId('api-failure-type-filter').insertAdjacentHTML('beforeend', ['HTTP_4XX','HTT
 document.querySelector('#scan-timing-settings .field-grid').insertAdjacentHTML('beforeend', '<label class="field"><span>Per-route total timeout (ms)</span><input id="per-route-timeout" type="number" min="1000" placeholder="Inherit maximum time / route"><small>Bounds the entire route lifecycle, including authentication, navigation and stabilization.</small></label>');
 for (const [key,label] of tableColumns.route.slice(13)) {
   const header = document.createElement('th');
-  header.textContent = label;
+  header.setAttribute('aria-sort', 'none');
+  header.innerHTML = `<button type="button" data-sort="${key}">${label}</button>`;
   document.querySelector('#route-table-wrap thead tr').append(header);
 }
 byId('result-filter').insertAdjacentHTML('beforeend', '<option value="not-tested">Not tested</option><option value="SKIPPED">Skipped</option>');

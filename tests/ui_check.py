@@ -188,7 +188,7 @@ async def main():
         await page.route("**/api/auth-profiles", profile_list_fixture)
         await page.goto(base_url, wait_until="networkidle")
         build_metadata = await page.evaluate("async () => (await fetch('/api/diagnostics/build', {cache:'no-store'})).json()")
-        assert build_metadata["version"] == "1.13.2"
+        assert build_metadata["version"] == "1.13.3"
         assert await page.evaluate("loadedFrontendSha256") == build_metadata["frontend_sha256"]
         assert await page.evaluate("loadedFrontendIntegrity.startsWith('sha256-')")
         assert "Frontend matched" in await page.locator("#build-summary").text_content()
@@ -497,6 +497,24 @@ async def main():
         for excluded in ("/blocked/", "/unfinished", "/policy-blocked.js", "/pending.js", "synthetic-private-value"):
             assert excluded not in failed_text, excluded
         assert await page.locator("#failed-endpoint-list configuration").count() == 0
+        # Every rendered data column of every table is sortable; only the
+        # failure tables' "Diagnostics" action column has no data to sort.
+        unsortable = await page.evaluate("""() => [...document.querySelectorAll(
+            '#route-table-wrap thead th, #api-table-wrap thead th, #resource-list, #failed-endpoint-list, #request-issue-list')]
+          .flatMap(node => node.tagName === 'TBODY' ? [...node.closest('table').querySelectorAll('thead th')] : [node])
+          .filter(th => !th.querySelector('button') && th.textContent.trim() !== 'Diagnostics')
+          .map(th => th.textContent.trim())""")
+        assert unsortable == [], unsortable
+        for key in ("navigation_hierarchy", "discovery_sources", "details"):
+            header = page.locator(f'[data-sort="{key}"]')
+            assert await header.count() == 1, key
+            await header.click()
+            assert await header.evaluate("b => b.closest('th').getAttribute('aria-sort')") == "ascending", key
+            await header.click()
+            assert await header.evaluate("b => b.closest('th').getAttribute('aria-sort')") == "descending", key
+        for key in ("traffic_role", "policies", "response_status_counts", "routes_using_endpoint"):
+            assert await page.locator(f'[data-api-sort="{key}"]').count() == 1, key
+        await page.evaluate("() => { routeSort = {key:'route_name', direction:1}; renderRows(); }")
         # Every data column of the failure and request-issue tables is sortable.
         assert await page.locator("[data-failed-sort]").count() == 9
         assert await page.locator("[data-issue-sort]").count() == 6
