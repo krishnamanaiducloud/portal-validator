@@ -80,6 +80,7 @@ from app.navigation import (
     settle_authentication_navigation,
     auth_protocol_signal,
     authentication_form_signal,
+    oauth_refresh_grant_signal,
 )
 from app.navigation_guard import RedirectResponseGuard
 from app.network import (
@@ -328,6 +329,9 @@ class ScanRequest(BaseModel):
     menu_settle_ms: int = Field(250, ge=0, le=BROWSER_TIMER_LIMIT_MS)
     max_navigation_actions: int = Field(200, ge=0)
     max_discovery_scrolls: int = Field(3, ge=0)
+    # Re-run a profile's configured silent session refresh during the scan this
+    # often, on a separate tab. Overrides the profile's refresh interval_ms.
+    session_refresh_interval_ms: int | None = Field(None, ge=1000, le=BROWSER_TIMER_LIMIT_MS)
     # Shared header/navigation/sidebar menus are explored once per scan.
     # Enable to re-explore them on every route (slower; for menus whose
     # content differs per route).
@@ -1354,6 +1358,8 @@ async def execute_scan(
     browser_context_count = 0
     browser_page_count = 0
     session_refresh: dict[str, object] = {"attempted": False}
+    # True only while the validator opens its own (non-application) tab.
+    internal_page_requested = False
     redirect_guards: list[RedirectResponseGuard] = []
     guard_install_tasks = weakref.WeakKeyDictionary()
 
@@ -2479,19 +2485,24 @@ async def execute_scan(
                             await abort_by_validator(route, "read_only_mutation_policy")
                             return
                         if auth_navigation_allowed:
+                            session_renewal = (
+                                not main_navigation and method == "POST"
+                                and oauth_refresh_grant_signal(auth_body)
+                            )
+                            request_phase_name = "SESSION_REFRESH" if session_renewal else "AUTHENTICATION"
                             request_observation[request_identity(request)] = (
-                                "AUTHENTICATION",
+                                request_phase_name,
                                 "AUTHENTICATION",
                             )
                             network_observer.mark_allowed(
                                 request,
-                                "AUTH_FLOW",
-                                phase="AUTHENTICATION",
+                                "SESSION_REFRESH" if session_renewal else "AUTH_FLOW",
+                                phase=request_phase_name,
                                 importance="AUTHENTICATION",
                             )
                             log_event(
                                 logging.INFO,
-                                "AUTH_FLOW_POST_ALLOWED",
+                                "SESSION_REFRESH_OBSERVED" if session_renewal else "AUTH_FLOW_POST_ALLOWED",
                                 scan_id=scan_id,
                                 hostname=host,
                                 method=method,
@@ -2593,6 +2604,12 @@ async def execute_scan(
 
                 def observe_context_page(owner_page):
                     nonlocal popup_observation_failures
+                    if internal_page_requested:
+                        # A validator-owned tab (session refresh) is observed for
+                        # network policy but is never an application popup/route.
+                        owner_page._portal_validator_internal = True
+                        register_browser_page(owner_page)
+                        return
                     if primary_page is not None and browser_page_count >= max(4, req.max_pages + 1):
                         # Keep independent windows bounded by the configured
                         # route ceiling, with minimal authentication headroom.
@@ -2614,6 +2631,48 @@ async def execute_scan(
                         schedule_popup(owner_page)
 
                 context.on("page", observe_context_page)
+                refresh_interval_s = (
+                    (req.session_refresh_interval_ms or refresh_config.interval_ms or 0) / 1000
+                    if refresh_config is not None else 0
+                )
+                last_session_refresh = time.perf_counter()
+
+                async def run_periodic_session_refresh():
+                    """Let the IdP renew the session on a separate validator tab."""
+                    nonlocal internal_page_requested, observation_phase, last_session_refresh
+                    nonlocal authentication_duration_ms
+                    previous_phase = observation_phase
+                    started_refresh = time.perf_counter()
+                    internal_page_requested = True
+                    try:
+                        refresh_page = await context.new_page()
+                    finally:
+                        internal_page_requested = False
+                    try:
+                        await ensure_redirect_guard(refresh_page)
+                        observation_phase = "SESSION_REFRESH"
+                        log_event(
+                            logging.INFO, "SESSION_REFRESH_STARTED", scan_id=scan_id, periodic=True,
+                            hostname=normalized_host(urlparse(refresh_config.refresh_url).hostname or ""),
+                        )
+                        outcome = await refresh_browser_session(refresh_page, refresh_config)
+                        log_event(
+                            logging.INFO if not outcome.get("error") else logging.WARNING,
+                            "SESSION_REFRESH_COMPLETED", scan_id=scan_id, periodic=True, **outcome,
+                        )
+                        session_refresh["periodic_refreshes"] = int(session_refresh.get("periodic_refreshes", 0)) + 1
+                        if outcome.get("error"):
+                            session_refresh["periodic_refresh_failures"] = int(
+                                session_refresh.get("periodic_refresh_failures", 0)
+                            ) + 1
+                    finally:
+                        observation_phase = previous_phase
+                        try:
+                            await refresh_page.close()
+                        except PlaywrightError:
+                            pass
+                        last_session_refresh = time.perf_counter()
+                        authentication_duration_ms += round((last_session_refresh - started_refresh) * 1000)
                 # Context observers see initial inline popup diagnostics before
                 # Playwright emits the Page event; per-page listeners are too late.
                 context.on("console", lambda message: record_console_error(message, message.page))
@@ -2656,6 +2715,11 @@ async def execute_scan(
                     if time.perf_counter() >= deadline:
                         total_timeout_reached = True
                         break
+                    if (
+                        refresh_interval_s and application_gate_confirmed
+                        and time.perf_counter() - last_session_refresh >= refresh_interval_s
+                    ):
+                        await run_periodic_session_refresh()
                     (
                         url,
                         depth,
@@ -4290,6 +4354,7 @@ async def execute_scan(
         "check_links", "check_console", "check_resources", "check_performance", "check_security_headers",
         "allow_subdomains", "allow_private_networks", "max_navigation_actions", "max_discovery_scrolls",
         "discovery_timeout_ms", "network_settle_cap_ms", "menu_settle_ms", "reexplore_navigation_each_route",
+        "session_refresh_interval_ms",
     })
     scan_configuration["authentication_mode"] = req.authentication.mode
     scan_configuration["readiness_selector_configured"] = bool(req.readiness_selector)

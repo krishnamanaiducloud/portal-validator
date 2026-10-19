@@ -232,6 +232,17 @@ def oauth_token_form_signal(post_data: str | None) -> bool:
     return bool(required and values.get(required, [""])[0].strip())
 
 
+def oauth_refresh_grant_signal(post_data: str | None) -> bool:
+    """Recognize only an OAuth refresh-token grant (session renewal).
+
+    Authorization-code and password grants are excluded: this evidence lets an
+    already authenticated application renew its own session, never sign in.
+    """
+    if not oauth_token_form_signal(post_data):
+        return False
+    return parse_qs(post_data or "", keep_blank_values=True).get("grant_type", [""])[0] == "refresh_token"
+
+
 @dataclass
 class AuthenticationNavigationPolicy:
     """Track an SSO navigation chain without broadening crawler or resource scope."""
@@ -347,6 +358,16 @@ class AuthenticationNavigationPolicy:
                 normalized_method, url, post_data, portal_scoped=portal_scoped,
                 source_url=source_url, source_portal_scoped=source_portal_scoped,
             )
+        if (
+            resource_type.lower() in {"xhr", "fetch"} and host_approved and source_portal_scoped
+            and normalized_method == "POST" and self.allows_authentication_endpoint(url)
+            and oauth_refresh_grant_signal(post_data)
+        ):
+            # A restored session never runs an interactive flow, so the
+            # application's own token renewal must not require one. Only a
+            # refresh-token grant from a portal document to an explicitly
+            # approved identity host/endpoint qualifies.
+            return True
         if not self.active or resource_type.lower() not in {"xhr", "fetch"} or not host_approved:
             return False
         if normalized_method in {"GET", "HEAD", "OPTIONS"}:

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from app.network import BROWSER_TIMER_LIMIT_MS
 from app.security import DestinationError, normalized_host, sanitize_url, validate_http_url
 
 
@@ -92,6 +93,8 @@ class SessionRefreshConfig:
     refresh_url: str
     timeout_ms: int = 60000
     settle_ms: int = 1500
+    # Re-run the silent refresh during a scan this often (None: start only).
+    interval_ms: int | None = None
 
 
 class RuntimeSessionStore:
@@ -127,7 +130,12 @@ class RuntimeSessionStore:
             and target.stat().st_mtime_ns != expected_mtime_ns
         ):
             return None
-        state = await context.storage_state()
+        try:
+            # Token libraries may keep renewed credentials in IndexedDB;
+            # without it the next scan would restore the stale session.
+            state = await context.storage_state(indexed_db=True)
+        except TypeError:
+            state = await context.storage_state()
         if approved_hosts is not None:
             previous = json.loads(target.read_text(encoding="utf-8")) if target.is_file() else {"cookies": [], "origins": []}
             state = merge_scoped_storage_state(previous, state, approved_hosts)
@@ -169,15 +177,21 @@ def load_refresh_config(profile: str, auth_state_dir: Path) -> SessionRefreshCon
     refresh_url = data["refresh_url"].strip()
     validate_http_url(refresh_url)
     timeout_ms = int(data.get("timeout_ms", 60000))
-    if timeout_ms < 1000 or timeout_ms > 120000:
-        raise ValueError("Session refresh timeout must be between 1000 and 120000 ms")
+    if timeout_ms < 1000 or timeout_ms > BROWSER_TIMER_LIMIT_MS:
+        raise ValueError("Session refresh timeout must be at least 1000 ms")
     settle_ms = int(data.get("settle_ms", 1500))
-    if settle_ms < 0 or settle_ms > 10000:
-        raise ValueError("Session refresh settle time must be between 0 and 10000 ms")
+    if settle_ms < 0 or settle_ms > BROWSER_TIMER_LIMIT_MS:
+        raise ValueError("Session refresh settle time must not be negative")
+    interval_ms = data.get("interval_ms")
+    if interval_ms is not None:
+        interval_ms = int(interval_ms)
+        if interval_ms < 1000 or interval_ms > BROWSER_TIMER_LIMIT_MS:
+            raise ValueError("Session refresh interval must be at least 1000 ms")
     return SessionRefreshConfig(
         refresh_url=refresh_url,
         timeout_ms=timeout_ms,
         settle_ms=settle_ms,
+        interval_ms=interval_ms,
     )
 
 
