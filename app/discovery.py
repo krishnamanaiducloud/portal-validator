@@ -755,8 +755,18 @@ async (maximumScrolls) => {
 
 
 EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
-({reset, inspectOnly}) => {
+({reset, inspectOnly, explored}) => {
   /* NAVIGATION_DOM_HELPERS */
+  // Controls in shared application chrome (header, navigation, sidebar and
+  // the menus they open) are identical on every route of a scan. Their
+  // signature ignores the current URL so the caller can explore them once.
+  const exploredSignatures = new Set(Array.isArray(explored) ? explored : []);
+  const sharedChrome = 'header,nav,aside,[role="navigation"],[role="banner"],[role="menubar"],' +
+    '[role="menu"],.cdk-overlay-container,.dropdown-menu';
+  const controlSignature = element => JSON.stringify([
+    composedClosest(element, sharedChrome) ? '' : location.pathname + location.search + location.hash,
+    navigationParents(element), controlLabel(element),
+  ]);
   const dangerous = new Set([
     'add','approve','begin','buy','cancel','checkout','confirm','create','delete','deploy','destroy',
     'disable','edit','enable','execute','export','import','logout','pay','purchase','reboot',
@@ -796,6 +806,7 @@ EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
         // it visited until it is visible and can actually be inspected.
         const raw = routeAttribute(element);
         if (!visited.has(element) && visibleControl(element) &&
+            !(exploredSignatures.size && exploredSignatures.has(controlSignature(element))) &&
             (isNavigationControl(element) || element.matches(selector)) &&
             (!raw || (raw.startsWith('#') && !raw.startsWith('#/') && !raw.startsWith('#!/'))) &&
             !describeView(element)) values.push(element);
@@ -848,6 +859,7 @@ EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
     // and retrying the entire script would repeat a natural request.
     return {activated:0, skipped, inspected, transitions, remaining:controls().length,
       element, before:location.href, label, accessibleName:ariaLabel.slice(0,160),
+      signature:controlSignature(element),
       labelSource:ariaLabel ? 'aria-label' : visibleLabel ? 'visible-text' : titleLabel ? 'title' : 'none'};
   }
   return {activated, skipped, inspected, transitions, remaining:controls().length};
@@ -948,9 +960,12 @@ async def _reveal_navigation_menu(page, element, timeout_ms: int) -> tuple[bool,
                       (revealed["panelVisible"] and not before["panelVisible"]))
 
 
-async def _expand_one_menu(page, reset: bool, timeout_ms: int) -> dict[str, Any]:
+async def _expand_one_menu(
+    page, reset: bool, timeout_ms: int, explored: list[str] | None = None,
+) -> dict[str, Any]:
     handle = await evaluate_dom(
-        page, EXPAND_SAFE_NAVIGATION_SCRIPT, {"reset": reset}, handle=True, timeout_ms=timeout_ms,
+        page, EXPAND_SAFE_NAVIGATION_SCRIPT, {"reset": reset, "explored": explored or []},
+        handle=True, timeout_ms=timeout_ms,
     )
     element_handle = None
     try:
@@ -1020,7 +1035,7 @@ SEMANTIC_ROUTE_ACTIVATION_SCRIPT = r"""
   const elements = navigationRoots().flatMap(root => Array.from(root.querySelectorAll(routeSelector + ',' + viewSelector)));
   const expected = (expectedLabel || '').replace(/\s+/g, ' ').trim().toLowerCase();
   const matches = [];
-  for (let index = 0; index < elements.length && index < 500; index += 1) {
+  for (let index = 0; index < elements.length; index += 1) {
     const element = elements[index];
     if (!visibleControl(element)) continue;
     const label = (
@@ -1089,14 +1104,19 @@ async def expand_safe_navigation(
     maximum_scrolls: int = 3,
     on_routes_discovered: Callable[[list[DiscoveredRoute]], Awaitable[None]] | None = None,
     timeout_ms: int = 5000,
+    explored_controls: set[str] | None = None,
 ) -> dict[str, object]:
     """Observe each safe panel before opening the next; never guess route URLs.
 
     The caller supplies its existing deadline/network observation policy. This
     prevents a slow lazy menu from being mistaken for an exhausted route set,
     without inventing a second timeout or weakening read-only interception.
+
+    ``explored_controls`` is a scan-wide set of control signatures. Controls
+    already explored in shared chrome are skipped and newly explored ones are
+    added, so the global navigation is expanded once per scan, not per route.
     """
-    maximum = max(0, min(int(maximum), 1500))
+    maximum = max(0, int(maximum))
     totals: dict[str, object] = {"activated": 0, "skipped": 0, "inspected": 0, "menus_expanded": 0, "routes": []}
     routes: list[DiscoveredRoute] = []
     # Collect the initially open panel as well as every subsequently opened
@@ -1104,8 +1124,13 @@ async def expand_safe_navigation(
     routes.extend(await discover_page_routes(page, maximum_scrolls))
     if on_routes_discovered is not None:
         await on_routes_discovered(routes.copy())
-    while int(totals["activated"]) < maximum and int(totals["inspected"]) < max(25, maximum * 5):
-        result = await _expand_one_menu(page, reset=int(totals["inspected"]) == 0, timeout_ms=timeout_ms)
+    while int(totals["activated"]) < maximum and int(totals["inspected"]) < maximum * 5 + 25:
+        result = await _expand_one_menu(
+            page, reset=int(totals["inspected"]) == 0, timeout_ms=timeout_ms,
+            explored=sorted(explored_controls) if explored_controls is not None else None,
+        )
+        if explored_controls is not None and isinstance(result.get("signature"), str):
+            explored_controls.add(result["signature"])
         for key in ("activated", "skipped", "inspected", "menus_expanded"):
             totals[key] = int(totals[key]) + int(result.get(key, 0))
         transition_routes: list[DiscoveredRoute] = []
@@ -1148,7 +1173,8 @@ async def expand_safe_navigation(
     remaining = await evaluate_dom(
         page,
         EXPAND_SAFE_NAVIGATION_SCRIPT,
-        {"reset": int(totals["inspected"]) == 0, "inspectOnly": True},
+        {"reset": int(totals["inspected"]) == 0, "inspectOnly": True,
+         "explored": sorted(explored_controls) if explored_controls is not None else []},
     )
     totals["remaining"] = int(remaining.get("remaining", 0))
     totals["discovered"] = int(totals["inspected"]) + int(totals["remaining"])
@@ -1160,7 +1186,7 @@ async def expand_safe_navigation(
 
 async def discover_page_routes(page, maximum_scrolls: int = 3) -> list[DiscoveredRoute]:
     """Discover one document or frame; its own URL/baseURI resolves relative links."""
-    raw = await evaluate_dom(page, DISCOVER_ROUTES_SCRIPT, max(0, min(maximum_scrolls, 20)))
+    raw = await evaluate_dom(page, DISCOVER_ROUTES_SCRIPT, max(0, int(maximum_scrolls)))
     document_url = page.url
     routes: list[DiscoveredRoute] = []
     for item in raw:

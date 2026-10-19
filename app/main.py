@@ -83,6 +83,7 @@ from app.navigation import (
 )
 from app.navigation_guard import RedirectResponseGuard
 from app.network import (
+    BROWSER_TIMER_LIMIT_MS,
     SAFE_HTTP_METHODS,
     PassiveNetworkObserver,
     ReadOnlyPolicy,
@@ -279,18 +280,21 @@ class ApprovedReadPostOperation(BaseModel):
 class ScanRequest(BaseModel):
     model_config = {"frozen": True, "extra": "forbid"}
     target: str = Field(min_length=1, max_length=4096)
-    # Keep the safe default conservative while allowing large portals to opt in
-    # to the full bounded discovery budget from the UI/API.
-    max_pages: int = Field(50, ge=1, le=1500)
-    max_depth: int = Field(3, ge=0, le=10)
-    max_redirects: int = Field(10, ge=0, le=30)
-    timeout_ms: int = Field(15000, ge=1000, le=120000)
-    per_route_timeout_ms: int | None = Field(None, ge=1000, le=120000)
-    total_timeout_ms: int = Field(300000, ge=1000, le=900000)
-    navigation_timeout_ms: int | None = Field(None, ge=1000, le=120000)
-    authentication_timeout_ms: int | None = Field(None, ge=1000, le=120000)
-    readiness_timeout_ms: int | None = Field(None, ge=1000, le=120000)
-    api_timeout_ms: int | None = Field(None, ge=1000, le=120000)
+    # Every scan setting is operator-configurable from the UI/API. Only
+    # technical bounds apply: millisecond values must fit browser timers.
+    max_pages: int = Field(500, ge=1)
+    max_depth: int = Field(10, ge=0)
+    max_redirects: int = Field(10, ge=0)
+    timeout_ms: int = Field(15000, ge=1000, le=BROWSER_TIMER_LIMIT_MS)
+    per_route_timeout_ms: int | None = Field(None, ge=1000, le=BROWSER_TIMER_LIMIT_MS)
+    total_timeout_ms: int = Field(1800000, ge=1000, le=BROWSER_TIMER_LIMIT_MS)
+    navigation_timeout_ms: int | None = Field(None, ge=1000, le=BROWSER_TIMER_LIMIT_MS)
+    authentication_timeout_ms: int | None = Field(None, ge=1000, le=BROWSER_TIMER_LIMIT_MS)
+    readiness_timeout_ms: int | None = Field(None, ge=1000, le=BROWSER_TIMER_LIMIT_MS)
+    api_timeout_ms: int | None = Field(None, ge=1000, le=BROWSER_TIMER_LIMIT_MS)
+    # Discovery runs after a route is validated and has its own budget, so a
+    # large menu tree cannot turn a healthy route into a route timeout.
+    discovery_timeout_ms: int | None = Field(None, ge=1000, le=BROWSER_TIMER_LIMIT_MS)
     readiness_selector: str | None = Field(None, max_length=512)
     readiness_event: str | None = Field(None, max_length=128, pattern=r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
     concurrency_limit: int = Field(MAX_CONCURRENT_SCANS, ge=1, le=MAX_CONCURRENT_SCANS)
@@ -301,25 +305,33 @@ class ScanRequest(BaseModel):
     check_security_headers: bool = True
     allow_subdomains: bool = False
     allow_private_networks: bool = False
-    resource_hosts: list[str] = Field(default_factory=list, max_length=50)
-    approved_read_post_operations: list[ApprovedReadPostOperation] = Field(
-        default_factory=list, max_length=100,
-    )
-    portal_hosts: list[str] = Field(default_factory=list, max_length=25)
-    credential_hosts: list[str] = Field(default_factory=list, max_length=25)
-    authentication_hosts: list[str] = Field(default_factory=list, max_length=25)
+    resource_hosts: list[str] = Field(default_factory=list)
+    approved_read_post_operations: list[ApprovedReadPostOperation] = Field(default_factory=list)
+    portal_hosts: list[str] = Field(default_factory=list)
+    credential_hosts: list[str] = Field(default_factory=list)
+    authentication_hosts: list[str] = Field(default_factory=list)
     query_parameter_policy: Literal["ignore", "allowlist", "preserve"] = "ignore"
-    allowed_query_parameters: list[str] = Field(default_factory=list, max_length=25)
-    slow_page_threshold_ms: int = Field(5000, ge=500, le=120000)
-    large_resource_threshold_bytes: int = Field(1048576, ge=1024, le=104857600)
-    large_image_threshold_bytes: int = Field(524288, ge=1024, le=104857600)
-    large_js_threshold_bytes: int = Field(1048576, ge=1024, le=104857600)
-    large_css_font_threshold_bytes: int = Field(524288, ge=1024, le=104857600)
-    render_settle_ms: int = Field(750, ge=0, le=5000)
-    min_observation_ms: int = Field(500, ge=0, le=10000)
-    network_quiet_ms: int = Field(300, ge=0, le=5000)
-    max_navigation_actions: int = Field(20, ge=0, le=1500)
-    max_discovery_scrolls: int = Field(3, ge=0, le=20)
+    allowed_query_parameters: list[str] = Field(default_factory=list)
+    slow_page_threshold_ms: int = Field(5000, ge=500, le=BROWSER_TIMER_LIMIT_MS)
+    large_resource_threshold_bytes: int = Field(1048576, ge=1024)
+    large_image_threshold_bytes: int = Field(524288, ge=1024)
+    large_js_threshold_bytes: int = Field(1048576, ge=1024)
+    large_css_font_threshold_bytes: int = Field(524288, ge=1024)
+    render_settle_ms: int = Field(400, ge=0, le=BROWSER_TIMER_LIMIT_MS)
+    min_observation_ms: int = Field(300, ge=0, le=BROWSER_TIMER_LIMIT_MS)
+    network_quiet_ms: int = Field(300, ge=0, le=BROWSER_TIMER_LIMIT_MS)
+    # Once the view is rendered and its DOM is stable, stop waiting for
+    # network quiet after this long. Polling applications never go quiet;
+    # 0 waits for quiet until the readiness budget is exhausted.
+    network_settle_cap_ms: int = Field(2000, ge=0, le=BROWSER_TIMER_LIMIT_MS)
+    # Observation after opening a menu during discovery (not route validation).
+    menu_settle_ms: int = Field(250, ge=0, le=BROWSER_TIMER_LIMIT_MS)
+    max_navigation_actions: int = Field(200, ge=0)
+    max_discovery_scrolls: int = Field(3, ge=0)
+    # Shared header/navigation/sidebar menus are explored once per scan.
+    # Enable to re-explore them on every route (slower; for menus whose
+    # content differs per route).
+    reexplore_navigation_each_route: bool = False
     authentication: Authentication = Field(default_factory=Authentication)
     allow_mutations: bool = False
     mutation_acknowledged: bool = False
@@ -795,6 +807,27 @@ async def application_build():
     return build_diagnostics()
 
 
+@app.get("/api/scan-settings")
+async def scan_settings():
+    """Defaults and technical bounds of every numeric/boolean scan setting.
+
+    The dashboard reads this instead of hard-coding limits, so the request
+    model stays the single source of truth for what an operator may configure.
+    """
+    settings = {}
+    for name, field in ScanRequest.model_fields.items():
+        if field.annotation not in (int, bool, int | None):
+            continue
+        entry: dict[str, object] = {"default": field.default}
+        for constraint in field.metadata:
+            for attribute, key in (("ge", "minimum"), ("le", "maximum")):
+                value = getattr(constraint, attribute, None)
+                if value is not None:
+                    entry[key] = value
+        settings[name] = entry
+    return {"settings": settings, "deployment": {"max_concurrent_scans": MAX_CONCURRENT_SCANS}}
+
+
 @app.get("/healthz", include_in_schema=False)
 async def healthz():
     return {"status": "ok", "version": app.version}
@@ -1139,6 +1172,10 @@ async def execute_scan(
     # A bootstrap target is not discovered/tested application coverage yet.
     discovered_routes: set[str] = set()
     queued_routes: set[str] = set()
+    # Signatures of shared navigation controls already explored in this scan.
+    explored_navigation_controls: set[str] | None = (
+        None if req.reexplore_navigation_each_route else set()
+    )
     depth_limited_routes: set[str] = set()
     queued_view_keys: dict[str, set[str]] = defaultdict(set)
     action_limited_routes: set[str] = set()
@@ -2743,7 +2780,7 @@ async def execute_scan(
                             navigation_type=navigation_mode,
                         )
                         try:
-                            async with asyncio.timeout_at(route_deadline):
+                            async with asyncio.timeout_at(route_deadline) as route_scope:
                                 dom_target = resolve_view_target(page, view_control)
                                 semantic_popup = None
 
@@ -2998,6 +3035,7 @@ async def execute_scan(
                                     readiness_selector=req.readiness_selector if dom_target == page else None,
                                     readiness_event=req.readiness_event if dom_target == page else None,
                                     view_control=view_control,
+                                    network_settle_cap_ms=req.network_settle_cap_ms,
                                 ) if authentication_classification == "PASS" else None
                                 if dom_target != page and render_health is not None and (req.readiness_selector or req.readiness_event):
                                     # The configured application-shell selector lives
@@ -3141,6 +3179,12 @@ async def execute_scan(
                                     observation_phase = "DISCOVERY"
                                     browser_lifecycle.advance("ROUTE_DISCOVERY")
                                     discovery_started = time.perf_counter()
+                                    # Validation is complete; discovery gets its own
+                                    # budget instead of the route's remaining time.
+                                    route_deadline = min(deadline, discovery_started + (
+                                        req.discovery_timeout_ms or req.navigation_timeout_ms or req.timeout_ms
+                                    ) / 1000)
+                                    route_scope.reschedule(route_deadline)
                                     await publish_progress(
                                         "DISCOVERING_ROUTES",
                                         discovered=len(discovered_routes),
@@ -3158,11 +3202,12 @@ async def execute_scan(
                                         require_current_session()
                                         snapshot = await wait_for_render_settle(
                                             target,
-                                            settle_ms=req.render_settle_ms,
+                                            settle_ms=req.menu_settle_ms,
                                             maximum_ms=max(0, round((route_deadline - time.perf_counter()) * 1000)),
                                             network_activity=route_activity_snapshot,
-                                            minimum_observation_ms=req.min_observation_ms,
-                                            network_quiet_ms=req.network_quiet_ms,
+                                            minimum_observation_ms=min(req.min_observation_ms, req.menu_settle_ms),
+                                            network_quiet_ms=min(req.network_quiet_ms, req.menu_settle_ms),
+                                            network_settle_cap_ms=req.network_settle_cap_ms,
                                         )
                                         require_current_session()
                                         return snapshot
@@ -3179,6 +3224,7 @@ async def execute_scan(
                                         wait_after_action=observe_discovery_panel,
                                         maximum_scrolls=req.max_discovery_scrolls,
                                         on_routes_discovered=retain_panel_routes,
+                                        explored_controls=explored_navigation_controls,
                                     )
                                     safe_routes = list(navigation_actions.pop("routes", []))
                                     if navigation_actions["activated"]:
@@ -3218,6 +3264,7 @@ async def execute_scan(
                                                 maximum_scrolls=req.max_discovery_scrolls,
                                                 wait_after_action=lambda target=frame: observe_discovery_panel(target),
                                                 on_routes_discovered=retain_panel_routes,
+                                                explored_controls=explored_navigation_controls,
                                             )
                                             frame_routes = list(frame_actions.pop("routes", []))
                                             for metric in ("activated", "skipped", "inspected", "remaining", "discovered", "unresolved", "view_controls", "menus_expanded"):
@@ -4242,6 +4289,7 @@ async def execute_scan(
         "large_js_threshold_bytes", "large_css_font_threshold_bytes",
         "check_links", "check_console", "check_resources", "check_performance", "check_security_headers",
         "allow_subdomains", "allow_private_networks", "max_navigation_actions", "max_discovery_scrolls",
+        "discovery_timeout_ms", "network_settle_cap_ms", "menu_settle_ms", "reexplore_navigation_each_route",
     })
     scan_configuration["authentication_mode"] = req.authentication.mode
     scan_configuration["readiness_selector_configured"] = bool(req.readiness_selector)

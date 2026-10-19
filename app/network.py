@@ -44,6 +44,11 @@ POLICY_CLASSIFICATIONS = frozenset({
 })
 
 
+# Browser timers (setTimeout) overflow above a signed 32-bit millisecond value
+# and fire immediately, so this is the only upper bound on configured timeouts.
+BROWSER_TIMER_LIMIT_MS = 2_147_483_647
+
+
 def api_timeout_init_script(timeout_ms: int) -> str:
     """Apply an explicitly requested browser API deadline without replaying calls.
 
@@ -51,7 +56,7 @@ def api_timeout_init_script(timeout_ms: int) -> str:
     This is opt-in; the default scan does not wrap fetch/XHR. Synchronous XHR
     does not support timeouts and remains bounded by the outer scan deadline.
     """
-    if not 1000 <= timeout_ms <= 120000:
+    if not 1 <= timeout_ms <= BROWSER_TIMER_LIMIT_MS:
         raise ValueError("API timeout is outside the supported range")
     return """(() => {
       const timeout = TIMEOUT_MS;

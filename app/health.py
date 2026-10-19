@@ -251,12 +251,16 @@ async def wait_for_render_settle(
     readiness_selector: str | None = None,
     readiness_event: str | None = None,
     view_control: dict[str, str] | None = None,
+    network_settle_cap_ms: int = 0,
 ) -> dict[str, Any]:
     """Wait for bounded DOM stability and route-scoped network quiet.
 
     Long-lived sockets/event streams are excluded by the activity tracker. The
     maximum remains authoritative so polling portals cannot hold a scan open.
+    With ``network_settle_cap_ms`` a rendered, DOM-stable view stops waiting
+    for network quiet after that long (reason ``DOM_STABLE_NETWORK_ACTIVE``).
     """
+    network_settle_cap_ms = max(0, int(network_settle_cap_ms))
     maximum_ms = max(0, int(maximum_ms))
     settle_ms = max(0, int(settle_ms))
     minimum_observation_ms = max(0, int(minimum_observation_ms))
@@ -403,6 +407,14 @@ async def wait_for_render_settle(
             content_ready = application_shell_ready(latest)
             if dom_stable and observed_minimum and network_quiet and content_ready:
                 return finish("DOM_AND_NETWORK_QUIET", now, pending, generation)
+            if (
+                network_settle_cap_ms and dom_stable and observed_minimum and content_ready
+                and first_render_ready is not None
+                and (now - first_render_ready) * 1000 >= network_settle_cap_ms
+            ):
+                # Background polling keeps the network busy indefinitely; the
+                # rendered view is ready, so do not spend the route budget.
+                return finish("DOM_STABLE_NETWORK_ACTIVE", now, pending, generation)
         else:
             if previous is not None:
                 dom_active_until = capture_started
