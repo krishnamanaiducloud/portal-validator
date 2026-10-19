@@ -108,3 +108,49 @@ in 16.5 minutes instead of 38.
   - `test_execution_evidence.py`
   - `test_authenticated_spa.py`
   - `ui_check.py`
+
+## Published images
+
+Built from commit `4a2bee3d60f32605c222981fdbec2dd2ae3277f0` for `linux/amd64`
+on the same digest-pinned bases as 1.13.0. Later commits change documentation
+and the Deployment reference only.
+
+| Image | Digest | Compressed size |
+|---|---|---|
+| `docker.io/mohankrishna999/portal-validator:1.13.1` | `sha256:7ce8327bd9a39e23b87182236a34d1ce1112bbf608add3ce132aba07ed74b405` | 503.6 MB |
+| `docker.io/mohankrishna999/portal-validator:1.13.1-debug` | `sha256:cc2842c99536a6775ad7b42665f69d0bb94f37f1395a4e8fe248956eb01b4c92` | 527.3 MB |
+
+Both digests were confirmed from the registry. Each image was pulled by digest
+and reported version 1.13.1, the commit above and `VERIFIED` source integrity.
+`openshift/deployment.yaml` pins the production image by tag and digest. No
+cluster rollout was performed.
+
+## Verification
+
+- Host suite (WSL2, Python 3.14): 1174 passed, 0 failed. Frontend
+  `tests/ui_check.py` passed.
+- Debug image (Python 3.15, arbitrary UID, read-only root, all capabilities
+  dropped): 104 of 104 scan-speed, broad discovery, authentication-first,
+  navigation, Material SPA, deadline and API tests passed.
+- `tests/release_image_smoke.py` passed for both images: strict Python and
+  Chromium TLS through a disposable corporate CA, Playwright 1.63.0 with
+  Chromium 153.0.8010.12, `/healthz`, redacted access logs, graceful SIGTERM
+  and an idempotent entrypoint.
+
+## Security scan results
+
+Trivy 0.72.0 (DB 2026-10-18 18:32 UTC) and Grype 0.104.0 (DB 2026-10-19 06:39
+UTC) scanned both images on 2026-10-19:
+
+| Check | `1.13.1` | `1.13.1-debug` |
+|---|---|---|
+| Trivy Critical/High/Medium/Low | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| Trivy secrets | 0 | 0 |
+| Grype Critical/High/Medium/Low | 0 / 0 / 3 / 0 | 0 / 0 / 3 / 0 |
+| SBOM packages (SPDX) | 121 | 172 |
+
+The three Grype findings are the unchanged `alsa-lib 1.2.16.1-r3` CVEs
+(CVE-2026-90781, CVE-2026-96674, CVE-2026-96675). They are carried forward
+under the exception approved for 1.13.0 and documented in
+`docs/RELEASE-1.13.0.md`. Wolfi still publishes no fixed `alsa-lib`, and both
+Chromium builds require `libasound.so.2`.
