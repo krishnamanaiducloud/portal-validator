@@ -43,6 +43,65 @@ Consumers that previously interpreted failed bootstrap rows as application
 routes must instead inspect `authentication_error`. Legacy internal job phase
 names remain accepted for compatibility; new scans publish the lifecycle above.
 
+The runtime moves from Python 3.14 to Python 3.15 (`python-3.15`
+`3.15.0_git20261017-r0`): Python 3.14.8 still accepts control characters in
+`poplib` commands (CVE-2025-15367), which CPython 3.15 rejects. All pinned
+dependencies install on 3.15; PyYAML, a `uvicorn[standard]` extra, builds from
+source and uses its pure-Python implementation.
+
+The debug image adds `curl`, `bind-tools` (`dig`, `nslookup`), `iproute2`
+(`ip`, `ss`) and `jq` from an exact signed APK transaction, plus `debugpy` and
+`pytest`. `openssl`, `certutil`, `ps`, `top` and `less` already ship in the
+production image. The debug image runs with the same entrypoint, CA trust
+initialization, TLS verification and network policy as production.
+
+## Security scan results
+
+Scanned on 2026-10-19 (UTC) with Trivy 0.72.0 (DB updated 2026-10-18 18:32
+UTC; OS, Python and Node.js packages plus secrets) and Grype 0.104.0 (DB built
+2026-10-18 06:27 UTC; image and Syft 1.46.0 SPDX SBOM). Source checks: pip-audit
+2.10.1, Bandit 1.9.4, Hadolint 2.14.0 and Gitleaks 8.28.0.
+
+| Check | Production `1.13.0` | Debug `1.13.0-debug` |
+|---|---|---|
+| Trivy Critical/High/Medium/Low | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| Trivy secrets | 0 | 0 |
+| Grype Critical/High/Medium/Low | 0 / 0 / 3 / 0 | 0 / 0 / 3 / 0 |
+| SBOM packages (SPDX) | 121 | 172 |
+
+- pip-audit: no known vulnerabilities in `requirements.txt` or
+  `requirements-dev.txt`.
+- Gitleaks: no leaks in the 64-commit history or the working tree.
+- Bandit: no High findings. Three Medium and six Low findings were reviewed as
+  false positives: string constants such as `refresh_token` (B105), commented
+  intentional `try/except/pass` (B110), the `$HOME` fallback path (B108) and
+  fixed-argument `openssl`/`certutil` subprocess calls (B404/B603).
+- Hadolint: warnings are root in builder stages that are not shipped (DL3002)
+  and intentional word splitting of an exact-version APK constraints file
+  (DL3018/SC2046/DL4006); the final stages run as UID 10001.
+
+### Approved exception: alsa-lib
+
+Grype matches three Medium CVEs against `alsa-lib 1.2.16.1-r3` through NVD CPE
+ranges ("through 1.2.16.1"); the Wolfi security data used by Trivy lists none.
+No fixed release exists upstream or in Wolfi, and both bundled Chromium builds
+(full and headless shell) dynamically link `libasound.so.2`, so the library
+cannot be removed without breaking browser scans.
+
+| CVE | Issue | Precondition |
+|---|---|---|
+| CVE-2026-90781 | One-byte stack overflow parsing a control element identifier | Attacker-supplied ALSA state file or control identifier |
+| CVE-2026-96674 | Integer overflow in topology element size | Attacker-supplied topology file |
+| CVE-2026-96675 | Out-of-bounds read in the multi PCM plugin | Attacker-supplied ALSA configuration |
+
+Compensating controls: the container has no sound devices, runs as a non-root
+arbitrary UID with a read-only root filesystem, dropped capabilities and no
+privilege escalation; ALSA configuration is root-owned image content, and the
+validator never loads ALSA state, topology or configuration supplied by a scan
+target. The release owner approved this exception for 1.13.0. Re-evaluate on
+the next build and remove the exception once Wolfi publishes a fixed
+`alsa-lib`.
+
 ## Root causes and changed files
 
 `app/main.py:execute_scan` previously admitted the bootstrap target before
@@ -135,3 +194,41 @@ oc -n "$NAMESPACE" get pods -l app=portal-validator -o custom-columns=NAME:.meta
 oc -n "$NAMESPACE" exec deployment/portal-validator -- python -c 'import json,urllib.request; print(json.dumps(json.load(urllib.request.urlopen("http://127.0.0.1:8080/api/diagnostics/build")),indent=2))'
 oc -n "$NAMESPACE" logs deployment/portal-validator --since=15m | rg 'AUTHENTICATION_APPROVALS_APPLIED|AUTHENTICATION_OBSERVATION_COMPLETED|APPLICATION_SHELL|SCAN_AUTHENTICATION_FAILED|ROUTE_VALIDATED|SCAN_COMPLETED'
 ```
+
+## Executed verification
+
+- Host suite (WSL2 Ubuntu, Python 3.14, Playwright 1.63.0 Chromium): 1168 of
+  1169 passed in one full run; the remaining authentication-observation test
+  passed after its fix, together with the 98 surrounding authentication tests.
+- Image suite (debug image, Python 3.15.0, arbitrary UID, read-only root, all
+  capabilities dropped): 1163 of 1169 passed. The six failures are
+  `tests/test_operator_policy_script.py`, which executes the operator
+  workstation helper `scripts/apply_auth_policy.sh`; the images intentionally
+  ship no `bash`. Those tests pass on the host.
+- Frontend: `tests/ui_check.py` passed against a live server, including
+  failed-authentication zero-route rendering, stale-result isolation and
+  44-route pagination.
+- Release image smoke (`tests/release_image_smoke.py`) passed for both images
+  with `--user 1000820000:0 --read-only --cap-drop ALL --security-opt
+  no-new-privileges`: source integrity `VERIFIED`, Playwright 1.63.0 with
+  Chromium 153.0.8010.12, strict Python and Chromium TLS through a disposable
+  corporate CA, `/healthz`, redacted access logs, graceful SIGTERM and an
+  idempotent entrypoint.
+- Some sub-second browser fixtures are timing-sensitive on a heavily loaded
+  host and were confirmed by isolated reruns.
+
+## Published images
+
+Built from commit `37ce675f537039610c43d6193e6607af9cec3bf9` for
+`linux/amd64` only (the tested platform). Later commits on the release branch
+change documentation and the Deployment reference only.
+
+| Image | Digest | Compressed size |
+|---|---|---|
+| `docker.io/mohankrishna999/portal-validator:1.13.0` | `sha256:002f93b341a4e89fe67da9da451417f872d8f08a5896ffe8081b1c684ce85fdb` | 503.6 MB |
+| `docker.io/mohankrishna999/portal-validator:1.13.0-debug` | `sha256:f1a5ac8e27281c51a380d676074254747d24536f1a8816f959a87defa5d8cca7` | 527.3 MB |
+
+Both digests were confirmed from the registry and by pulling each image by
+digest, which reported version 1.13.0, the commit above and `VERIFIED` source
+integrity. `openshift/deployment.yaml` pins the production image by tag and
+digest. No cluster rollout was performed.
