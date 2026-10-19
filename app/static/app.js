@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = '1.14.0';
+const FRONTEND_VERSION = '1.13.1';
 // The server pins this exact deferred script with SRI and a hash-versioned URL.
 // Capture currentScript now; it is unavailable in subsequent async callbacks.
 const frontendScript = document.currentScript;

@@ -1,4 +1,4 @@
-# Portal Validator 1.14.0 — fast, fully configurable scanning
+# Portal Validator 1.13.1 — fast, fully configurable scanning
 
 ## Problems addressed
 
@@ -62,7 +62,7 @@
 
 ## Changed defaults
 
-| Setting | 1.13.0 | 1.14.0 |
+| Setting | 1.13.0 | 1.13.1 |
 |---|---|---|
 | Maximum routes (`max_pages`) | 50 | 500 |
 | Maximum depth | 3 | 10 |
@@ -85,8 +85,8 @@ WSL2 host), with the same 44 views discovered and validated in every run:
 | Configuration | Total scan | Discovery time |
 |---|---|---|
 | 1.13.0 defaults | 84 s | 31.7 s |
-| 1.14.0 defaults, re-explore enabled | 66 s | 29.3 s |
-| 1.14.0 defaults | 50 s | 11.1 s |
+| 1.13.1 defaults, re-explore enabled | 66 s | 29.3 s |
+| 1.13.1 defaults | 50 s | 11.1 s |
 
 The fixture has only five shared menus. Portals with larger navigation trees, or
 that poll continuously, gain proportionally more, because the per-route menu
