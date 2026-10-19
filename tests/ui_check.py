@@ -188,7 +188,7 @@ async def main():
         await page.route("**/api/auth-profiles", profile_list_fixture)
         await page.goto(base_url, wait_until="networkidle")
         build_metadata = await page.evaluate("async () => (await fetch('/api/diagnostics/build', {cache:'no-store'})).json()")
-        assert build_metadata["version"] == "1.13.1"
+        assert build_metadata["version"] == "1.13.2"
         assert await page.evaluate("loadedFrontendSha256") == build_metadata["frontend_sha256"]
         assert await page.evaluate("loadedFrontendIntegrity.startsWith('sha256-')")
         assert "Frontend matched" in await page.locator("#build-summary").text_content()
@@ -497,6 +497,25 @@ async def main():
         for excluded in ("/blocked/", "/unfinished", "/policy-blocked.js", "/pending.js", "synthetic-private-value"):
             assert excluded not in failed_text, excluded
         assert await page.locator("#failed-endpoint-list configuration").count() == 0
+        # Every data column of the failure and request-issue tables is sortable.
+        assert await page.locator("[data-failed-sort]").count() == 9
+        assert await page.locator("[data-issue-sort]").count() == 6
+        assert await page.locator('[data-resource-sort="health"]').count() == 1
+        for button, cells in (
+            ('[data-failed-sort="endpoint"]', "#failed-endpoint-list tr td:nth-child(3) code"),
+            ('[data-issue-sort="endpoint"]', "#request-issue-list tr td:nth-child(3) code"),
+        ):
+            header = page.locator(button)
+            await header.click()
+            ascending = await page.locator(cells).all_inner_texts()
+            assert await header.evaluate("b => b.closest('th').getAttribute('aria-sort')") == "ascending"
+            await header.click()
+            descending = await page.locator(cells).all_inner_texts()
+            assert await header.evaluate("b => b.closest('th').getAttribute('aria-sort')") == "descending"
+            assert len(set(ascending)) > 1 and descending == list(reversed(ascending)), (button, ascending, descending)
+        await page.locator('[data-failed-sort="affected"]').click()
+        affected = [int(value) for value in await page.locator("#failed-endpoint-list tr td:nth-child(7)").all_inner_texts()]
+        assert affected == sorted(affected)
         interrupted_row = page.locator("#failed-endpoint-list tr").filter(has_text="/interrupted.js")
         assert await interrupted_row.locator("td").nth(5).text_content() == "RESPONSE_BODY_FAILURE"
         gateway_row = page.locator("#failed-endpoint-list tr").filter(has_text="/remote<configuration>.json")
@@ -1059,7 +1078,7 @@ async def main():
         await page.locator("#resource-columns > summary").click()
         await page.locator("#resource-details > summary").click()
         assert await page.locator("#security-list .recommendation").count() == 1
-        calls_sort = page.get_by_role("button", name="Calls", exact=True)
+        calls_sort = page.locator('[data-api-sort="calls"]')
         assert await calls_sort.count() == 1
         await calls_sort.click()
         assert await page.locator('[data-api-sort="calls"]').evaluate(

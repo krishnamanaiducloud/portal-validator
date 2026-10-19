@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = '1.13.1';
+const FRONTEND_VERSION = '1.13.2';
 // The server pins this exact deferred script with SRI and a hash-versioned URL.
 // Capture currentScript now; it is unavailable in subsequent async callbacks.
 const frontendScript = document.currentScript;
@@ -19,6 +19,8 @@ let profileMessage = '';
 let routeSort = {key:'route_name', direction:1};
 let apiSort = {key:'host', direction:1};
 let resourceSort = {key:'transfer_size_bytes', direction:-1};
+let failedSort = {key:'affected', direction:-1};
+let issueSort = {key:'affected', direction:-1};
 let progressTimer = null;
 let activeDrilldown = 'all';
 let apiFailureOnly = false;
@@ -165,6 +167,7 @@ const terminalStates = new Set(['COMPLETED','PARTIAL','FAILED','CANCELLED']);
 const numericRouteKeys = new Set(['status','load_ms','api_failures','resource_failure_count','console_count','warning_findings']);
 const numericApiKeys = new Set(['calls','status_2xx','status_3xx','status_4xx','status_5xx','network_failures','route_count','allowed_calls','blocked_count','application_bootstrap_phase_count','authentication_phase_count','route_validation_phase_count','session_refresh_phase_count','average_duration_ms','worst_duration_ms','failure_count']);
 const numericResourceKeys = new Set(['transfer_size_bytes','encoded_body_size_bytes','decoded_body_size_bytes','duration_ms','status']);
+const numericIssueKeys = new Set(['affected']);
 const postDiagnosticFields = [
   ['total_http_requests_observed','Total HTTP requests observed'],
   ['post_requests_observed','POST requests observed'],
@@ -428,7 +431,7 @@ function updateAuthenticationConfigurationNote() {
 
 function phaseConfiguration() {
   const configuration = {};
-  const fields = {navigation_timeout_ms:'navigation-timeout',authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout',per_route_timeout_ms:'per-route-timeout',discovery_timeout_ms:'discovery-timeout',concurrency_limit:'concurrency-limit'};
+  const fields = {navigation_timeout_ms:'navigation-timeout',authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout',per_route_timeout_ms:'per-route-timeout',discovery_timeout_ms:'discovery-timeout',session_refresh_interval_ms:'session-refresh-interval',concurrency_limit:'concurrency-limit'};
   for (const [name,id] of Object.entries(fields)) {
     const input = byId(id);
     if (!input.value.trim()) continue;
@@ -1023,7 +1026,10 @@ function renderResourceDetails() {
       && (status === 'all' || (status === 'unknown' ? item.status == null : Math.floor(Number(item.status) / 100) === Number(status)))
       && (!failedOnly || resourceIsFailed(item))
       && (!largeOnly || Boolean(item.size_categories?.length));
-  }).sort((left, right) => compareValues(left[resourceSort.key], right[resourceSort.key], numericResourceKeys.has(resourceSort.key)) * resourceSort.direction);
+  }).sort((left, right) => {
+    const value = item => resourceSort.key === 'health' ? resourceObservationStatus(item) : item[resourceSort.key];
+    return compareValues(value(left), value(right), numericResourceKeys.has(resourceSort.key)) * resourceSort.direction;
+  });
   updateAriaSort('[data-resource-sort]', resourceSort, 'resourceSort');
   byId('resource-count').textContent = `${visible.length} of ${details.length} resource observations`;
   visible = paginateTable('resource', visible);
@@ -1088,10 +1094,17 @@ function renderFailedEndpoints() {
       routes:item.routes_using_resource, affected:failures || http,
       categories:categories.length ? categories : ['RESOURCE_FAILURE']});
   }
+  for (const row of rows) {
+    row.statuses = Object.entries(row.item.response_status_counts || {}).filter(([status]) => Number(status) >= 400 && Number(status) < 600)
+      .map(([status,count]) => `${status} (${count})`).join(', ') || (row.categories.includes('HTTP_FAILURE') ? '4xx / 5xx (exact code not recorded)' : 'No HTTP error recorded');
+    Object.assign(row, {route_names:routeNames(row.routes), classification:row.categories.join(', '),
+      first_seen:row.item.first_seen || '', last_seen:row.item.last_seen || ''});
+  }
+  rows.sort((left, right) => compareValues(left[failedSort.key], right[failedSort.key], numericIssueKeys.has(failedSort.key)) * failedSort.direction);
+  updateAriaSort('[data-failed-sort]', failedSort, 'failedSort');
   byId('failed-endpoint-count').textContent = `${rows.length} failed endpoint/resource identities; affected calls are counted per row, not unique routes.`;
   byId('failed-endpoint-list').innerHTML = rows.map((row,index) => {
-    const statuses = Object.entries(row.item.response_status_counts || {}).filter(([status]) => Number(status) >= 400 && Number(status) < 600)
-      .map(([status,count]) => `${status} (${count})`).join(', ') || (row.categories.includes('HTTP_FAILURE') ? '4xx / 5xx (exact code not recorded)' : 'No HTTP error recorded');
+    const statuses = row.statuses;
     return `<tr><td>${escapeHtml(row.kind)}</td><td>${escapeHtml(row.method)}</td><td class="resource-path"><strong>${escapeHtml(row.item.host || '')}</strong><code>${escapeHtml(row.endpoint)}</code></td><td>${escapeHtml(routeNames(row.routes))}</td><td>${escapeHtml(statuses)}</td><td>${escapeHtml(row.categories.join(', '))}</td><td>${escapeHtml(row.affected)}</td><td>${escapeHtml(row.item.first_seen || 'Not recorded')}</td><td>${escapeHtml(row.item.last_seen || 'Not recorded')}</td><td><button type="button" class="secondary" data-failed-endpoint="${index}">Inspect failure</button></td></tr>`;
   }).join('') || '<tr><td colspan="10" class="empty-table">No target HTTP, network, or response-body failures were observed. Policy-blocked and unresolved requests remain in their inventories.</td></tr>';
   byId('failed-endpoint-list').querySelectorAll('[data-failed-endpoint]').forEach(button => button.addEventListener('click', () => {
@@ -1134,6 +1147,9 @@ function renderRequestIssues() {
     const match = routes.find(route => [route.route_id, route.normalized_route_identity, route.canonical_route, route.url].includes(id));
     return match?.route_name || match?.route_label || id;
   }).join(', ') || 'Not attributed';
+  for (const row of rows) Object.assign(row, {method:row.item.method || 'Not recorded', route_names:names(row.routes)});
+  rows.sort((left, right) => compareValues(left[issueSort.key], right[issueSort.key], numericIssueKeys.has(issueSort.key)) * issueSort.direction);
+  updateAriaSort('[data-issue-sort]', issueSort, 'issueSort');
   byId('request-issue-count').textContent = String(rows.length) + ' issue categories; these are not target HTTP failures.';
   byId('request-issue-list').innerHTML = rows.map((row, index) =>
     '<tr><td>' + escapeHtml(row.kind) + '</td><td>' + escapeHtml(row.item.method || 'Not recorded') + '</td><td class="resource-path"><strong>' + escapeHtml(row.item.host || '') + '</strong><code>' + escapeHtml(row.endpoint) + '</code></td><td>' + escapeHtml(row.state) + '</td><td>' + escapeHtml(row.affected) + '</td><td>' + escapeHtml(names(row.routes)) + '</td><td><button type="button" class="secondary" data-request-issue="' + index + '">Inspect request issue</button></td></tr>'
@@ -1557,7 +1573,7 @@ byId('result-filter').insertAdjacentHTML('beforeend', '<option value="not-tested
 const requestIssueSection = document.createElement('section');
 requestIssueSection.id = 'request-issues';
 requestIssueSection.className = 'inventory';
-requestIssueSection.innerHTML = '<h3>Blocked / Incomplete Requests</h3><p>Policy-blocked, canceled and incomplete requests are shown separately from target HTTP failures. These are passive observations only.</p><p id="request-issue-count" class="inventory-scope"></p><div class="route-table-wrap"><table class="route-table"><thead><tr><th>Kind</th><th>Method</th><th>Sanitized endpoint</th><th>Issue</th><th>Calls</th><th>Associated routes/views</th><th>Diagnostics</th></tr></thead><tbody id="request-issue-list"></tbody></table></div>';
+requestIssueSection.innerHTML = '<h3>Blocked / Incomplete Requests</h3><p>Policy-blocked, canceled and incomplete requests are shown separately from target HTTP failures. These are passive observations only.</p><p id="request-issue-count" class="inventory-scope"></p><div class="route-table-wrap"><table class="route-table"><thead><tr><th aria-sort="none"><button type="button" data-issue-sort="kind">Kind</button></th><th aria-sort="none"><button type="button" data-issue-sort="method">Method</button></th><th aria-sort="none"><button type="button" data-issue-sort="endpoint">Sanitized endpoint</button></th><th aria-sort="none"><button type="button" data-issue-sort="state">Issue</button></th><th aria-sort="none"><button type="button" data-issue-sort="affected">Calls</button></th><th aria-sort="none"><button type="button" data-issue-sort="route_names">Associated routes/views</button></th><th>Diagnostics</th></tr></thead><tbody id="request-issue-list"></tbody></table></div>';
 byId('failed-endpoints').after(requestIssueSection);
 const postSummary = document.createElement('dl');
 postSummary.className = 'api-post-summary';
@@ -1608,6 +1624,8 @@ byId('route-inspector-download').addEventListener('click', () => {
 document.querySelectorAll('[data-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.sort; routeSort = {key, direction:routeSort.key === key ? -routeSort.direction : 1}; renderRows(); }));
 document.querySelectorAll('[data-api-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.apiSort; apiSort = {key, direction:apiSort.key === key ? -apiSort.direction : 1}; renderApiInventory(); }));
 document.querySelectorAll('[data-resource-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.resourceSort; resourceSort = {key, direction:resourceSort.key === key ? -resourceSort.direction : 1}; renderResourceDetails(); }));
+document.querySelectorAll('[data-failed-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.failedSort; failedSort = {key, direction:failedSort.key === key ? -failedSort.direction : 1}; renderFailedEndpoints(); }));
+document.querySelectorAll('[data-issue-sort]').forEach((button) => button.addEventListener('click', () => { const key = button.dataset.issueSort; issueSort = {key, direction:issueSort.key === key ? -issueSort.direction : 1}; renderRequestIssues(); }));
 byId('cancel-button').addEventListener('click', async () => {
   if (!activeScanId) return;
   const scanId = activeScanId, generation = scanGeneration;
@@ -1682,7 +1700,8 @@ const SCAN_SETTING_INPUTS = {max_pages:'pages',max_depth:'depth',max_redirects:'
   min_observation_ms:'min-observation',network_quiet_ms:'network-quiet',network_settle_cap_ms:'network-settle-cap',
   menu_settle_ms:'menu-settle',max_navigation_actions:'navigation-actions',max_discovery_scrolls:'discovery-scrolls',
   per_route_timeout_ms:'per-route-timeout',discovery_timeout_ms:'discovery-timeout',navigation_timeout_ms:'navigation-timeout',
-  authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout'};
+  authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout',
+  session_refresh_interval_ms:'session-refresh-interval'};
 requestJson('/api/scan-settings', {}, 'Scan settings request').then((data) => {
   for (const [name, id] of Object.entries(SCAN_SETTING_INPUTS)) {
     const setting = data.settings?.[name], input = byId(id);
