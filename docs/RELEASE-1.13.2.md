@@ -1,4 +1,35 @@
-# Portal Validator 1.13.2 — sortable tables and session renewal
+# Portal Validator 1.13.2 — session recovery, sortable tables and session renewal
+
+## Session expiry during a scan
+
+With an SSO session profile, routes validated normally until the access token
+expired, typically after a few minutes. Then the whole scan ended as
+"Authentication failed" with zero routes. The authentication-first gate
+treated any session rejection after the application was ready as a global
+authentication failure, and discarded every route validated while the session
+was still valid.
+
+The scan now recovers:
+
+1. When the session is rejected after the application was ready, the
+   validator runs the profile's silent refresh, if one is configured.
+2. It then reopens the portal through the same approved SSO flow as the
+   initial bootstrap. An identity provider with a valid session silently
+   re-issues the application session. Credentials are never entered or
+   replayed.
+3. If the application becomes ready again, the interrupted route is retried
+   and the scan continues. Earlier 401 evidence is not re-applied to the
+   recovered session.
+4. *Session recovery attempts* (`session_recovery_attempts`, default 3)
+   limits the retries. When they are exhausted, or the identity provider
+   requires an interactive sign-in or MFA, the scan stops with
+   `scan_status=PARTIAL` and `termination_reason=SESSION_EXPIRED`:
+   - routes validated while the session was valid are kept;
+   - the remaining routes are listed as `NOT_TESTED_SESSION_EXPIRED`;
+   - the cause is reported in `session_interruption`.
+
+Initial authentication failures still fail closed with zero routes. The
+dashboard explains a stopped or recovered session.
 
 ## Sortable tables
 
@@ -48,6 +79,16 @@ itself; use an SSO session profile for applications with expiring tokens.
 
 ## Tests
 
+- `tests/test_session_recovery.py` uses a portal whose session expires
+  server-side mid-scan:
+  - with a silently re-issuing identity provider, the session is recovered
+    and every route is validated;
+  - when sign-in is required, validated routes are kept and the rest are
+    marked not tested;
+  - zero recovery attempts never re-authenticates.
+- `tests/test_authentication_first.py` now asserts that an unrecoverable
+  expiry keeps the validated routes. It previously asserted that they were
+  discarded.
 - `tests/test_session_renewal.py`:
   - only refresh grants qualify;
   - restored-session renewal policy works without an interactive flow;
