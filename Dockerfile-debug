@@ -1,4 +1,4 @@
-ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.2
+ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.3
 FROM ${PRODUCTION_IMAGE} AS production
 
 # Resolve an exact, signed APK transaction for the diagnostic utilities against

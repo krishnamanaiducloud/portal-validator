@@ -1,3 +1,3 @@
 """Release identity shared by the web application and container build tooling."""
 
-VALIDATOR_VERSION = "1.13.2"
+VALIDATOR_VERSION = "1.13.3"
