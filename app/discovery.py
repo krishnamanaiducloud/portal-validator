@@ -922,9 +922,19 @@ async def _reveal_navigation_menu(page, element, timeout_ms: int) -> tuple[bool,
     if before["expanded"] and not before["collapsed"]:
         # An already opened native disclosure or asynchronously mounted
         # menu must not be clicked again: that would close its real routes.
-        if not before["panelVisible"]:
-            await page.wait_for_function(MENU_READY_SCRIPT, arg=element, timeout=remaining_ms())
-        return False, False
+        if before["panelVisible"] or await element.evaluate("element => element.matches('summary')"):
+            return False, False
+        # ARIA state can be stale after an overlay was dismissed. Allow a
+        # short mount window, then use the normal reveal flow instead of
+        # spending the whole discovery budget on a panel that never appears.
+        try:
+            await page.wait_for_function(
+                "element => (" + MENU_REVEALED_SCRIPT + ")(element, false).panelVisible",
+                arg=element, timeout=min(remaining_ms(), 250),
+            )
+            return False, False
+        except PlaywrightTimeoutError:
+            before = await element.evaluate(MENU_REVEALED_SCRIPT, True)
     if before["panelVisible"] and not before["collapsed"]:
         return False, False
     await element.hover(timeout=remaining_ms())
