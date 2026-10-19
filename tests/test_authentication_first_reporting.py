@@ -24,7 +24,7 @@ def loaded_result(status=200, classification=None):
 @pytest.mark.parametrize("category", [
     "AUTHENTICATION_BLOCKED", "AUTHENTICATION_FAILED", "AUTHENTICATION_TIMEOUT",
     "SESSION_EXPIRED", "IDENTITY_PROVIDER_UNAVAILABLE", "AUTHENTICATION_CONFIGURATION_ERROR",
-    "APPLICATION_NOT_READY", "AUTHENTICATION_REQUIRED", "ACCESS_RESTRICTED", "TLS_ERROR",
+    "APPLICATION_NOT_READY", "AUTHENTICATION_REQUIRED", "MFA_REQUIRED", "ACCESS_RESTRICTED", "TLS_ERROR",
 ])
 def test_failed_global_authentication_has_zero_application_coverage(category):
     old_result = loaded_result()
@@ -74,7 +74,7 @@ def test_failed_global_authentication_has_zero_application_coverage(category):
 
 @pytest.mark.parametrize("source,canonical", [
     ("AUTH_FAILED", "AUTHENTICATION_FAILED"), ("AUTH_TIMEOUT", "AUTHENTICATION_TIMEOUT"),
-    ("AUTH_REQUIRED", "AUTHENTICATION_REQUIRED"), ("MFA_REQUIRED", "AUTHENTICATION_REQUIRED"),
+    ("AUTH_REQUIRED", "AUTHENTICATION_REQUIRED"), ("MFA_REQUIRED", "MFA_REQUIRED"),
     ("AUTH_CONFIGURATION_ERROR", "AUTHENTICATION_CONFIGURATION_ERROR"),
 ])
 def test_authentication_error_preserves_canonical_failure_category(source, canonical):

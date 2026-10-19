@@ -52,7 +52,6 @@ API_WARNING_TYPES = frozenset({
 _AUTHENTICATION_FAILURE_ALIASES = {
     "AUTH_FAILED": "AUTHENTICATION_FAILED",
     "AUTH_REQUIRED": "AUTHENTICATION_REQUIRED",
-    "MFA_REQUIRED": "AUTHENTICATION_REQUIRED",
     "AUTH_TIMEOUT": "AUTHENTICATION_TIMEOUT",
     "AUTH_CONFIGURATION_ERROR": "AUTHENTICATION_CONFIGURATION_ERROR",
 }
@@ -65,6 +64,10 @@ _AUTHENTICATION_FAILURE_GUIDANCE = {
     "AUTHENTICATION_REQUIRED": (
         "Provide a current authorized session profile or complete the approved authentication workflow. "
         "A desktop browser session is separate from the validator browser."
+    ),
+    "MFA_REQUIRED": (
+        "The identity provider requires an interactive multi-factor step. Complete it in an authorized workflow "
+        "and provide a refreshed session profile; the validator never automates or bypasses MFA."
     ),
     "AUTHENTICATION_TIMEOUT": "Check identity-provider reachability and the authorized login workflow before adjusting the authentication timeout.",
     "SESSION_EXPIRED": "Refresh the authorized session using the configured refresh workflow, then start a new scan.",

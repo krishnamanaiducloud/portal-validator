@@ -53,7 +53,7 @@ def failed_report(scan_id, category="AUTHENTICATION_BLOCKED"):
 
 @pytest.mark.parametrize("category", [
     "AUTHENTICATION_BLOCKED", "AUTHENTICATION_FAILED", "SESSION_EXPIRED",
-    "AUTHENTICATION_TIMEOUT", "IDENTITY_PROVIDER_UNAVAILABLE",
+    "MFA_REQUIRED", "AUTHENTICATION_TIMEOUT", "IDENTITY_PROVIDER_UNAVAILABLE",
 ])
 def test_failed_authentication_discards_every_route_and_application_api(category):
     report = failed_report("scan-one", category)

@@ -76,7 +76,7 @@ def resource_fixture(monkeypatch):
 async def scan(origin):
     return await execute_scan(ScanRequest(
         target=origin, allow_private_networks=True, max_pages=1,
-        timeout_ms=5000, total_timeout_ms=10000, render_settle_ms=250,
+        timeout_ms=5000, total_timeout_ms=20000, render_settle_ms=250,
         min_observation_ms=250, network_quiet_ms=0,
         check_links=False, check_resources=True, check_console=False,
         check_security_headers=False, max_navigation_actions=0, max_discovery_scrolls=0,

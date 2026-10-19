@@ -1329,7 +1329,9 @@ async def execute_scan(
         category = classification or "APPLICATION_NOT_READY"
         if category in {"PASS", "APPLICATION_BOOTSTRAP_PENDING"}:
             category = "APPLICATION_NOT_READY"
-        elif category in {"AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "MFA_REQUIRED", "AUTH_FAILED"}:
+        elif category == "MFA_REQUIRED":
+            pass
+        elif category in {"AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "AUTH_FAILED"}:
             category = (
                 "SESSION_EXPIRED" if application_gate_confirmed and req.authentication.mode != "none"
                 else "AUTHENTICATION_FAILED"
@@ -1392,8 +1394,25 @@ async def execute_scan(
             )
 
     def authentication_request_diagnostics() -> list[dict]:
-        evidence = list(authentication_diagnostics)
+        def request_identity(item: dict) -> tuple[str, str, str]:
+            parsed = urlparse(str(item.get("url") or item.get("endpoint") or ""))
+            return (
+                str(item.get("method") or "").upper(),
+                normalized_host(parsed.hostname or str(item.get("destination_host") or item.get("host") or "")),
+                parsed.path,
+            )
+
+        scan_category = (authentication_error or {}).get("category")
+        evidence = [
+            {**item, "category": scan_category} if scan_category and not item.get("category") else dict(item)
+            for item in authentication_diagnostics
+        ]
+        # A policy decision and the browser request it blocked describe one
+        # transition; report it once, with the richer policy evidence.
+        recorded = {request_identity(item) for item in evidence}
         for event in scan_api_events:
+            if request_identity(event) in recorded:
+                continue
             if (
                 event.get("importance") == "AUTHENTICATION"
                 or event.get("phase") in {"AUTHENTICATION", "SESSION_REFRESH"}
@@ -2957,10 +2976,18 @@ async def execute_scan(
                                     )
                                 render_start_ms = round((time.perf_counter() - started) * 1000)
                                 readiness_started = time.perf_counter()
-                                readiness_deadline = min(
-                                    route_deadline,
-                                    readiness_started + (req.readiness_timeout_ms or req.timeout_ms) / 1000,
+                                # At bootstrap a never-settling resource (pixel, long
+                                # poll) must not consume the whole route budget: keep
+                                # headroom so the scan-wide gate decides on observed
+                                # readiness instead of failing on a route timeout.
+                                route_budget_s = (req.per_route_timeout_ms or req.timeout_ms) / 1000
+                                gate_reserve_s = 0.0 if application_gate_confirmed else min(
+                                    2.0, max(0.25, route_budget_s * 0.2),
                                 )
+                                readiness_deadline = max(readiness_started, min(
+                                    route_deadline - gate_reserve_s,
+                                    readiness_started + (req.readiness_timeout_ms or req.timeout_ms) / 1000,
+                                ))
                                 render_health = await wait_for_render_settle(
                                     dom_target,
                                     settle_ms=req.render_settle_ms,

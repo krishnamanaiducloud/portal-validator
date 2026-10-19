@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, unquote, urlparse, urlsplit, urldefrag
 from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 
 from app.auth_policy import canonical_authentication_endpoint
-from app.discovery import retry_dom_operation
+from app.discovery import context_replacement_error, retry_dom_operation
 from app.security import DestinationError, normalized_host, sanitize_url
 
 
@@ -637,6 +637,7 @@ async def settle_authentication_navigation(
             if cancel_event is not None and cancel_event.is_set():
                 raise AuthenticationObservationCancelled
             document_changed.clear()
+            attempt_url, attempt_generation = page.url, document_generation
             try:
                 current_url, password, mfa, effective_status, portal_scoped, auth_surface, ready = await cancellable(
                     retry_dom_operation(
@@ -646,6 +647,18 @@ async def settle_authentication_navigation(
                 )
             except asyncio.TimeoutError:
                 return result(pending_stage, timed_out=True)
+            except PlaywrightError as error:
+                # A multi-hop redirect chain can outlast the bounded retries;
+                # the observation deadline, not the retry count, is authoritative.
+                if not context_replacement_error(error) or (
+                    page.url == attempt_url and document_generation == attempt_generation
+                ):
+                    # Only an observed document replacement is transient.
+                    raise
+                if (min(deadline, bootstrap_deadline or deadline) - time.perf_counter()) <= 0:
+                    return result(pending_stage, timed_out=True)
+                await cancellable(asyncio.sleep(0.05))
+                continue
             if mfa:
                 return result("MFA_REQUIRED", mfa=True, password=password)
             if password:
