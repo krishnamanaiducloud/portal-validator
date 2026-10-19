@@ -100,3 +100,46 @@ itself; use an SSO session profile for applications with expiring tokens.
 - `tests/ui_check.py` verifies sorting of the failure and request-issue tables
   in both directions, numeric ordering of affected calls, and the Health sort
   control.
+
+## Published images
+
+Built from commit `9a90436750ef13876da12122285c24fe9f4aab1e` for `linux/amd64`
+on the same digest-pinned bases as 1.13.1. Later commits change documentation
+and the Deployment reference only.
+
+| Image | Digest | Compressed size |
+|---|---|---|
+| `docker.io/mohankrishna999/portal-validator:1.13.2` | `sha256:f6cd4c3017a49e763c669e83a6cbaaf399ba008a04fb0fc5af2049aa9f9209a9` | 503.6 MB |
+| `docker.io/mohankrishna999/portal-validator:1.13.2-debug` | `sha256:e0c3d05544347fa28ef06eb766a94df56d8a3709a75f8b076e261daa6096882b` | 527.3 MB |
+
+Both digests were confirmed from the registry. Each image was pulled by digest
+and reported version 1.13.2, the commit above and `VERIFIED` source integrity.
+`openshift/deployment.yaml` pins the production image by tag and digest. No
+cluster rollout was performed.
+
+## Verification
+
+- Host suite (WSL2, Python 3.14): 1187 passed, 0 failed. Frontend
+  `tests/ui_check.py` passed.
+- Debug image (Python 3.15, arbitrary UID, read-only root, all capabilities
+  dropped): 114 of 114 session recovery, session renewal,
+  authentication-first, SSO, scan-speed, broad discovery and API tests passed.
+- `tests/release_image_smoke.py` passed for both images: strict Python and
+  Chromium TLS, `/healthz`, redacted access logs, graceful SIGTERM and an
+  idempotent entrypoint.
+
+## Security scan results
+
+Trivy 0.72.0 (DB 2026-10-18 18:32 UTC) and Grype 0.104.0 (DB 2026-10-19 06:39
+UTC) scanned both images on 2026-10-19:
+
+| Check | `1.13.2` | `1.13.2-debug` |
+|---|---|---|
+| Trivy Critical/High/Medium/Low | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| Trivy secrets | 0 | 0 |
+| Grype Critical/High/Medium/Low | 0 / 0 / 3 / 0 | 0 / 0 / 3 / 0 |
+| SBOM packages (SPDX) | 121 | 172 |
+
+The three Grype findings are the unchanged, still-unfixed `alsa-lib
+1.2.16.1-r3` CVEs, carried forward under the exception documented in
+`docs/RELEASE-1.13.0.md`.
