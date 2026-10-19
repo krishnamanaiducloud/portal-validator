@@ -112,7 +112,7 @@ assert m.version("playwright") == "1.63.0"
 packages = {}
 for record in Path("/usr/lib/apk/db/installed").read_text().split("\n\n"):
     fields = dict(line.split(":", 1) for line in record.splitlines() if ":" in line)
-    if fields.get("P", "").startswith(("glibc", "python-3.14", "busybox", "libxml2", "libssh2", "pcre2", "libnss", "zlib")):
+    if fields.get("P", "").startswith(("glibc", "python-3.15", "busybox", "libxml2", "libssh2", "pcre2", "libnss", "zlib")):
         packages[fields["P"]] = fields.get("V")
 print("APK_VERSIONS=" + json.dumps(packages), flush=True)
 status = json.loads(Path(os.environ["PORTAL_VALIDATOR_TRUST_STATUS"]).read_text())

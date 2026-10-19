@@ -1,8 +1,8 @@
 FROM cgr.dev/chainguard/wolfi-base:latest@sha256:c2a4815b6ca49b9bbafd451b4bde690d567a86b2b6b54877faac8082a7bc4296 AS runtime-base
 
-# The venv is copied into a runtime that installs python-3.14, so the builder
-# must stay on a Python 3.14 digest; latest-dev has moved to newer minors.
-FROM cgr.dev/chainguard/python:latest-dev@sha256:630df1be3733f7b38d1b535872904248adfe23fbea4befcb08da47cb7436ddb2 AS builder
+# The venv is copied into a runtime that installs python-3.15, so the builder
+# must stay on a Python 3.15 digest; the assertion below catches minor drift.
+FROM cgr.dev/chainguard/python:latest-dev@sha256:905b31747ebcae4242e0b71fcd2640c712b79a96f929811d3202b9716b66592a AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
@@ -10,7 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
 USER 0
 WORKDIR /app
 COPY requirements.txt .
-RUN python -c "import sys; assert sys.version_info[:2] == (3, 14), sys.version" \
+RUN python -c "import sys; assert sys.version_info[:2] == (3, 15), sys.version" \
     && python -m venv /app/.venv \
     && /app/.venv/bin/pip install --no-cache-dir --no-compile -r requirements.txt \
     && /app/.venv/bin/python -m playwright install chromium \
@@ -34,7 +34,7 @@ RUN --mount=type=cache,id=portal-validator-apks,target=/tmp/apks set -eu; \
     printf '%s\n' /runtime-repository > /etc/apk/repositories; \
     transaction="$(apk --root /tmp/apk-root --initdb --keys-dir /etc/apk/keys \
       --repositories-file /etc/apk/repositories --no-network --simulate --no-progress \
-      add 'glibc>=2.44-r8' python-3.14 libnss-tools openssl font-opensans libatk-bridge-2.0 \
+      add 'glibc>=2.44-r8' python-3.15 libnss-tools openssl font-opensans libatk-bridge-2.0 \
       cups-libs libxcomposite libxdamage libxfixes libxrandr libxkbcommon \
       mesa-gbm alsa-lib pango libx11 libxcb libxext libstdc++ libexpat1 dbus-libs libudev 2>&1)" \
       || { printf '%s\n' "$transaction" >&2; exit 1; }; \
