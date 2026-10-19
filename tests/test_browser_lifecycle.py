@@ -41,10 +41,10 @@ def test_impossible_healthy_transition_and_sensitive_failure_reason_are_rejected
 
 
 def test_navigation_action_limit_is_configurable_without_hidden_fifty_cap():
-    assert ScanRequest(target="portal.example").max_navigation_actions == 20
-    assert ScanRequest(target="portal.example", max_navigation_actions=1500).max_navigation_actions == 1500
+    assert ScanRequest(target="portal.example").max_navigation_actions == 200
+    assert ScanRequest(target="portal.example", max_navigation_actions=100000).max_navigation_actions == 100000
     with pytest.raises(ValueError):
-        ScanRequest(target="portal.example", max_navigation_actions=1501)
+        ScanRequest(target="portal.example", max_navigation_actions=-1)
 
 
 @pytest.mark.asyncio

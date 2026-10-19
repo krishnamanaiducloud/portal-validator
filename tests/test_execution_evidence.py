@@ -172,7 +172,7 @@ def test_optional_phase_timeouts_validate_and_preserve_default_behavior():
     assert all(getattr(default, field) is None for field in fields)
     for field in fields:
         assert getattr(ScanRequest(target="portal.example", **{field: 2345}), field) == 2345
-        for invalid in (0, 999, 120001):
+        for invalid in (0, 999, 2_147_483_648):
             with pytest.raises(ValidationError):
                 ScanRequest(target="portal.example", **{field: invalid})
     with pytest.raises(ValidationError):

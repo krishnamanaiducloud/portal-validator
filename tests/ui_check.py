@@ -188,7 +188,7 @@ async def main():
         await page.route("**/api/auth-profiles", profile_list_fixture)
         await page.goto(base_url, wait_until="networkidle")
         build_metadata = await page.evaluate("async () => (await fetch('/api/diagnostics/build', {cache:'no-store'})).json()")
-        assert build_metadata["version"] == "1.13.0"
+        assert build_metadata["version"] == "1.14.0"
         assert await page.evaluate("loadedFrontendSha256") == build_metadata["frontend_sha256"]
         assert await page.evaluate("loadedFrontendIntegrity.startsWith('sha256-')")
         assert "Frontend matched" in await page.locator("#build-summary").text_content()
@@ -233,30 +233,38 @@ async def main():
         assert await page.get_by_role("button", name="Run validation →").is_enabled()
         assert await page.locator("#auth-mode option").count() == 6
         assert await page.locator("#redirects").input_value() == "10"
-        assert await page.locator("#pages").input_value() == "50"
-        assert await page.locator("#pages").get_attribute("max") == "1500"
+        # Bounds/defaults are loaded from /api/scan-settings, not markup.
+        await page.wait_for_function("document.querySelector('#timeout').max === '2147483647'")
+        assert await page.locator("#pages").input_value() == "500"
+        assert await page.locator("#pages").get_attribute("max") is None
         assert "Maximum time / route" in await page.locator("#timeout").evaluate("element => element.closest('label').textContent")
-        assert await page.locator("#min-observation").input_value() == "500"
+        assert await page.locator("#min-observation").input_value() == "300"
         assert await page.locator("#network-quiet").input_value() == "300"
         assert await page.locator("#slow-threshold").input_value() == "5000"
-        assert await page.locator("#timeout").get_attribute("max") == "120000"
-        assert await page.locator("#navigation-actions").get_attribute("max") == "1500"
-        assert await page.locator("#total-timeout").get_attribute("max") == "900000"
+        assert await page.locator("#render-settle").input_value() == "400"
+        assert await page.locator("#network-settle-cap").input_value() == "2000"
+        assert await page.locator("#menu-settle").input_value() == "250"
+        assert not await page.locator("#reexplore-navigation").is_checked()
+        assert await page.locator("#navigation-actions").input_value() == "200"
+        assert await page.locator("#navigation-actions").get_attribute("max") is None
+        assert await page.locator("#depth").get_attribute("max") is None
+        assert await page.locator("#total-timeout").get_attribute("max") == "2147483647"
         assert await page.evaluate("phaseConfiguration()") == {}
         await page.locator("#scan-timing-settings > summary").click()
         concurrency = page.locator("#concurrency-limit")
+        await page.wait_for_function("document.querySelector('#concurrency-limit').max !== ''")
         concurrency_cap = int(await concurrency.get_attribute("max"))
         assert concurrency_cap >= 1
         assert await concurrency.input_value() == ""
         await concurrency.fill("1")
         assert await page.evaluate("phaseConfiguration()") == {"concurrency_limit": 1}
         await concurrency.fill(str(concurrency_cap + 1))
-        assert f"integer between 1 and {concurrency_cap}" in await page.evaluate("""() => {
+        assert f"at least 1 and at most {concurrency_cap}" in await page.evaluate("""() => {
           try { phaseConfiguration(); return ''; } catch (error) { return error.message; }
         }""")
         await concurrency.fill("")
         assert "concurrency_limit" not in await page.evaluate("phaseConfiguration()")
-        for control in ("navigation-timeout", "authentication-timeout", "api-timeout", "readiness-timeout", "per-route-timeout"):
+        for control in ("navigation-timeout", "authentication-timeout", "api-timeout", "readiness-timeout", "per-route-timeout", "discovery-timeout"):
             await page.locator(f"#{control}").fill("12345")
         await page.locator("#readiness-selector").fill("[data-app-ready]")
         await page.locator("#readiness-event").fill("portal:ready")
@@ -264,16 +272,16 @@ async def main():
         assert await page.evaluate("phaseConfiguration()") == {
             "navigation_timeout_ms": 12345, "authentication_timeout_ms": 12345,
             "api_timeout_ms": 12345, "readiness_timeout_ms": 12345,
-            "per_route_timeout_ms": 12345,
+            "per_route_timeout_ms": 12345, "discovery_timeout_ms": 12345,
             "readiness_selector": "[data-app-ready]",
             "readiness_event": "portal:ready",
             "authentication_hosts": ["login.example.net", "identity.example.org"],
         }
         await page.locator("#api-timeout").fill("1")
-        assert "integer between" in await page.evaluate("""() => {
+        assert "must be an integer of at least" in await page.evaluate("""() => {
           try { phaseConfiguration(); return ''; } catch (error) { return error.message; }
         }""")
-        for control in ("navigation-timeout", "authentication-timeout", "api-timeout", "readiness-timeout", "per-route-timeout", "readiness-selector", "readiness-event", "authentication-hosts"):
+        for control in ("navigation-timeout", "authentication-timeout", "api-timeout", "readiness-timeout", "per-route-timeout", "discovery-timeout", "readiness-selector", "readiness-event", "authentication-hosts"):
             await page.locator(f"#{control}").fill("")
         await page.locator("#scan-timing-settings > summary").click()
         await page.locator("#auth-mode").select_option("storage_state")

@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = '1.13.0';
+const FRONTEND_VERSION = '1.14.0';
 // The server pins this exact deferred script with SRI and a hash-versioned URL.
 // Capture currentScript now; it is unavailable in subsequent async callbacks.
 const frontendScript = document.currentScript;
@@ -428,12 +428,14 @@ function updateAuthenticationConfigurationNote() {
 
 function phaseConfiguration() {
   const configuration = {};
-  const fields = {navigation_timeout_ms:'navigation-timeout',authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout',per_route_timeout_ms:'per-route-timeout',concurrency_limit:'concurrency-limit'};
+  const fields = {navigation_timeout_ms:'navigation-timeout',authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout',per_route_timeout_ms:'per-route-timeout',discovery_timeout_ms:'discovery-timeout',concurrency_limit:'concurrency-limit'};
   for (const [name,id] of Object.entries(fields)) {
     const input = byId(id);
     if (!input.value.trim()) continue;
     const value = Number(input.value);
-    if (!Number.isInteger(value) || value < Number(input.min) || value > Number(input.max)) throw new Error(`${input.closest('label').querySelector('span').textContent} must be an integer between ${input.min} and ${input.max}.`);
+    if (!Number.isInteger(value) || value < Number(input.min) || (input.max !== '' && value > Number(input.max))) {
+      throw new Error(`${input.closest('label').querySelector('span').textContent} must be an integer of at least ${input.min}${input.max !== '' ? ` and at most ${input.max}` : ''}.`);
+    }
     configuration[name] = value;
   }
   const readiness = byId('readiness-selector').value.trim();
@@ -1545,7 +1547,7 @@ for (const [id,label,option] of [['api-lifecycle-filter','Request lifecycle','Al
   document.querySelector('.api-tools').append(field);
 }
 byId('api-failure-type-filter').insertAdjacentHTML('beforeend', ['HTTP_4XX','HTTP_5XX','NETWORK_FAILURE','RESPONSE_BODY_FAILURE','POLICY_BLOCKED','CANCELED','INCOMPLETE'].map((value) => `<option value="${value}">${value.replaceAll('_', ' ')}</option>`).join(''));
-document.querySelector('#scan-timing-settings .field-grid').insertAdjacentHTML('beforeend', '<label class="field"><span>Per-route total timeout (ms)</span><input id="per-route-timeout" type="number" min="1000" max="120000" placeholder="Inherit maximum time / route"><small>Bounds the entire route lifecycle, including authentication, navigation and stabilization.</small></label>');
+document.querySelector('#scan-timing-settings .field-grid').insertAdjacentHTML('beforeend', '<label class="field"><span>Per-route total timeout (ms)</span><input id="per-route-timeout" type="number" min="1000" placeholder="Inherit maximum time / route"><small>Bounds the entire route lifecycle, including authentication, navigation and stabilization.</small></label>');
 for (const [key,label] of tableColumns.route.slice(13)) {
   const header = document.createElement('th');
   header.textContent = label;
@@ -1634,6 +1636,9 @@ form.addEventListener('submit', async (event) => {
   let payload;
   try {
     payload = {target:byId('target').value.trim(),max_pages:Number(byId('pages').value),max_depth:Number(byId('depth').value),max_redirects:Number(byId('redirects').value),timeout_ms:Number(byId('timeout').value),total_timeout_ms:Number(byId('total-timeout').value),check_links:byId('links').checked,check_console:byId('console').checked,check_resources:byId('resources').checked,check_performance:byId('performance').checked,check_security_headers:byId('headers').checked,allow_subdomains:byId('subdomains').checked,allow_private_networks:byId('private-network').checked,portal_hosts:splitList(byId('portal-hosts').value),resource_hosts:splitList(byId('resource-hosts').value),credential_hosts:splitList(byId('credential-hosts').value),query_parameter_policy:byId('query-policy').value,allowed_query_parameters:splitList(byId('query-parameters').value),slow_page_threshold_ms:Number(byId('slow-threshold').value),render_settle_ms:Number(byId('render-settle').value),max_navigation_actions:Number(byId('navigation-actions').value),max_discovery_scrolls:Number(byId('discovery-scrolls').value),authentication:authenticationPayload(),allow_mutations:false};
+    payload.network_settle_cap_ms = Number(byId('network-settle-cap').value);
+    payload.menu_settle_ms = Number(byId('menu-settle').value);
+    payload.reexplore_navigation_each_route = byId('reexplore-navigation').checked;
     payload.approved_read_post_operations = approvedReadPostOperations();
     Object.assign(payload, phaseConfiguration());
     payload.large_resource_threshold_bytes = Number(byId('large-resource-threshold').value) * 1024;
@@ -1671,6 +1676,26 @@ byId('download-button').addEventListener('click', () => {
 setupScrollSync();
 byId('authentication-hosts').addEventListener('input', updateAuthenticationConfigurationNote);
 verifyBuildIdentity();
+// Bounds and defaults come from the backend request model, never from markup.
+const SCAN_SETTING_INPUTS = {max_pages:'pages',max_depth:'depth',max_redirects:'redirects',timeout_ms:'timeout',
+  total_timeout_ms:'total-timeout',slow_page_threshold_ms:'slow-threshold',render_settle_ms:'render-settle',
+  min_observation_ms:'min-observation',network_quiet_ms:'network-quiet',network_settle_cap_ms:'network-settle-cap',
+  menu_settle_ms:'menu-settle',max_navigation_actions:'navigation-actions',max_discovery_scrolls:'discovery-scrolls',
+  per_route_timeout_ms:'per-route-timeout',discovery_timeout_ms:'discovery-timeout',navigation_timeout_ms:'navigation-timeout',
+  authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout'};
+requestJson('/api/scan-settings', {}, 'Scan settings request').then((data) => {
+  for (const [name, id] of Object.entries(SCAN_SETTING_INPUTS)) {
+    const setting = data.settings?.[name], input = byId(id);
+    if (!setting || !input) continue;
+    if (Number.isInteger(setting.minimum)) input.min = setting.minimum;
+    if (Number.isInteger(setting.maximum)) input.max = setting.maximum; else input.removeAttribute('max');
+    if (Number.isInteger(setting.default) && input.value === input.defaultValue) input.value = input.defaultValue = setting.default;
+  }
+  const capacity = data.deployment?.max_concurrent_scans;
+  if (Number.isInteger(capacity) && capacity > 0) byId('concurrency-limit').max = capacity;
+  const reexplore = data.settings?.reexplore_navigation_each_route;
+  if (reexplore && typeof reexplore.default === 'boolean') byId('reexplore-navigation').checked = reexplore.default;
+}).catch(() => notify('Scan setting defaults could not be loaded; the displayed defaults are used.', true));
 requestJson('/api/auth-profiles', {}, 'Authentication profile request').then((data) => {
   profileNames = data.profiles || [];
   refreshProfiles = new Set(data.refresh_enabled_profiles || []);

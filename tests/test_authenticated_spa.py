@@ -274,4 +274,5 @@ def test_per_route_timeout_is_an_explicit_optional_execution_ceiling():
     assert ScanRequest(target="portal.example", per_route_timeout_ms=60000).per_route_timeout_ms == 60000
     assert ScanRequest(target="portal.example").per_route_timeout_ms is None
     with pytest.raises(ValidationError):
-        ScanRequest(target="portal.example", per_route_timeout_ms=120001)
+        ScanRequest(target="portal.example", per_route_timeout_ms=2_147_483_648)
+    assert ScanRequest(target="portal.example", per_route_timeout_ms=600000).per_route_timeout_ms == 600000
