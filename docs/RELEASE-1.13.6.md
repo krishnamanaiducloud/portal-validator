@@ -47,3 +47,37 @@ Sub-tab discovery inside a route can only run once the route has rendered.
 If routes report as sign-in blocked, approve the identity hosts suggested in
 the authentication callout (added in 1.13.4) first. Their sub-tabs will be
 discovered on the next run.
+
+## Verification
+
+- Host suite (WSL2, Python and Playwright): 1201 passed. This includes the
+  new nested and query-addressed sub-tab tests.
+- UI smoke (`tests/ui_check.py`): passed. It covers the POST approval review:
+  only unverified, non-authentication POSTs are offered, nothing is
+  pre-selected, and approved paths become exact or `{segment}` rules.
+- Debug image (Python 3.15, restricted runtime): 1195 of 1201 passed. The 6
+  failures are `tests/test_operator_policy_script.py`, which runs the
+  host-side operator script with `bash`. The runtime image deliberately does
+  not ship `bash`, and these tests pass on the host.
+- `tests/release_image_smoke.py` passed for both images. The debug run used
+  `RELEASE_SMOKE_STARTUP_TIMEOUT=300` because the debugpy and reload worker
+  needs more than the default 60 s.
+
+| Image | Digest | Compressed size |
+|---|---|---|
+| `docker.io/mohankrishna999/portal-validator:1.13.6` | `sha256:6d0de34ffa9d43a249552886a84afa57a061702e51b6b1327bf220f07aa53030` | 502.8 MB |
+| `docker.io/mohankrishna999/portal-validator:1.13.6-debug` | `sha256:0682b3aca11055dd30d232066f52d5c9e34753ff2d7439fbd24d1e07e3d7c3bc` | 526.5 MB |
+
+Both images were built for `linux/amd64` from commit
+`0b6b798677ae215354689c82ffa180517ff9257e`. The digests were confirmed from
+the registry. Each image pulled by digest reported version 1.13.6, that
+commit and `VERIFIED` source integrity.
+
+| Scanner | Result (both images) |
+|---|---|
+| Trivy 0.72.0 | 0 vulnerabilities, 0 secrets |
+| Grype 0.104.0 | 3 Medium: the still-unfixed `alsa-lib 1.2.16.1-r3` CVEs (CVE-2026-90781, CVE-2026-96674, CVE-2026-96675), carried forward under the exception in `docs/RELEASE-1.13.0.md` |
+| Syft | SPDX SBOM generated |
+
+`openshift/deployment.yaml` pins the production image by tag and digest. No
+cluster rollout was performed.

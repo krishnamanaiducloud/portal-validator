@@ -24,7 +24,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
       - name: portal-validator
-        image: docker.io/mohankrishna999/portal-validator:1.13.5@sha256:105426186f9b35c6b21479a60fec6ecd134bd921c1e287321f429c37d7ec5c69
+        image: docker.io/mohankrishna999/portal-validator:1.13.6@sha256:6d0de34ffa9d43a249552886a84afa57a061702e51b6b1327bf220f07aa53030
         ports:
         - containerPort: 8080
         securityContext:
