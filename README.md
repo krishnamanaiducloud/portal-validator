@@ -1,12 +1,13 @@
 # Portal Validator
 
-Portal Validator 1.13.4 is a read-only browser health validator with optional authentication for public,
+Portal Validator 1.13.5 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
 results without disabling certificate verification.
 
-See [1.13.4 SSO route diagnosis, route states and dashboard](docs/RELEASE-1.13.4.md),
+See [1.13.5 corporate CA directory restored](docs/RELEASE-1.13.5.md),
+[1.13.4 SSO route diagnosis, route states and dashboard](docs/RELEASE-1.13.4.md),
 [1.13.3 renewal blocks no longer fail scans](docs/RELEASE-1.13.3.md),
 [1.13.2 sortable tables and session renewal](docs/RELEASE-1.13.2.md),
 [1.13.1 fast, fully configurable scanning](docs/RELEASE-1.13.1.md),
@@ -375,10 +376,10 @@ runtime files against the image's generated hash manifest.
 ```bash
 docker build --build-arg VCS_REF="$(git rev-parse HEAD)" \
   --build-arg BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -t mohankrishna999/portal-validator:1.13.4 .
+  -t mohankrishna999/portal-validator:1.13.5 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.4 \
-  -t mohankrishna999/portal-validator:1.13.4-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.5 \
+  -t mohankrishna999/portal-validator:1.13.5-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -393,7 +394,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.13.4
+  mohankrishna999/portal-validator:1.13.5
 ```
 
 ## OpenShift

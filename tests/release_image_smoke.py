@@ -93,7 +93,7 @@ for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
     assert os.environ[name] == expected_bundle
 identity = build_diagnostics()
 print("BUILD_IDENTITY=" + json.dumps(identity), flush=True)
-assert identity["version"] == "1.13.4"
+assert identity["version"] == "1.13.5"
 # An explicitly selected, uncommitted release snapshot must be compared with
 # the operator's expected hashes rather than falsely claiming a Git revision.
 snapshot_path = os.getenv("RELEASE_SMOKE_SOURCE_HASHES")
