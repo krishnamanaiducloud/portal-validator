@@ -188,7 +188,7 @@ async def main():
         await page.route("**/api/auth-profiles", profile_list_fixture)
         await page.goto(base_url, wait_until="networkidle")
         build_metadata = await page.evaluate("async () => (await fetch('/api/diagnostics/build', {cache:'no-store'})).json()")
-        assert build_metadata["version"] == "1.13.3"
+        assert build_metadata["version"] == "1.13.4"
         assert await page.evaluate("loadedFrontendSha256") == build_metadata["frontend_sha256"]
         assert await page.evaluate("loadedFrontendIntegrity.startsWith('sha256-')")
         assert "Frontend matched" in await page.locator("#build-summary").text_content()
@@ -515,6 +515,31 @@ async def main():
         for key in ("traffic_role", "policies", "response_status_counts", "routes_using_endpoint"):
             assert await page.locator(f'[data-api-sort="{key}"]').count() == 1, key
         await page.evaluate("() => { routeSort = {key:'route_name', direction:1}; renderRows(); }")
+        # Route-state funnel, identity-host callout and grouped diagnostics.
+        await page.evaluate("""() => {
+          const report = structuredClone(lastReport);
+          report.summary.route_states = {DISCOVERED:2, VALIDATED:1, RENDERED:0, AUTHENTICATION_BLOCKED:2, TIMEOUT:1};
+          Object.assign(report.summary, {routes_visited:4, routes_rendered:1, routes_application_validated:1});
+          report.suggested_authentication_hosts = ['identity.example.net'];
+          report.authentication_diagnostic_groups = [{reason:'AUTHENTICATION_HOSTS_REQUIRED', protocol:'AUTHENTICATION_FORM',
+            source_host:'identity.example.net', destination_host:'identity.example.net', policy_reason:'READ_ONLY_MUTATION_POLICY',
+            affects_authentication:true, occurrences:62, routes:['Reports','Billing'], suggested_authentication_host:'identity.example.net'}];
+          report.authentication_diagnostics = [{reason:'AUTHENTICATION_HOSTS_REQUIRED'}];
+          renderRouteStateOverview(report); renderAuthenticationAction(report); renderAuthenticationDiagnostics(report);
+        }""")
+        overview = page.locator("#route-state-overview")
+        assert await overview.is_visible()
+        overview_text = (await overview.inner_text()).lower()
+        assert "validated" in overview_text and "sign-in blocked" in overview_text
+        assert await page.locator("#authentication-action").is_visible()
+        await page.locator("#authentication-hosts").fill("login.example.org")
+        await page.locator("#approve-suggested-hosts").click()
+        assert await page.locator("#authentication-hosts").input_value() == "login.example.org, identity.example.net"
+        groups = page.locator("#authentication-diagnostic-list .diagnostic-group")
+        assert await groups.count() == 1
+        assert "62×" in await groups.first.inner_text()
+        await page.locator("#authentication-hosts").fill("")
+        await page.evaluate("() => { renderRouteStateOverview(lastReport); renderAuthenticationAction(lastReport); renderAuthenticationDiagnostics(lastReport); }")
         # Every data column of the failure and request-issue tables is sortable.
         assert await page.locator("[data-failed-sort]").count() == 9
         assert await page.locator("[data-issue-sort]").count() == 6
@@ -903,7 +928,7 @@ async def main():
         assert await page.locator('[data-api-sort="average_duration_ms"]').text_content() == "Average Time (ms)"
         assert await page.locator('[data-api-sort="worst_duration_ms"]').text_content() == "Worst Time (ms)"
         await page.locator("#api-columns > summary").click()
-        assert await page.locator("#api-columns input[type=checkbox]").count() == 29
+        assert await page.locator("#api-columns input[type=checkbox]").count() == 30
         await page.locator('[data-column-kind="api"][data-column-key="validation_reason"]').uncheck()
         assert not await page.locator("#api-list .api-validation-reason-cell").first.is_visible()
         await page.locator('[data-column-kind="api"][data-column-key="validation_reason"]').check()
@@ -934,7 +959,7 @@ async def main():
         assert abs(await route_panel.evaluate("element => element.getBoundingClientRect().height") - route_panel_height) <= 2
         assert not await page.locator('[data-api-sort="host"]').is_visible()
         assert not await page.locator('[data-sort="authentication_status"]').is_visible()
-        assert await page.locator("#api-table-wrap th").last.text_content() == "Result reason"
+        assert await page.locator("#api-table-wrap th").last.text_content() == "Traffic class"
         assert await page.locator("#api-table-wrap th").last.is_visible()
         for kind in ("api", "route"):
             await page.locator(f"#{kind}-columns > summary").click()

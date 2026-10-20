@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = '1.13.3';
+const FRONTEND_VERSION = '1.13.4';
 // The server pins this exact deferred script with SRI and a hash-versioned URL.
 // Capture currentScript now; it is unavailable in subsequent async callbacks.
 const frontendScript = document.currentScript;
@@ -17,6 +17,7 @@ let profileNames = [];
 let refreshProfiles = new Set();
 let profileMessage = '';
 let routeSort = {key:'route_name', direction:1};
+let routeStateFilter = '';
 let apiSort = {key:'host', direction:1};
 let resourceSort = {key:'transfer_size_bytes', direction:-1};
 let failedSort = {key:'affected', direction:-1};
@@ -56,6 +57,8 @@ function clearReportResults() {
   ['api-count','resource-count','resource-scope','failed-endpoint-count',
     'navigation-coverage-limitations','authentication-diagnostic-count'].forEach((id) => { byId(id).textContent = ''; });
   byId('authentication-diagnostics').hidden = true;
+  ['route-state-overview','authentication-action'].forEach((id) => { byId(id).hidden = true; byId(id).replaceChildren(); });
+  routeStateFilter = '';
   Object.values(tablePagination).forEach((state) => { state.page = 0; state.key = ''; });
 }
 // Panel preferences contain dimensions only, never report or authentication data.
@@ -296,6 +299,7 @@ const tableColumns = {
     ['validation_outcome','Observed result','Result of passive browser observation; a URL alone does not establish successful validation.'],
     ['active_validation_status','Active test','Whether a separate endpoint test was performed. Natural browser activity is passive observation.'],
     ['validation_reason','Result reason','Safe explanation of incomplete, failed, blocked, or passively observed requests.'],
+    ['traffic_class','Traffic class','Purpose of the traffic from metadata only: authentication, business API, configuration/bootstrap, static asset, third-party dependency, or unknown.'],
   ],
   route: [
     ['classification','Status','PASS and PASS_WITH_WARNINGS both count as healthy routes.'],
@@ -313,6 +317,7 @@ const tableColumns = {
     ['details','Details','Route evidence and timing breakdown.'],
     ['navigation_hierarchy','Navigation hierarchy','Parent and child navigation labels; distinct UI states retain their logical route identity.'],
     ['discovery_sources','Discovery source','How the route was discovered, separate from its display-name source.'],
+    ['route_state','Route state','How far the browser got: VALIDATED needs a loaded view with observed application readiness; RENDERED loaded but never became ready.'],
   ],
   resource: [
     ['type','Type','Naturally observed browser resource type.'],
@@ -751,7 +756,8 @@ function renderRows() {
   const navigationFilter = byId('navigation-filter').value;
   let rows = [...(lastReport.route_inventory || lastReport.results || [])].map((item) => ({...item, warning_findings:routeWarnings(item).length, console_count:(item.console_errors?.length || 0) + (item.page_errors?.length || 0)})).filter((item) => {
     const haystack = `${item.url} ${item.route_name || ''} ${item.display_path || ''} ${item.document_title || item.title || ''} ${item.navigation_label || item.route_label || ''} ${(item.navigation_hierarchy || []).join(' ')} ${routeDiscoverySources(item)} ${item.classification} ${item.failure_reason || ''}`.toLowerCase();
-    return (!query || haystack.includes(query)) && matchesOutcome(item, filter) && matchesDrilldown(item) && (navigationFilter === 'all' || item.navigation_type === navigationFilter);
+    return (!query || haystack.includes(query)) && matchesOutcome(item, filter) && matchesDrilldown(item) && (navigationFilter === 'all' || item.navigation_type === navigationFilter)
+      && (!routeStateFilter || item.route_state === routeStateFilter);
   });
   rows.sort((left, right) => {
     const key = routeSort.key;
@@ -767,7 +773,7 @@ function renderRows() {
     const failure = item.failure_reason ? `<small class="failure-reason"><b>${escapeHtml(item.failure_dimension || 'VALIDATION')}</b>${escapeHtml(item.failure_reason)}</small>` : '';
     const hierarchy = item.navigation_hierarchy?.length ? item.navigation_hierarchy.join(' › ') : [item.parent_route_name,item.route_name || item.route_label].filter(Boolean).join(' › ');
     const dimension = (value) => `<span class="dimension-state ${statusClass(value)}">${escapeHtml(value || 'NOT_TESTED')}</span>`;
-    return `<tr class="route-row outcome-${statusClass(item.classification)}"><td><span class="outcome-badge ${statusClass(item.classification)}">${escapeHtml(item.classification)}</span>${failure}</td><td class="route-name-cell"><strong>${escapeHtml(item.route_name || item.route_label || 'Unnamed route')}</strong><small>${escapeHtml(item.route_name_source || 'FALLBACK')}</small></td><td class="route-cell"><span>${escapeHtml(route.host)}</span><code>${escapeHtml(route.path)}</code></td><td>${dimension(item.navigation_type || 'DOCUMENT_NAVIGATION')}</td><td><strong class="http-status">${escapeHtml(item.http_status_display ?? item.status ?? 'N/A')}</strong></td><td><span class="time-value ${item.slow ? 'slow' : ''}">${escapeHtml(item.load_ms ?? '—')} ms</span></td><td>${dimension(item.api_status)}</td><td>${dimension(item.resource_status)}</td><td>${dimension(item.console_status)}</td><td>${dimension(item.authentication_status)}</td><td>${dimension(item.tls_status)}</td><td><strong>${escapeHtml(item.warning_findings || 0)}</strong></td><td><button type="button" class="secondary route-inspect" aria-expanded="false" aria-controls="route-inspector" aria-label="Inspect ${escapeHtml(item.route_name || item.display_path || 'route')}">Inspect</button></td><td class="route-hierarchy-cell">${escapeHtml(hierarchy || 'Not recorded')}${item.parent_route_name ? `<small>Parent: ${escapeHtml(item.parent_route_name)}</small>` : ''}<small>${escapeHtml(item.spa_route || item.route_id || '')}</small></td><td class="route-discovery-cell">${escapeHtml(routeDiscoverySources(item))}</td></tr>`;
+    return `<tr class="route-row outcome-${statusClass(item.classification)}"><td><span class="outcome-badge ${statusClass(item.classification)}">${escapeHtml(item.classification)}</span>${failure}</td><td class="route-name-cell"><strong>${escapeHtml(item.route_name || item.route_label || 'Unnamed route')}</strong><small>${escapeHtml(item.route_name_source || 'FALLBACK')}</small></td><td class="route-cell"><span>${escapeHtml(route.host)}</span><code>${escapeHtml(route.path)}</code></td><td>${dimension(item.navigation_type || 'DOCUMENT_NAVIGATION')}</td><td><strong class="http-status">${escapeHtml(item.http_status_display ?? item.status ?? 'N/A')}</strong></td><td><span class="time-value ${item.slow ? 'slow' : ''}">${escapeHtml(item.load_ms ?? '—')} ms</span></td><td>${dimension(item.api_status)}</td><td>${dimension(item.resource_status)}</td><td>${dimension(item.console_status)}</td><td>${dimension(item.authentication_status)}</td><td>${dimension(item.tls_status)}</td><td><strong>${escapeHtml(item.warning_findings || 0)}</strong></td><td><button type="button" class="secondary route-inspect" aria-expanded="false" aria-controls="route-inspector" aria-label="Inspect ${escapeHtml(item.route_name || item.display_path || 'route')}">Inspect</button></td><td class="route-hierarchy-cell">${escapeHtml(hierarchy || 'Not recorded')}${item.parent_route_name ? `<small>Parent: ${escapeHtml(item.parent_route_name)}</small>` : ''}<small>${escapeHtml(item.spa_route || item.route_id || '')}</small></td><td class="route-discovery-cell">${escapeHtml(routeDiscoverySources(item))}</td><td class="route-state-cell">${stateChip(item.route_state)}</td></tr>`;
   }).join('') || `<tr><td colspan="${tableColumns.route.length}" class="empty-table">No routes match this filter.</td></tr>`;
   byId('result-list').querySelectorAll('.route-row').forEach((row, index) => {
     const item = rows[index];
@@ -1001,7 +1007,7 @@ function renderApiInventory() {
       const matched = (lastReport?.route_inventory || lastReport?.results || []).find((result) => [result.route_id,result.normalized_route_identity,result.canonical_route,result.url].includes(identity));
       return matched?.route_name || matched?.route_label || identity;
     }).join(', ') || 'Not attributed';
-    return `<tr><td><strong>${escapeHtml(item.method)}</strong></td><td>${escapeHtml(item.host)}</td><td><button class="api-endpoint" type="button" data-api-index="${index}" title="${escapeHtml(item.endpoint)}">${escapeHtml(item.endpoint)}</button></td>${numbers.map((value) => `<td>${escapeHtml(value)}</td>`).join('')}<td><span class="dimension-state ${statusClass(outcome)}">${escapeHtml(healthLabel)}</span></td><td class="api-role-cell">${escapeHtml(item.traffic_role || 'UNCLASSIFIED')}</td><td class="api-policy-cell">${escapeHtml(policies.join(', ') || 'N/A')}</td><td class="api-response-status-cell">${escapeHtml(statusCodes)}</td><td class="api-failure-count-cell">${escapeHtml(failureCount)}</td><td class="api-associated-routes-cell">${escapeHtml(routeNames)}</td><td class="api-auth-class-cell">${escapeHtml((item.authentication_classifications || []).join(', ') || 'Not recorded')}</td><td class="api-post-class-cell">${escapeHtml((item.post_classifications || []).join(', ') || (item.method === 'POST' ? 'Not recorded' : 'N/A'))}</td><td class="api-validation-cell">${escapeHtml(item.validation_outcome || item.validation_status || 'NOT_RECORDED')}</td><td class="api-active-test-cell">${escapeHtml(item.active_validation_status || 'NOT_ACTIVELY_TESTED')}</td><td class="api-validation-reason-cell">${escapeHtml(apiValidationReason(item))}</td></tr>`;
+    return `<tr><td><strong>${escapeHtml(item.method)}</strong></td><td>${escapeHtml(item.host)}</td><td><button class="api-endpoint" type="button" data-api-index="${index}" title="${escapeHtml(item.endpoint)}">${escapeHtml(item.endpoint)}</button></td>${numbers.map((value) => `<td>${escapeHtml(value)}</td>`).join('')}<td><span class="dimension-state ${statusClass(outcome)}">${escapeHtml(healthLabel)}</span></td><td class="api-role-cell">${escapeHtml(item.traffic_role || 'UNCLASSIFIED')}</td><td class="api-policy-cell">${escapeHtml(policies.join(', ') || 'N/A')}</td><td class="api-response-status-cell">${escapeHtml(statusCodes)}</td><td class="api-failure-count-cell">${escapeHtml(failureCount)}</td><td class="api-associated-routes-cell">${escapeHtml(routeNames)}</td><td class="api-auth-class-cell">${escapeHtml((item.authentication_classifications || []).join(', ') || 'Not recorded')}</td><td class="api-post-class-cell">${escapeHtml((item.post_classifications || []).join(', ') || (item.method === 'POST' ? 'Not recorded' : 'N/A'))}</td><td class="api-validation-cell">${escapeHtml(item.validation_outcome || item.validation_status || 'NOT_RECORDED')}</td><td class="api-active-test-cell">${escapeHtml(item.active_validation_status || 'NOT_ACTIVELY_TESTED')}</td><td class="api-validation-reason-cell">${escapeHtml(apiValidationReason(item))}</td><td class="api-traffic-class-cell"><span class="chip chip-class">${escapeHtml(item.traffic_class || 'UNKNOWN')}</span></td></tr>`;
   }).join('') || `<tr><td colspan="${tableColumns.api.length}" class="empty-table">${method === 'POST' && !inventory.some((item) => item.method === 'POST') ? 'No POST requests were observed for this scan.' : failedOnly || policy === 'target-failures' ? 'No target API failures match these filters.' : 'No API requests match these filters.'}</td></tr>`;
   byId('api-list').querySelectorAll('[data-api-index]').forEach((button) => button.addEventListener('click', () => {
     const item = visible[Number(button.dataset.apiIndex)];
@@ -1190,7 +1196,7 @@ function renderRequestIssues() {
 
 function renderSecurityRecommendations() {
   const recommendations = lastReport?.security_recommendations || [];
-  byId('security-list').innerHTML = recommendations.map((item) => `<article class="recommendation"><div><span>${escapeHtml(item.severity || 'RECOMMENDATION')}</span><strong>${escapeHtml(item.header || item.type)}</strong></div><p>Recommended content security protection is missing from ${escapeHtml(item.affected_document_count || 0)} document${item.affected_document_count === 1 ? '' : 's'}.</p><dl><dt>Impact</dt><dd>${escapeHtml(item.impact || 'NON_BLOCKING')}</dd><dt>Affected documents</dt><dd>${escapeHtml(item.affected_document_count || 0)}</dd></dl></article>`).join('') || '<p class="empty-detail">No document-level security recommendations were observed.</p>';
+  byId('security-list').innerHTML = recommendations.map((item) => `<article class="recommendation risk-${escapeHtml(String(item.risk || 'LOW').toLowerCase())}"><div><span>${escapeHtml(item.category === 'HARDENING_RECOMMENDATION' ? 'Hardening' : (item.severity || 'RECOMMENDATION'))}</span><span class="chip chip-risk">${escapeHtml(item.risk || 'LOW')}</span><strong>${escapeHtml(item.title || item.header || item.type)}</strong></div><p>${escapeHtml(item.evidence || `Recommended content security protection is missing from ${item.affected_document_count || 0} document${item.affected_document_count === 1 ? '' : 's'}.`)}</p>${item.explanation ? `<p><b>Why it matters:</b> ${escapeHtml(item.explanation)}</p>` : ''}${item.remediation ? `<p><b>Remediation:</b> ${escapeHtml(item.remediation)}</p>` : ''}<dl><dt>Header</dt><dd><code>${escapeHtml(item.header || '')}</code></dd><dt>Impact</dt><dd>${escapeHtml(item.impact || 'NON_BLOCKING')}</dd><dt>Affected documents</dt><dd>${escapeHtml(item.affected_document_count || 0)}</dd><dt>Confidence</dt><dd>${escapeHtml(item.confidence || 'Not recorded')}</dd></dl>${item.limitation ? `<small>${escapeHtml(item.limitation)}</small>` : ''}${item.affected_documents?.length ? `<details><summary>Affected resources</summary><p>${escapeHtml(item.affected_documents.join(', '))}</p></details>` : ''}</article>`).join('') || '<p class="empty-detail">No document-level security recommendations were observed.</p>';
   byId('security-raw').textContent = JSON.stringify(recommendations, null, 2);
 }
 
@@ -1321,6 +1327,61 @@ function authenticationHostApprovalSummary(configuration = {}) {
   return `${total} ${sources}`;
 }
 
+const ROUTE_STATE_LABELS = {
+  VALIDATED:['Validated','good'], RENDERED:['Rendered, not ready','warning'], NAVIGATION_ATTEMPTED:['Attempted','warning'],
+  AUTHENTICATION_BLOCKED:['Sign-in blocked','bad'], AUTHORIZATION_DENIED:['Access denied','bad'], POLICY_BLOCKED:['Policy blocked','bad'],
+  NAVIGATION_FAILED:['Navigation failed','bad'], TIMEOUT:['Timed out','bad'], INCOMPLETE:['Incomplete','warning'], DISCOVERED:['Not visited','muted'],
+};
+
+function stateChip(state) {
+  const [label, kind] = ROUTE_STATE_LABELS[state] || [state || 'Not recorded', 'muted'];
+  return `<span class="chip chip-${kind}" title="${escapeHtml(state || '')}">${escapeHtml(label)}</span>`;
+}
+
+function renderRouteStateOverview(report) {
+  const summary = report.summary || {}, states = summary.route_states || {};
+  const section = byId('route-state-overview');
+  section.hidden = !Object.keys(states).length;
+  if (section.hidden) { section.replaceChildren(); return; }
+  const funnel = [
+    ['Discovered', Number(summary.routes_discovered || 0)], ['Visited', Number(summary.routes_visited ?? summary.routes_validated ?? 0)],
+    ['Rendered', Number(summary.routes_rendered || 0)], ['Validated', Number(summary.routes_application_validated || 0)],
+    ['Healthy', Number(summary.healthy_routes || 0)],
+  ];
+  const top = Math.max(1, ...funnel.map(([, count]) => count));
+  const outcomes = Object.entries(states).filter(([state, count]) => count && state !== 'VALIDATED');
+  section.innerHTML = `<div class="section-heading"><h3>Route coverage</h3><p>A discovered route counts as validated only after the browser loads it and observes application readiness.</p></div>
+    <ol class="funnel">${funnel.map(([label, count]) => `<li><span class="funnel-bar"><span class="funnel-fill" data-fill="${Math.round(count / top * 100)}"></span></span><strong>${count}</strong><span>${label}</span></li>`).join('')}</ol>
+    <div class="state-chips">${outcomes.map(([state, count]) => `<button type="button" class="state-filter" data-route-state="${escapeHtml(state)}">${stateChip(state)}<b>${count}</b></button>`).join('') || '<span class="empty-detail">Every visited route was validated.</span>'}</div>`;
+  // Inline style attributes are blocked by the strict CSP; size the bars here.
+  section.querySelectorAll('.funnel-fill').forEach((bar) => { bar.style.width = `${bar.dataset.fill}%`; });
+  section.querySelectorAll('[data-route-state]').forEach((button) => button.addEventListener('click', () => {
+    routeStateFilter = routeStateFilter === button.dataset.routeState ? '' : button.dataset.routeState;
+    section.querySelectorAll('[data-route-state]').forEach((other) => other.classList.toggle('active', other.dataset.routeState === routeStateFilter));
+    renderRows();
+    byId('route-table-wrap').scrollIntoView({behavior:'smooth', block:'start'});
+  }));
+}
+
+function renderAuthenticationAction(report) {
+  const hosts = report.suggested_authentication_hosts || [];
+  const section = byId('authentication-action');
+  section.hidden = !hosts.length;
+  if (!hosts.length) { section.replaceChildren(); return; }
+  const blocked = Number(report.summary?.route_states?.AUTHENTICATION_BLOCKED || 0);
+  section.innerHTML = `<div><h3>Sign-in blocked by ${hosts.length === 1 ? 'an unapproved identity host' : 'unapproved identity hosts'}</h3>
+    <p>${blocked ? `${blocked} route${blocked === 1 ? '' : 's'} could not sign in. ` : ''}The application signs in through ${hosts.map((host) => `<code>${escapeHtml(host)}</code>`).join(', ')}. Approve only hosts you trust as this portal's identity provider; requests stay read-only and every other destination remains blocked.</p></div>
+    <div class="action-buttons"><button type="button" id="approve-suggested-hosts">Add to Authentication hosts</button><button type="button" class="secondary" id="approve-and-rerun">Add and run again</button></div>`;
+  const approve = () => {
+    const input = byId('authentication-hosts');
+    input.value = [...new Set([...splitList(input.value), ...hosts])].join(', ');
+    input.dispatchEvent(new Event('input'));
+    notify(`Added ${hosts.join(', ')} to Authentication hosts.`);
+  };
+  byId('approve-suggested-hosts').addEventListener('click', approve);
+  byId('approve-and-rerun').addEventListener('click', () => { approve(); form.requestSubmit(); });
+}
+
 function renderAuthenticationDiagnostics(report) {
   const diagnostics = (report.authentication_diagnostics || []).map(authenticationDiagnosticEvidence);
   const approvalSummary = authenticationHostApprovalSummary(report.scan_configuration);
@@ -1333,6 +1394,21 @@ function renderAuthenticationDiagnostics(report) {
     AUTHENTICATION_PROTOCOL_MISMATCH:'The request did not match the required authentication protocol context.',
     AUTHENTICATION_POLICY_BLOCKED:'A separate security policy blocked the authentication request.',
   };
+  const groups = report.authentication_diagnostic_groups || [];
+  if (groups.length) {
+    byId('authentication-diagnostic-count').textContent = `${diagnostics.length} authentication policy observations grouped into ${groups.length} root cause${groups.length === 1 ? '' : 's'}. ${approvalSummary || 'Authentication host approval counts were not recorded.'} Every individual record remains in the JSON export. Authentication approvals do not expand crawler or general API scope.`;
+    byId('authentication-diagnostic-list').innerHTML = groups.map((group, index) => `<li class="diagnostic-group${group.affects_authentication ? ' affects' : ''}">
+      <div class="diagnostic-head"><strong>${escapeHtml(group.reason || 'AUTHENTICATION_POLICY_BLOCKED')}</strong><span class="chip chip-count">${escapeHtml(group.occurrences)}×</span>${group.affects_authentication ? '<span class="chip chip-bad">Affects sign-in</span>' : '<span class="chip chip-muted">Impact not established</span>'}</div>
+      <p>${escapeHtml(reasons[group.reason] || 'Review the original policy decision and authorized session configuration.')}</p>
+      <code>${escapeHtml(group.protocol || 'Not recorded')}: ${escapeHtml(group.source_host || 'unknown source')} → ${escapeHtml(group.destination_host || 'unknown destination')}</code>
+      <p>Policy: ${escapeHtml(group.policy_reason || 'Not recorded')}.${group.suggested_authentication_host ? ` Approve <code>${escapeHtml(group.suggested_authentication_host)}</code> under Authentication hosts if it is this portal's identity provider.` : ''}</p>
+      ${group.routes?.length ? `<details><summary>${escapeHtml(group.routes.length)} affected route${group.routes.length === 1 ? '' : 's'}</summary><p>${escapeHtml(group.routes.join(', '))}</p></details>` : ''}
+      <button type="button" class="secondary" data-authentication-group="${index}">Inspect evidence</button></li>`).join('');
+    byId('authentication-diagnostic-list').querySelectorAll('[data-authentication-group]').forEach(button => {
+      button.addEventListener('click', () => showEvidence('Authentication policy root cause', groups[Number(button.dataset.authenticationGroup)]));
+    });
+    return;
+  }
   byId('authentication-diagnostic-count').textContent = `${diagnostics.length} authentication policy observations. ${approvalSummary || 'Authentication host approval counts were not recorded.'} Showing ${Math.min(50, diagnostics.length)} records; all records remain in the JSON export. Authentication approvals do not expand crawler or general API scope.`;
   byId('authentication-diagnostic-list').innerHTML = diagnostics.slice(0, 50).map((item, index) =>
     `<li><strong>${escapeHtml(item.reason || 'AUTHENTICATION_POLICY_BLOCKED')}</strong><p>${escapeHtml(reasons[item.reason] || 'Review the original policy decision and authorized session configuration.')}</p><code>${escapeHtml(item.protocol || 'Not recorded')} - ${escapeHtml(item.destination_host || 'Not recorded')}</code><p>Policy: ${escapeHtml(item.policy_reason || 'Not recorded')}. Protected coverage affected: ${item.affects_authentication === true ? 'Yes' : 'Not established'}.</p><button type="button" class="secondary" data-authentication-diagnostic="${index}">Inspect authentication decision</button></li>`
@@ -1459,6 +1535,8 @@ function renderReport(report, context = null) {
   renderSecurityRecommendations();
   renderNavigationCoverage(report);
   renderCoverageDimensions(report);
+  renderRouteStateOverview(report);
+  renderAuthenticationAction(report);
   renderAuthenticationDiagnostics(report);
   renderAuthenticationFailure(report);
   results.hidden = false;
