@@ -130,6 +130,56 @@ vulnerabilities.
   table headers and identity columns, striped rows, status chips, and
   example placeholders that cannot be mistaken for configured values.
 
+## Generic validation of any website
+
+The validator contains no organization-, portal-, identity-provider- or
+cluster-specific values. Real public scans run with default settings and no
+authentication:
+
+| Site | Result |
+|---|---|
+| python.org | 15 routes visited, 13 validated and healthy. *Sign In* and *Sign Up* were reported as authentication-required routes and the scan continued. |
+| developer.mozilla.org | 15 of 15 routes validated and healthy. |
+| udemy.com | Its bot protection served a challenge (HTTP 403) to the automated browser. Reported as `CHALLENGE_REQUIRED`; nothing was bypassed. |
+
+Fixes found by these scans:
+
+- **Public scans and login-only pages.** On a public scan
+  (`authentication.mode=none`), a login-required page or a 401 after the site
+  is ready is a result for that route only. It no longer triggers session
+  recovery, stops discovery, or ends the scan as `SESSION_EXPIRED`. Public
+  scans report `authentication_status=NOT_REQUIRED` instead of
+  `AUTHENTICATED`.
+- **Bot-protection challenges.** A blocking status (403, 429 or 503) whose URL
+  carries a generic challenge parameter (`__cf_chl_rt_tk`, `__cf_chl_tk`,
+  `challenge_token`, `captcha_token`) is classified as `CHALLENGE_REQUIRED`.
+  The remediation asks the site owner to allow the validator. The dashboard's
+  failure heading now names the actual cause (challenge, access denied,
+  unreachable site, TLS failure, application not ready), not always
+  "Authentication failed".
+- **Unclickable link controls.** A link control that never becomes clickable
+  (covered, collapsed or off screen) no longer fails its route with a timeout.
+  The click was never dispatched, so the guarded read-only fallbacks are used.
+  The hard-coded 5-second click limits are replaced by limits derived from the
+  configured timeouts.
+- **Corporate CA directory.** The vendor-specific default directory name is
+  replaced by a generic one; see the migration below.
+
+## Migration: corporate CA directory
+
+The default corporate CA directory is now `/etc/portal-validator/corporate-ca`.
+The example OpenShift manifest mounts a ConfigMap named
+`portal-validator-corporate-ca` there.
+
+If you mount CA certificates at the previous default path without setting
+`PORTAL_VALIDATOR_ADDITIONAL_CA_DIRS`, do one of the following:
+
+- mount them at the new path; or
+- set `PORTAL_VALIDATOR_ADDITIONAL_CA_DIRS` and
+  `PORTAL_VALIDATOR_BROWSER_CA_DIRS` to your existing directory.
+
+A configured directory that is missing still fails closed.
+
 ## Using it with an SSO portal
 
 Add the identity provider hosts reported under *Sign-in blocked* to
