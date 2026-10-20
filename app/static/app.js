@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = '1.13.5';
+const FRONTEND_VERSION = '1.13.6';
 // The server pins this exact deferred script with SRI and a hash-versioned URL.
 // Capture currentScript now; it is unavailable in subsequent async callbacks.
 const frontendScript = document.currentScript;
@@ -57,7 +57,7 @@ function clearReportResults() {
   ['api-count','resource-count','resource-scope','failed-endpoint-count',
     'navigation-coverage-limitations','authentication-diagnostic-count'].forEach((id) => { byId(id).textContent = ''; });
   byId('authentication-diagnostics').hidden = true;
-  ['route-state-overview','authentication-action'].forEach((id) => { byId(id).hidden = true; byId(id).replaceChildren(); });
+  ['route-state-overview','authentication-action','post-approval-action'].forEach((id) => { byId(id).hidden = true; byId(id).replaceChildren(); });
   routeStateFilter = '';
   Object.values(tablePagination).forEach((state) => { state.page = 0; state.key = ''; });
 }
@@ -427,7 +427,6 @@ function addReadPostOperation() {
 
 function approvedReadPostOperations() {
   const rows = [...document.querySelectorAll('.read-post-operation')];
-  if (rows.length > 100) throw new Error('At most 100 read-only POST operations may be approved.');
   return rows.map((row) => {
     const host = row.querySelector('.operation-host').value.trim().toLowerCase().replace(/\.$/, '');
     const path = row.querySelector('.operation-path').value.trim();
@@ -1363,6 +1362,51 @@ function renderRouteStateOverview(report) {
   }));
 }
 
+function unverifiedPostEndpoints(report) {
+  // Observed POSTs blocked only because nobody approved them as read-only.
+  return (report.api_inventory || []).filter((item) => item.method === 'POST' && Number(item.blocked_count || 0) > 0
+    && item.traffic_class !== 'AUTHENTICATION' && (item.post_classifications || []).includes('POST_READ_ONLY_UNVERIFIED')
+    && typeof item.host === 'string' && typeof item.endpoint === 'string' && item.endpoint.startsWith('/'));
+}
+
+function renderPostApprovalReview(report) {
+  const section = byId('post-approval-action');
+  const endpoints = unverifiedPostEndpoints(report);
+  section.hidden = !endpoints.length;
+  if (!endpoints.length) { section.replaceChildren(); return; }
+  section.innerHTML = `<div><h3>${endpoints.length} POST endpoint${endpoints.length === 1 ? ' was' : 's were'} blocked as unverified</h3>
+    <p>Blocked requests never reach the application, so their results cannot be validated. Approve only endpoints you know are read-only (for example search or lookup); every other POST stays blocked and request bodies are never logged or replayed.</p>
+    <ul class="post-review-list">${endpoints.map((item, index) => `<li><label><input type="checkbox" data-post-approval="${index}"> <code>POST ${escapeHtml(item.host)}${escapeHtml(item.endpoint)}</code></label>
+      <span class="chip chip-count">${escapeHtml(item.blocked_count)} blocked</span><small>${escapeHtml((item.routes_using_endpoint || []).length)} route${(item.routes_using_endpoint || []).length === 1 ? '' : 's'}</small></li>`).join('')}</ul></div>
+    <div class="action-buttons"><button type="button" id="approve-selected-posts">Approve selected as read-only</button><button type="button" class="secondary" id="approve-posts-and-rerun">Approve and run again</button></div>`;
+  const approve = () => {
+    const selected = [...section.querySelectorAll('[data-post-approval]:checked')].map((input) => endpoints[Number(input.dataset.postApproval)]);
+    if (!selected.length) { notify('Select at least one read-only POST endpoint to approve.', true); return false; }
+    const existing = new Set([...document.querySelectorAll('.read-post-operation')].map((row) =>
+      `${row.querySelector('.operation-host').value.trim().toLowerCase()} ${row.querySelector('.operation-path').value.trim()}`));
+    const skipped = [];
+    for (const item of selected) {
+      // Inventory identities replace IDs with {id}; approvals use bounded {segment} patterns.
+      const path = item.endpoint.replace(/\{[a-z_]+\}/gi, '{segment}');
+      const pattern = path.includes('{segment}');
+      if (pattern && path.split('/').filter((part) => part && part !== '{segment}').length < 2) { skipped.push(item.endpoint); continue; }
+      if (existing.has(`${item.host.toLowerCase()} ${path}`)) continue;
+      addReadPostOperation();
+      const row = [...document.querySelectorAll('.read-post-operation')].pop();
+      row.querySelector('.operation-host').value = item.host.toLowerCase();
+      row.querySelector('.operation-path').value = path;
+      row.querySelector('.operation-path-type').value = pattern ? 'path_pattern' : 'path';
+      row.querySelector('.operation-description').value = 'Approved from scan review';
+    }
+    if (skipped.length) notify(`Not approved (needs an exact path you add manually): ${skipped.join(', ')}`, true);
+    byId('read-post-settings').open = true;
+    notify(`Approved ${selected.length} POST endpoint${selected.length === 1 ? '' : 's'} as read-only. Review them under Approved read-only API operations.`);
+    return true;
+  };
+  byId('approve-selected-posts').addEventListener('click', approve);
+  byId('approve-posts-and-rerun').addEventListener('click', () => { if (approve()) form.requestSubmit(); });
+}
+
 function renderAuthenticationAction(report) {
   const hosts = report.suggested_authentication_hosts || [];
   const section = byId('authentication-action');
@@ -1549,6 +1593,7 @@ function renderReport(report, context = null) {
   renderCoverageDimensions(report);
   renderRouteStateOverview(report);
   renderAuthenticationAction(report);
+  renderPostApprovalReview(report);
   renderAuthenticationDiagnostics(report);
   renderAuthenticationFailure(report);
   results.hidden = false;

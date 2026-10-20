@@ -188,7 +188,7 @@ async def main():
         await page.route("**/api/auth-profiles", profile_list_fixture)
         await page.goto(base_url, wait_until="networkidle")
         build_metadata = await page.evaluate("async () => (await fetch('/api/diagnostics/build', {cache:'no-store'})).json()")
-        assert build_metadata["version"] == "1.13.5"
+        assert build_metadata["version"] == "1.13.6"
         assert await page.evaluate("loadedFrontendSha256") == build_metadata["frontend_sha256"]
         assert await page.evaluate("loadedFrontendIntegrity.startsWith('sha256-')")
         assert "Frontend matched" in await page.locator("#build-summary").text_content()
@@ -540,6 +540,31 @@ async def main():
         assert "62×" in await groups.first.inner_text()
         await page.locator("#authentication-hosts").fill("")
         await page.evaluate("() => { renderRouteStateOverview(lastReport); renderAuthenticationAction(lastReport); renderAuthenticationDiagnostics(lastReport); }")
+        # Unverified POST endpoints can be reviewed and explicitly approved as read-only.
+        await page.evaluate("""() => {
+          const report = structuredClone(lastReport);
+          report.api_inventory = [
+            {method:'POST', host:'api.example.net', endpoint:'/v1/search', blocked_count:4, routes_using_endpoint:['Reports'],
+             post_classifications:['POST_BLOCKED_BY_POLICY','POST_READ_ONLY_UNVERIFIED'], traffic_class:'BUSINESS_API'},
+            {method:'POST', host:'api.example.net', endpoint:'/v1/items/{id}/lookup', blocked_count:2, routes_using_endpoint:['Items'],
+             post_classifications:['POST_READ_ONLY_UNVERIFIED'], traffic_class:'BUSINESS_API'},
+            {method:'POST', host:'login.example.net', endpoint:'/oauth/token', blocked_count:1,
+             post_classifications:['POST_READ_ONLY_UNVERIFIED'], traffic_class:'AUTHENTICATION'},
+          ];
+          document.querySelectorAll('.read-post-operation').forEach((row) => row.remove());
+          renderPostApprovalReview(report);
+        }""")
+        review = page.locator("#post-approval-action")
+        assert await review.is_visible()
+        assert await review.locator("[data-post-approval]").count() == 2  # authentication traffic is never offered
+        assert not await review.locator("[data-post-approval]").first.is_checked()
+        await review.locator("[data-post-approval]").nth(0).check()
+        await review.locator("[data-post-approval]").nth(1).check()
+        await page.locator("#approve-selected-posts").click()
+        operations = await page.evaluate("approvedReadPostOperations()")
+        assert {"method": "POST", "host": "api.example.net", "path": "/v1/search", "description": "Approved from scan review"} in operations
+        assert {"method": "POST", "host": "api.example.net", "path_pattern": "/v1/items/{segment}/lookup", "description": "Approved from scan review"} in operations
+        await page.evaluate("() => { document.querySelectorAll('.read-post-operation').forEach((row) => row.remove()); byId('read-post-settings').open = false; renderPostApprovalReview(lastReport); }")
         # Every data column of the failure and request-issue tables is sortable.
         assert await page.locator("[data-failed-sort]").count() == 9
         assert await page.locator("[data-issue-sort]").count() == 6
