@@ -101,6 +101,9 @@ from app.network import (
 )
 from app.reporting import (
     _safe_authentication_diagnostics,
+    group_authentication_diagnostics,
+    suggested_authentication_hosts,
+    traffic_class,
     aggregate_api_events,
     aggregate_api_inventory,
     aggregate_report,
@@ -1190,6 +1193,8 @@ async def execute_scan(
     # A bootstrap target is not discovered/tested application coverage yet.
     discovered_routes: set[str] = set()
     queued_routes: set[str] = set()
+    # (label, menu hierarchy) of entries discovered as real links.
+    linked_menu_entries: set[tuple[str, tuple[str, ...]]] = set()
     # Signatures of shared navigation controls already explored in this scan.
     explored_navigation_controls: set[str] | None = (
         None if req.reexplore_navigation_each_route else set()
@@ -1246,6 +1251,10 @@ async def execute_scan(
         if source not in sources:
             sources.append(source)
 
+    def menu_entry_signature(label: str | None, hierarchy) -> tuple[str, tuple[str, ...]] | None:
+        text = " ".join(str(label or "").split()).lower()
+        return (text, tuple(hierarchy or ())) if text else None
+
     def enqueue_discovered_routes(
         routes: list[DiscoveredRoute], depth: int, source_url: str,
     ) -> list[str]:
@@ -1257,7 +1266,19 @@ async def execute_scan(
         if not application_gate_confirmed or authentication_error is not None:
             return []
         external_urls: set[str] = set()
+        # A menu entry rendered both as a link and as a clickable menu item is
+        # one destination: validate it once through its link.
         for route in routes:
+            signature = None if route.view_control else menu_entry_signature(route.label, route.navigation_hierarchy)
+            if signature is not None:
+                linked_menu_entries.add(signature)
+        for route in routes:
+            # Only panel-less menu items duplicate a link; tabs that control a
+            # panel are distinct views even when they also carry an href.
+            if route.view_control and route.view_control.get("kind") == "navigation" and menu_entry_signature(
+                route.label, route.navigation_hierarchy,
+            ) in linked_menu_entries:
+                continue
             if (route.view_control and active_view_source
                     and normalize_route_url(route.url) == normalize_route_url(source_url)):
                 # History updates caused by a tab do not create fresh copies
@@ -1921,6 +1942,7 @@ async def execute_scan(
                         source_portal_scoped=url_in_scan_scope(
                             source_url, root_host, req.allow_subdomains, approved_portal_hosts,
                         ),
+                        main_frame=is_main_navigation(request),
                     )
                     if auth_diagnostic is not None:
                         route_id, activation_id, phase = request_origin(request)
@@ -2861,6 +2883,12 @@ async def execute_scan(
                         ), route_identity)
                         if route_key in seen or depth > req.max_depth:
                             continue
+                        if view_control and view_control.get("kind") == "navigation" and menu_entry_signature(
+                            route_label, route_metadata.get(route_key, {}).get("navigation_hierarchy", ()),
+                        ) in linked_menu_entries:
+                            # Its link was discovered after this menu item was queued.
+                            discovered_routes.discard(route_key)
+                            continue
                         seen.add(route_key)
                         active_route_identity = route_key
                         active_route_id = route_key if view_control else sanitized_url(route_identity)
@@ -3558,6 +3586,20 @@ async def execute_scan(
                                     )
                                     if active_route_activation_id in authentication_denials:
                                         authentication_classification = "AUTHENTICATION_BLOCKED"
+                                        # The route's own sign-in handshake was blocked; that is
+                                        # the cause, not a generic navigation failure.
+                                        blocked = next((
+                                            item for item in reversed(authentication_diagnostics)
+                                            if item.get("route_activation_id") == active_route_activation_id
+                                            and item.get("affects_authentication")
+                                        ), {})
+                                        error_classification = "AUTHENTICATION_BLOCKED"
+                                        error = (
+                                            "The route's sign-in request to "
+                                            f"{blocked.get('destination_host') or 'its identity provider'} was blocked "
+                                            f"({blocked.get('reason') or 'AUTHENTICATION_POLICY_BLOCKED'}). "
+                                            "Add the identity provider host to Authentication hosts to validate this route."
+                                        )
                                     browser_lifecycle.fail(
                                         authentication_classification
                                         if authentication_classification not in {None, "PASS"}
@@ -4355,6 +4397,10 @@ async def execute_scan(
         aggregate_api_events(scan_api_events)
         if scan_api_events else aggregate_api_inventory(results)
     )
+    for item in api_inventory:
+        item["traffic_class"] = traffic_class(item.get("traffic_role"), in_portal_scope=url_in_scan_scope(
+            f"https://{item.get('host') or ''}/", root_host, req.allow_subdomains, approved_portal_hosts,
+        ) if item.get("host") else True)
     business_api_inventory = [
         item for item in api_inventory
         if item.get("traffic_role") == "APPLICATION_API"
@@ -4545,6 +4591,12 @@ async def execute_scan(
         "coverage_dimensions": build_coverage_dimensions(results, summary),
         "api_inventory": api_inventory,
         "authentication_diagnostics": authentication_diagnostics,
+        "authentication_diagnostic_groups": group_authentication_diagnostics(
+            _safe_authentication_diagnostics(authentication_diagnostics), route_name_by_id,
+        ),
+        "suggested_authentication_hosts": suggested_authentication_hosts(
+            _safe_authentication_diagnostics(authentication_diagnostics),
+        ),
         "api_request_occurrences": [
             {
                 **event,

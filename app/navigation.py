@@ -453,7 +453,7 @@ class AuthenticationNavigationPolicy:
     def diagnose_blocked_request(
         self, method: str, url: str, post_data: str | None, *,
         resource_type: str, document_navigation: bool, portal_scoped: bool,
-        source_url: str, source_portal_scoped: bool = False,
+        source_url: str, source_portal_scoped: bool = False, main_frame: bool = False,
     ) -> dict[str, Any] | None:
         """Explain denied protocol traffic without granting or activating a flow.
 
@@ -490,7 +490,21 @@ class AuthenticationNavigationPolicy:
             destination_approved = destination_approved or portal_scoped
         else:
             return None
-        if not source_approved:
+        # An identity provider page posting its own sign-in form to itself in
+        # the main frame is that provider's sign-in step reached by the portal's
+        # navigation. The actionable cause is the unapproved identity host, and
+        # the blocked step does prevent the route from signing in.
+        identity_self_post = bool(
+            protocol == "AUTHENTICATION_FORM" and main_frame and not source_approved
+            and source_host and source_host == destination_host and not portal_scoped
+            and endpoint_matches
+        )
+        if identity_self_post:
+            reason = (
+                "AUTHENTICATION_HOST_NOT_APPROVED" if self.approved_hosts
+                else "AUTHENTICATION_HOSTS_REQUIRED"
+            )
+        elif not source_approved:
             reason = "AUTHENTICATION_SOURCE_NOT_APPROVED"
         elif not endpoint_matches:
             reason = "AUTHENTICATION_PROTOCOL_MISMATCH"
@@ -511,7 +525,12 @@ class AuthenticationNavigationPolicy:
             "source_approved": source_approved,
             "destination_approved": destination_approved,
             "flow_active": self.active,
-            "affects_authentication": bool(source_approved and endpoint_matches),
+            "affects_authentication": bool((source_approved or identity_self_post) and endpoint_matches),
+            # Host the operator would have to approve for this sign-in step.
+            "suggested_authentication_host": (
+                destination_host if reason in {"AUTHENTICATION_HOSTS_REQUIRED", "AUTHENTICATION_HOST_NOT_APPROVED"}
+                else None
+            ),
         }
 
 

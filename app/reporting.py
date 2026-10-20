@@ -166,10 +166,15 @@ def _safe_authentication_diagnostics(items: list[dict[str, Any]]) -> list[dict[s
             value = _diagnostic_code(item.get(key))
             if value:
                 diagnostic[key] = value
+        for key in ("route_id", "route_activation_id"):
+            value = item.get(key)
+            # Route identities are sanitized URLs/view keys; never keep a query.
+            if isinstance(value, str) and 0 < len(value) <= 512 and "?" not in value:
+                diagnostic[key] = value
         for key in ("affects_authentication", "source_approved", "destination_approved", "flow_active"):
             if isinstance(item.get(key), bool):
                 diagnostic[key] = item[key]
-        for key in ("source_host", "destination_host"):
+        for key in ("source_host", "destination_host", "suggested_authentication_host"):
             value = item.get(key)
             if isinstance(value, str):
                 # Host-only evidence must not admit URL credentials or queries.
@@ -182,6 +187,64 @@ def _safe_authentication_diagnostics(items: list[dict[str, Any]]) -> list[dict[s
         if diagnostic not in output:
             output.append(diagnostic)
     return output
+
+
+TRAFFIC_CLASS_BY_ROLE = {
+    "AUTH_API": "AUTHENTICATION", "SESSION_REFRESH": "AUTHENTICATION",
+    "APPLICATION_API": "BUSINESS_API",
+    "MICROFRONTEND_CONFIG": "CONFIGURATION_BOOTSTRAP", "DOCUMENT": "CONFIGURATION_BOOTSTRAP",
+    "STATIC_RESOURCE": "STATIC_ASSET",
+}
+
+
+def traffic_class(role: str | None, *, in_portal_scope: bool) -> str:
+    """Generic purpose of observed traffic from metadata only (no bodies)."""
+    if role in {"AUTH_API", "SESSION_REFRESH"}:
+        return "AUTHENTICATION"
+    if not in_portal_scope or role in {"TELEMETRY", "CHALLENGE_API"}:
+        return "THIRD_PARTY_DEPENDENCY"
+    return TRAFFIC_CLASS_BY_ROLE.get(str(role), "UNKNOWN")
+
+
+def group_authentication_diagnostics(
+    diagnostics: list[dict[str, Any]], route_names: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Group repeated policy observations by root cause instead of listing each.
+
+    Input items are already sanitized; only host-level and code fields are kept.
+    """
+    groups: dict[tuple, dict[str, Any]] = {}
+    for item in diagnostics:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            item.get("reason"), item.get("protocol"), item.get("source_host"),
+            item.get("destination_host"), item.get("policy_reason") or item.get("policy_decision"),
+        )
+        group = groups.setdefault(key, {
+            "reason": key[0], "protocol": key[1], "source_host": key[2], "destination_host": key[3],
+            "policy_reason": key[4], "affects_authentication": False, "occurrences": 0,
+            "routes": [], "suggested_authentication_host": None,
+        })
+        group["occurrences"] += 1
+        group["affects_authentication"] = group["affects_authentication"] or item.get("affects_authentication") is True
+        if item.get("suggested_authentication_host"):
+            group["suggested_authentication_host"] = item["suggested_authentication_host"]
+        route = (route_names or {}).get(str(item.get("route_id") or "")) or item.get("route_id")
+        if isinstance(route, str) and route and route not in group["routes"]:
+            group["routes"].append(route)
+    return sorted(groups.values(), key=lambda group: (
+        not group["affects_authentication"], -group["occurrences"], str(group["reason"]),
+    ))
+
+
+def suggested_authentication_hosts(diagnostics: list[dict[str, Any]]) -> list[str]:
+    """Identity hosts whose approval would let blocked sign-in steps proceed."""
+    return sorted({
+        item["suggested_authentication_host"] for item in diagnostics
+        if isinstance(item, dict) and isinstance(item.get("suggested_authentication_host"), str)
+        and item["suggested_authentication_host"]
+    })
 
 
 def apply_global_authentication_failure(
@@ -270,6 +333,8 @@ def apply_global_authentication_failure(
             "api": {"status": "NOT_STARTED", "reason": "Authentication diagnostics are not application API checks."},
         },
         "authentication_diagnostics": safe_diagnostics,
+        "authentication_diagnostic_groups": group_authentication_diagnostics(safe_diagnostics),
+        "suggested_authentication_hosts": suggested_authentication_hosts(safe_diagnostics),
         "network_observation": {
             **{key: 0 for key in (
                 "total_http_requests_observed", "api_requests_observed", "observed_requests", "policy_evaluated",
@@ -991,6 +1056,38 @@ def unvisited_route_reason(termination_reason: str) -> str:
     }.get(termination_reason, "NOT_TESTED")
 
 
+ROUTE_STATES = (
+    "DISCOVERED", "NAVIGATION_ATTEMPTED", "RENDERED", "VALIDATED", "AUTHENTICATION_BLOCKED",
+    "AUTHORIZATION_DENIED", "POLICY_BLOCKED", "NAVIGATION_FAILED", "TIMEOUT", "INCOMPLETE",
+)
+NAVIGATION_FAILURE_OUTCOMES = frozenset({"TLS_ERROR", "DNS_ERROR", "NETWORK_ERROR", "HTTP_ERROR", "NAVIGATION_ERROR"})
+
+
+def route_state(result: dict[str, Any]) -> str:
+    """Where a visited route got to, from browser evidence only.
+
+    VALIDATED means the view loaded and its application readiness was observed,
+    so its health checks ran (they may still have failed). RENDERED means the
+    view loaded but never became ready, so its health was not established.
+    """
+    classification = result.get("classification")
+    if classification in AUTH_OUTCOMES:
+        return "AUTHENTICATION_BLOCKED"
+    if classification == "AUTHORIZATION_DENIED" or classification in ACCESS_OUTCOMES:
+        return "AUTHORIZATION_DENIED"
+    if classification in {"NAVIGATION_BLOCKED", "POLICY_BLOCKED"}:
+        return "POLICY_BLOCKED"
+    if classification == "TIMEOUT":
+        return "TIMEOUT"
+    if classification in {"SKIPPED", "DISCOVERED_BUT_NOT_SAFELY_ACTIVATABLE", "DISCOVERY_LIMITATION"}             or result.get("page_load_status") == "NOT_TESTED":
+        return "INCOMPLETE"
+    if classification in NAVIGATION_FAILURE_OUTCOMES or result.get("page_load_status") == "FAILED_TO_LOAD":
+        return "NAVIGATION_FAILED"
+    if result.get("page_load_status") == "LOADED":
+        return "VALIDATED" if result.get("application_ready") is not False else "RENDERED"
+    return "NAVIGATION_ATTEMPTED"
+
+
 def aggregate_report(
     results: list[dict[str, Any]],
     *,
@@ -1260,6 +1357,23 @@ def aggregate_report(
     if not all(invariants.values()):
         raise ValueError("Report counters are internally inconsistent")
     summary["counter_invariants"] = invariants
+    # Route states separate discovery from browser evidence of validation.
+    states: Counter[str] = Counter()
+    for result in results:
+        result["route_state"] = route_state(result)
+        states[result["route_state"]] += 1
+    states["DISCOVERED"] = max(0, discovered_count - len(results))
+    summary["route_states"] = {state: states.get(state, 0) for state in ROUTE_STATES}
+    summary["routes_visited"] = len(results)
+    summary["routes_rendered"] = states["RENDERED"] + states["VALIDATED"]
+    summary["routes_application_validated"] = states["VALIDATED"]
+    summary["routes_blocked"] = (
+        states["AUTHENTICATION_BLOCKED"] + states["AUTHORIZATION_DENIED"] + states["POLICY_BLOCKED"]
+    )
+    summary["routes_incomplete"] = (
+        states["NAVIGATION_FAILED"] + states["TIMEOUT"] + states["INCOMPLETE"]
+        + states["NAVIGATION_ATTEMPTED"] + states["RENDERED"]
+    )
     return summary
 
 
@@ -1764,8 +1878,53 @@ def aggregate_api_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return aggregate_api_inventory([{"api_requests": events}])
 
 
+SECURITY_HEADER_GUIDANCE = {
+    "content-security-policy": (
+        "Content Security Policy not set", "MEDIUM",
+        "Without a Content Security Policy the browser applies no allow-list to scripts, frames or "
+        "connections, so an injection flaw has a larger impact.",
+        "Define a Content-Security-Policy (start in Report-Only mode), restricting script-src, "
+        "frame-ancestors and connect-src to the origins the application actually uses.",
+    ),
+    "strict-transport-security": (
+        "HTTP Strict Transport Security not set", "MEDIUM",
+        "Browsers may still attempt plain HTTP on a first visit, which allows downgrade or "
+        "interception on untrusted networks.",
+        "Send Strict-Transport-Security with a max-age of at least 15552000 seconds on HTTPS "
+        "responses; add includeSubDomains once every subdomain serves HTTPS.",
+    ),
+    "x-content-type-options": (
+        "MIME-type sniffing not disabled", "LOW",
+        "Browsers may interpret responses as a different content type than declared.",
+        "Send X-Content-Type-Options: nosniff on all responses.",
+    ),
+    "referrer-policy": (
+        "Referrer Policy not set", "LOW",
+        "Full URLs, including paths and query values, may be sent to other sites in the Referer header.",
+        "Send Referrer-Policy: strict-origin-when-cross-origin (or stricter).",
+    ),
+    "permissions-policy": (
+        "Permissions Policy not set", "LOW",
+        "Embedded or injected content is not restricted from requesting powerful browser features.",
+        "Send a Permissions-Policy that disables features the application does not use "
+        "(for example camera=(), microphone=(), geolocation=()).",
+    ),
+    "cross-origin-opener-policy": (
+        "Cross-Origin Opener Policy not set", "LOW",
+        "Pages opened from other sites can keep a reference to this window, enabling some "
+        "cross-window attacks.",
+        "Send Cross-Origin-Opener-Policy: same-origin, or same-origin-allow-popups when the "
+        "application relies on cross-origin popups such as sign-in windows.",
+    ),
+}
+
+
 def aggregate_security_recommendations(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Deduplicate document-level recommendations across inherited SPA routes."""
+    """Deduplicate document-level recommendations across inherited SPA routes.
+
+    Missing response headers are hardening recommendations observed directly on
+    document responses; they are not demonstrated vulnerabilities.
+    """
     recommendations: dict[str, set[str]] = {}
     for result in results:
         if result.get("security_headers_basis") != "DOCUMENT_RESPONSE":
@@ -1773,17 +1932,35 @@ def aggregate_security_recommendations(results: list[dict[str, Any]]) -> list[di
         route = result.get("normalized_route_identity") or result.get("url")
         for header in result.get("missing_security_headers", []):
             recommendations.setdefault(str(header), set()).add(str(route))
-    return [
-        {
+    output = []
+    for header, routes in sorted(recommendations.items()):
+        title, severity, explanation, remediation = SECURITY_HEADER_GUIDANCE.get(header, (
+            f"{header} not set", "LOW", "The recommended response header was not present.",
+            f"Review whether {header} should be sent by the application or its proxy.",
+        ))
+        output.append({
             "type": "MISSING_SECURITY_HEADER",
+            "category": "HARDENING_RECOMMENDATION",
             "header": header,
+            "title": title,
             "severity": "RECOMMENDATION",
+            "risk": severity,
             "impact": "NON_BLOCKING",
+            "evidence": (
+                f"The {header} response header was absent from {len(routes)} observed document "
+                f"response{'s' if len(routes) != 1 else ''}."
+            ),
+            "explanation": explanation,
+            "remediation": remediation,
+            "confidence": "HIGH",
+            "limitation": (
+                "Observed on document responses received by the validator. A proxy or CDN in front of "
+                "other clients could add the header; it was not observed on this path."
+            ),
             "affected_documents": sorted(routes),
             "affected_document_count": len(routes),
-        }
-        for header, routes in sorted(recommendations.items())
-    ]
+        })
+    return output
 
 
 def aggregate_resource_inventory(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
