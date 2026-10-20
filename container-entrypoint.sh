@@ -3,7 +3,7 @@ set -eu
 
 : "${HOME:=/tmp/portal-validator-home}"
 : "${PORTAL_VALIDATOR_MANAGED_CA_BUNDLE:=/etc/portal-validator/certs/ca-bundle.crt}"
-: "${PORTAL_VALIDATOR_ADDITIONAL_CA_DIRS:=/etc/portal-validator/corporate-ca}"
+: "${PORTAL_VALIDATOR_ADDITIONAL_CA_DIRS:=/etc/portal-validator/zscaler}"
 : "${PORTAL_VALIDATOR_BROWSER_CA_DIRS:=$PORTAL_VALIDATOR_ADDITIONAL_CA_DIRS}"
 : "${RUNTIME_CA_BUNDLE:=$HOME/.portal-validator/ca-bundle.crt}"
 : "${CHROMIUM_NSS_DB:=$HOME/.local/share/pki/nssdb}"

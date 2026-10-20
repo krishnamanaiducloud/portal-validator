@@ -154,7 +154,7 @@ def test_missing_managed_bundle_is_rejected(tmp_path, monkeypatch):
 
 def test_default_directory_combines_deduplicates_and_imports_roots(tmp_path, monkeypatch):
     managed = tmp_path / "managed.pem"
-    corporate = tmp_path / "corporate-ca"
+    corporate = tmp_path / "zscaler"
     nested = corporate / "nested"
     nested.mkdir(parents=True)
     managed.write_bytes(b"managed")
@@ -231,7 +231,7 @@ def test_multiple_colon_separated_directories_are_discovered(tmp_path, monkeypat
 
 
 def test_kubernetes_configmap_symlink_layout_processes_each_public_file_once(tmp_path):
-    mount = tmp_path / "corporate-ca"
+    mount = tmp_path / "zscaler"
     version = mount / "..2026_10_03_18_13_39"
     version.mkdir(parents=True)
     (version / "root-one.crt").write_bytes(b"one")
@@ -426,8 +426,8 @@ def test_entrypoint_and_deployment_use_existing_combined_ca_mount():
     ))
     assert "PORTAL_VALIDATOR_ADDITIONAL_CA_DIRS" in deployment
     assert "PORTAL_VALIDATOR_BROWSER_CA_DIRS" in deployment
-    assert "portal-validator-corporate-ca" in deployment
-    assert "/etc/portal-validator/corporate-ca" in deployment
+    assert "portal-validator-zscaler-ca" in deployment
+    assert "/etc/portal-validator/zscaler" in deployment
     assert "portal-validator-additional-ca" not in deployment
     assert "CORPORATE_CA_BUNDLE" not in deployment
     assert "- name: SSL_CERT_FILE" not in deployment

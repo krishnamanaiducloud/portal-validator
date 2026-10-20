@@ -318,7 +318,7 @@ The container entrypoint is the only trust writer. Before Uvicorn starts it:
 1. Reads the required managed bundle from
    `PORTAL_VALIDATOR_MANAGED_CA_BUNDLE`.
 2. Recursively discovers `*.crt`, `*.pem`, and `*.cer` under the existing
-   `/etc/portal-validator/corporate-ca` mount by default. Colon-separated directory
+   `/etc/portal-validator/zscaler` mount by default. Colon-separated directory
    overrides and legacy file inputs remain supported for compatibility.
 3. Parses every discovered X.509 certificate, rejects malformed/private-key
    inputs, skips non-CA certificates, and fails if no usable self-signed root
@@ -345,7 +345,7 @@ Relevant environment variables:
 |---|---|
 | `HOME` | `/tmp/portal-validator-home` |
 | `PORTAL_VALIDATOR_MANAGED_CA_BUNDLE` | `/etc/portal-validator/certs/ca-bundle.crt` (required) |
-| `PORTAL_VALIDATOR_ADDITIONAL_CA_DIRS` | Colon-separated required directories; defaults to `/etc/portal-validator/corporate-ca` |
+| `PORTAL_VALIDATOR_ADDITIONAL_CA_DIRS` | Colon-separated required directories; defaults to `/etc/portal-validator/zscaler` |
 | `PORTAL_VALIDATOR_BROWSER_CA_DIRS` | Optional browser-root override; defaults to the additional CA directories |
 | `PORTAL_VALIDATOR_ADDITIONAL_CA_FILES` | Legacy OS-path-separated required PEM files |
 | `PORTAL_VALIDATOR_OPTIONAL_CA_DIRS` | OS-path-separated optional certificate directories |
@@ -392,7 +392,7 @@ directory:
 docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
-  -v ./corporate-cas:/etc/portal-validator/corporate-ca:ro \
+  -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
   mohankrishna999/portal-validator:1.13.4
 ```
 
@@ -401,7 +401,7 @@ docker run --rm -p 8080:8080 \
 `openshift/deployment.yaml` creates an injection-labeled
 `portal-validator-trusted-ca` ConfigMap for the managed bundle. It mounts that
 bundle read-only and mounts every key from the existing combined
-`portal-validator-corporate-ca` ConfigMap at `/etc/portal-validator/corporate-ca`.
+`portal-validator-zscaler-ca` ConfigMap at `/etc/portal-validator/zscaler`.
 The cluster-managed ConfigMap is not modified and no additional CA ConfigMap is
 created:
 
