@@ -15,7 +15,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Literal
-from urllib.parse import urldefrag, urlparse
+from urllib.parse import parse_qsl, urldefrag, urlparse, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -1028,6 +1028,42 @@ async def execute_scan(
     except HTTPException:
         return await configuration_failure()
     req = req.model_copy(update={"authentication_hosts": effective_authentication_hosts})
+    # Query parameters observed to distinguish sibling tab/menu destinations
+    # (e.g. ?tab=daily vs ?tab=monthly). They become part of route identity
+    # even under the default "ignore" policy; tracking and secret parameters
+    # remain excluded by normalize_route_url.
+    view_query_parameters: set[str] = set()
+
+    def route_query_policy() -> str:
+        if req.query_parameter_policy == "ignore" and view_query_parameters:
+            return "allowlist"
+        return req.query_parameter_policy
+
+    def route_query_allowlist() -> set[str]:
+        return set(req.allowed_query_parameters) | view_query_parameters
+
+    def learn_view_query_parameters(routes) -> None:
+        groups: dict[tuple[str, str, str], list[dict[str, str]]] = {}
+        for route in routes:
+            if route.view_control or not (
+                route.source in {"tab", "menuitem", "option"} or route.navigation_hierarchy
+            ):
+                continue
+            try:
+                parsed = urlsplit(route.url)
+            except ValueError:
+                continue
+            if not parsed.query:
+                continue
+            groups.setdefault((parsed.scheme, parsed.netloc, parsed.path), []).append(
+                {key.lower(): value for key, value in parse_qsl(parsed.query, keep_blank_values=True)}
+            )
+        for queries in groups.values():
+            if len(queries) < 2:
+                continue
+            for key in set().union(*queries):
+                if len({query.get(key) for query in queries}) > 1:
+                    view_query_parameters.add(key)
     log_event(
         logging.INFO, "AUTHENTICATION_APPROVALS_APPLIED", scan_id=scan_id,
         effective_host_count=len(effective_authentication_hosts), **authentication_approval_counts,
@@ -1174,8 +1210,8 @@ async def execute_scan(
     authentication_diagnostics: list[dict] = []
     requested_route = normalize_route_url(
         requested_target,
-        query_policy=req.query_parameter_policy,
-        allowed_query_parameters=set(req.allowed_query_parameters),
+        query_policy=route_query_policy(),
+        allowed_query_parameters=route_query_allowlist(),
     ) or requested_target
     queue = deque([(
         requested_target,
@@ -1266,6 +1302,7 @@ async def execute_scan(
         """
         if not application_gate_confirmed or authentication_error is not None:
             return []
+        learn_view_query_parameters(routes)
         external_urls: set[str] = set()
         # A menu entry rendered both as a link and as a clickable menu item is
         # one destination: validate it once through its link.
@@ -1288,8 +1325,8 @@ async def execute_scan(
                 route = replace(route, url=active_view_source)
             identity = normalize_route_url(
                 route.url,
-                query_policy=req.query_parameter_policy,
-                allowed_query_parameters=set(req.allowed_query_parameters),
+                query_policy=route_query_policy(),
+                allowed_query_parameters=route_query_allowlist(),
             )
             if identity is None or route.navigation_mode == DOWNLOAD_OBSERVED:
                 continue
@@ -2880,8 +2917,8 @@ async def execute_scan(
                         ) = current_queue_entry = queue.popleft()
                         route_identity = normalize_route_url(
                             url,
-                            query_policy=req.query_parameter_policy,
-                            allowed_query_parameters=set(req.allowed_query_parameters),
+                            query_policy=route_query_policy(),
+                            allowed_query_parameters=route_query_allowlist(),
                         ) or url
                         route_key = discovered_route_key(DiscoveredRoute(
                             url=url, label=route_label, source=route_source, view_control=view_control,
@@ -3167,8 +3204,8 @@ async def execute_scan(
                                     )
                                     if view_control and final_in_scope:
                                         observed_view_url = normalize_route_url(
-                                            final_raw_url, query_policy=req.query_parameter_policy,
-                                            allowed_query_parameters=set(req.allowed_query_parameters),
+                                            final_raw_url, query_policy=route_query_policy(),
+                                            allowed_query_parameters=route_query_allowlist(),
                                         )
                                         if observed_view_url and observed_view_url != route_identity:
                                             view_navigation_aliases[observed_view_url] = route_key
@@ -3353,8 +3390,8 @@ async def execute_scan(
                                         # redirect, never infer that '/' and 'index.html' are
                                         # equivalent for every application.
                                         actual_document = normalize_route_url(
-                                            final_raw_url, query_policy=req.query_parameter_policy,
-                                            allowed_query_parameters=set(req.allowed_query_parameters),
+                                            final_raw_url, query_policy=route_query_policy(),
+                                            allowed_query_parameters=route_query_allowlist(),
                                         )
                                         if actual_document and actual_document != route_identity:
                                             document_navigation_aliases[actual_document] = route_key
@@ -3514,8 +3551,8 @@ async def execute_scan(
                                         for route in discovered:
                                             identity = normalize_route_url(
                                                 route.url,
-                                                query_policy=req.query_parameter_policy,
-                                                allowed_query_parameters=set(req.allowed_query_parameters),
+                                                query_policy=route_query_policy(),
+                                                allowed_query_parameters=route_query_allowlist(),
                                             )
                                             if identity is not None:
                                                 key = discovered_route_key(route, identity)
@@ -3866,18 +3903,18 @@ async def execute_scan(
                         api_coverage = summarize_route_api_coverage(page_api_events)
                         final_identity = normalize_route_url(
                             final_raw_url,
-                            query_policy=req.query_parameter_policy,
-                            allowed_query_parameters=set(req.allowed_query_parameters),
+                            query_policy=route_query_policy(),
+                            allowed_query_parameters=route_query_allowlist(),
                         ) or route_identity
                         identity = route_identity_fields(
                             final_identity,
-                            query_policy=req.query_parameter_policy,
-                            allowed_query_parameters=set(req.allowed_query_parameters),
+                            query_policy=route_query_policy(),
+                            allowed_query_parameters=route_query_allowlist(),
                         )
                         requested_identity = route_identity_fields(
                             route_identity,
-                            query_policy=req.query_parameter_policy,
-                            allowed_query_parameters=set(req.allowed_query_parameters),
+                            query_policy=route_query_policy(),
+                            allowed_query_parameters=route_query_allowlist(),
                         )
                         display_url = sanitized_url(final_identity)
                         route_name, route_name_source, route_name_confidence = resolve_route_name(
@@ -4347,8 +4384,8 @@ async def execute_scan(
         route_url = sanitized_url(route_locations[route_key])
         route_fields = route_identity_fields(
             route_url,
-            query_policy=req.query_parameter_policy,
-            allowed_query_parameters=set(req.allowed_query_parameters),
+            query_policy=route_query_policy(),
+            allowed_query_parameters=route_query_allowlist(),
         )
         metadata = route_metadata[route_key]
         name, name_source, name_confidence = resolve_route_name(
