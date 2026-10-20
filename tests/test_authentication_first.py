@@ -345,3 +345,20 @@ async def test_successful_authentication_unlocks_all_nested_and_url_less_fixture
     assert failed["response_status_counts"] == {"502": 1}
     assert not any(method == "POST" and path == "/api/write" for _, method, path in receipts)
     assert "fixture-private" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_public_scan_treats_a_login_required_page_as_one_route_not_session_expiry(authentication_first_site):
+    """A public site may have members-only pages; they must not stop the scan."""
+    await require_browser()
+    origin, handler = authentication_first_site
+    handler.expire_session = True  # links to a page answering 401 with a sign-in form
+    report = await execute_scan(request_for(origin))
+    routes = {urlsplit(route["requested_url"]).path or "/": route for route in report["results"]}
+    assert report["scan_status"] != "FAILED"
+    assert report["authentication_status"] == "NOT_REQUIRED"
+    assert report["summary"]["termination_reason"] != "SESSION_EXPIRED"
+    assert report.get("session_interruption") is None
+    assert routes["/03-expired"]["route_state"] == "AUTHENTICATION_BLOCKED"
+    assert routes["/02-authorized"]["route_state"] == "VALIDATED"
+    assert handler.receipts[("GET", "/03-expired")] == 1, "A public 401 page is not retried as a session recovery"

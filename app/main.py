@@ -741,6 +741,7 @@ async def acknowledge_configured_access_gate(
     policy: ReadOnlyPolicy,
     current_url: str,
     acknowledged: set[tuple[str, str]],
+    timeout_ms: int = 5000,
 ) -> bool:
     """Activate one exact administrator-approved gate without inspecting content."""
     rule = policy.access_gate_for(current_url)
@@ -757,7 +758,7 @@ async def acknowledge_configured_access_gate(
         raise RuntimeError("Configured access gate selector is ambiguous")
     if not await control.is_visible():
         return False
-    await control.click(timeout=5000)
+    await control.click(timeout=max(1, timeout_ms))
     acknowledged.add(key)
     return True
 
@@ -1456,6 +1457,10 @@ async def execute_scan(
         # The application must accept the session, not merely return a static
         # HTML shell. Optional/public peripheral 401s are not proof of expiry;
         # explicit session-required APIs and scoped auth exchanges are evidence.
+        # A public scan has no session to expire once the site is ready: a 401
+        # there belongs to its route, not to the whole scan.
+        if application_gate_confirmed and req.authentication.mode == "none":
+            return None
         return next((event for event in reversed(scan_api_events[session_evidence_start:]) if (
             event.get("status") == 401 and not event.get("blocked_by_validator")
             and event.get("phase") != "SESSION_REFRESH"
@@ -3141,6 +3146,7 @@ async def execute_scan(
                                             read_only_policy,
                                             final_raw_url,
                                             acknowledged_access_gates,
+                                            timeout_ms=max(1, round((route_deadline - time.perf_counter()) * 1000)),
                                         )
                                     ):
                                         final_raw_url = page.url
@@ -3334,7 +3340,7 @@ async def execute_scan(
                                         discovered_routes.add(route_key)
                                         queued_routes.add(route_key)
                                         await publish_progress("DISCOVERING_ROUTES", discovered=len(discovered_routes), queued=len(queue))
-                                    elif authentication_classification in {
+                                    elif req.authentication.mode != "none" and authentication_classification in {
                                         "AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "AUTH_FAILED", "AUTH_TIMEOUT",
                                         "SESSION_EXPIRED", "MFA_REQUIRED",
                                     }:
@@ -3636,7 +3642,7 @@ async def execute_scan(
                                 hostname=normalized_host(urlparse(final_raw_url).hostname or ""),
                             )
 
-                        if not application_gate_confirmed or authentication_classification in {
+                        if not application_gate_confirmed or req.authentication.mode != "none" and authentication_classification in {
                             "AUTH_REQUIRED", "AUTHENTICATION_REQUIRED", "AUTH_FAILED", "AUTH_TIMEOUT",
                             "SESSION_EXPIRED", "MFA_REQUIRED",
                         }:
@@ -4060,7 +4066,8 @@ async def execute_scan(
                         )
                         # A blocked authentication request on a later route affects
                         # that route only; bootstrap blocks fail through the gate.
-                        if (session_expired or authentication_classification in {
+                        # On a public scan a login-required page is one route's result.
+                        if (session_expired or req.authentication.mode != "none" and authentication_classification in {
                             "AUTHENTICATION_REQUIRED", "AUTH_REQUIRED",
                             "AUTH_FAILED", "AUTH_TIMEOUT", "MFA_REQUIRED",
                         } or (len(results) == 1 and not application_ready)):
@@ -4707,7 +4714,10 @@ async def execute_scan(
         or summary.get("termination_reason") == "SESSION_EXPIRED" else "COMPLETED"
     )
     report["outcome"] = report["scan_status"]
-    report["authentication_status"] = "AUTHENTICATED" if application_gate_confirmed else "NOT_STARTED"
+    report["authentication_status"] = (
+        "NOT_STARTED" if not application_gate_confirmed else
+        "NOT_REQUIRED" if req.authentication.mode == "none" else "AUTHENTICATED"
+    )
     summary["routes_tested"] = sum(item.get("page_load_status") != "NOT_TESTED" for item in results)
     report["coverage"]["routes_tested"] = summary["routes_tested"]
     await publish_progress(str(report["scan_status"]))

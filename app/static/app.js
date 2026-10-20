@@ -1443,11 +1443,23 @@ function failedAuthenticationReport(report) {
       execution_status:'FAILED',termination_reason:report.authentication_error?.category || 'AUTHENTICATION_FAILED'}};
 }
 
+const FAILURE_TITLES = {
+  CHALLENGE_REQUIRED:'Site challenged the automated browser — validation not started',
+  ACCESS_RESTRICTED:'Site denied access — validation not started',
+  DNS_ERROR:'Site unreachable — validation not started', NETWORK_ERROR:'Site unreachable — validation not started',
+  TLS_ERROR:'TLS verification failed — validation not started', HTTP_ERROR:'Site returned an error — validation not started',
+  APPLICATION_NOT_READY:'Application did not become ready — validation not started',
+  AUTHENTICATION_CONFIGURATION_ERROR:'Scan configuration error — validation not started',
+};
+
 function renderAuthenticationFailure(report) {
   const failed = report.scan_status === 'FAILED' && report.authentication_status === 'FAILED';
   byId('authentication-failure').hidden = !failed;
   if (!failed) { byId('authentication-failure-details').replaceChildren(); return; }
   const error = report.authentication_error || {};
+  // Name what actually stopped the scan; a public site's bot challenge or an
+  // unreachable host is not an authentication failure.
+  byId('authentication-failure-title').textContent = FAILURE_TITLES[error.category] || 'Authentication failed — application validation not started';
   const code = value => typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(value) ? value : 'NOT_RECORDED';
   const evidence = {scan_status:'FAILED',authentication_status:'FAILED',category:code(error.category),
     stage:code(error.stage),route_coverage:'NOT_STARTED',discovered_routes:0,validated_routes:0,tested_routes:0};

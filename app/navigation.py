@@ -735,6 +735,17 @@ async def settle_authentication_navigation(
             page.remove_listener(event, listener)
 
 
+# Generic URL parameters that bot-protection services add to challenge pages.
+BROWSER_CHALLENGE_PARAMETERS = frozenset({"__cf_chl_rt_tk", "__cf_chl_tk", "challenge_token", "captcha_token"})
+
+
+def browser_challenge_signal(url: str) -> bool:
+    try:
+        return bool(BROWSER_CHALLENGE_PARAMETERS & {name.lower() for name in parse_qs(urlparse(url).query)})
+    except (TypeError, ValueError):
+        return False
+
+
 def classify_authentication(
     *,
     authentication_mode: str,
@@ -753,6 +764,10 @@ def classify_authentication(
         return error_classification
     if status == 401:
         return "AUTH_REQUIRED" if authentication_mode == "none" else "AUTH_FAILED"
+    if status in {403, 429, 503} and browser_challenge_signal(final_url):
+        # Bot protection challenged the automated browser. It is never
+        # bypassed and is not an authentication outcome.
+        return "CHALLENGE_REQUIRED"
     if status in {403, 429} or access_restricted:
         return "ACCESS_RESTRICTED"
     if mfa_form:

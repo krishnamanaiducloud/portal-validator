@@ -1088,9 +1088,16 @@ async def activate_semantic_route(
         candidate = handle.as_element()
         if candidate is None:
             return False
-        # Once attempted, a click failure must propagate. Retrying another
-        # control or falling back to goto could duplicate a natural POST.
-        await candidate.click(timeout=min(timeout_ms, 5000))
+        # Check actionability without dispatching anything. A control that never
+        # becomes clickable (covered, collapsed or off screen) leaves the
+        # caller's guarded fallbacks safe. Once the real click is dispatched,
+        # any failure must propagate: retrying a dispatched click or falling
+        # back to goto could duplicate a natural POST.
+        try:
+            await candidate.click(trial=True, timeout=max(1, timeout_ms // 3))
+        except PlaywrightTimeoutError:
+            return False
+        await candidate.click(timeout=max(1, timeout_ms))
         return True
     finally:
         await handle.dispose()

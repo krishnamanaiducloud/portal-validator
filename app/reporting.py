@@ -75,7 +75,11 @@ _AUTHENTICATION_FAILURE_GUIDANCE = {
     "AUTHENTICATION_CONFIGURATION_ERROR": "Ask the operator to verify the configured authentication policy and selected session profile without sharing their contents.",
     "APPLICATION_NOT_READY": "Verify that the authenticated application shell renders and that configured readiness conditions are correct.",
     "ACCESS_RESTRICTED": "The target denied access. Verify permission and any approved access requirements; HTTP 403 alone does not prove a missing login.",
-    "CHALLENGE_REQUIRED": "Complete any permitted access challenge through an authorized workflow; do not bypass the target's browser security.",
+    "CHALLENGE_REQUIRED": (
+        "The site's bot protection challenged the automated browser. The validator never bypasses bot "
+        "protection. To validate this site, ask its owner to allow the validator (for example an allowlist "
+        "or verified-bot rule for the validator's egress address) or use another operator-approved access path."
+    ),
     "TLS_ERROR": "Verify the mounted corporate CA chain and browser trust initialization. Keep certificate verification enabled.",
     "DNS_ERROR": "Check target DNS and the configured destination/network policy before starting a new scan.",
     "NETWORK_ERROR": "Check target connectivity and network policy before starting a new scan.",

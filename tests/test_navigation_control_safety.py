@@ -412,6 +412,9 @@ async def test_semantic_click_failure_after_dispatch_does_not_retry_another_cont
         real_click = ElementHandle.click
 
         async def dispatched_click_then_timeout(locator, *args, **kwargs):
+            if kwargs.get("trial"):
+                # Actionability check only; nothing is dispatched.
+                return await real_click(locator, *args, **kwargs)
             await real_click(locator, *args, **kwargs)
             await page.wait_for_function("window.completed === true", timeout=1000)
             raise PlaywrightTimeoutError("fixture deadline after real browser click dispatch")
@@ -425,3 +428,19 @@ async def test_semantic_click_failure_after_dispatch_does_not_retry_another_cont
         assert page.url == "https://portal.example/"
         assert await page.evaluate("window.activations") == 1
         assert post_requests == ["https://portal.example/api/read"]
+
+
+@pytest.mark.asyncio
+async def test_unclickable_semantic_link_is_never_dispatched_and_falls_back(monkeypatch):
+    """A covered link fails only the actionability trial; no click is dispatched."""
+    body = '''<main>
+      <a href="/reports" onclick="window.activations=(window.activations||0)+1">Reports</a>
+      <div style="position:fixed;inset:0;background:#fff">Overlay that intercepts pointer events</div>
+    </main>'''
+    async with _local_page(body) as page:
+        await perform_route_navigation(
+            page, "https://portal.example/reports", SEMANTIC_LINK_NAVIGATION, 1500,
+            label="Reports", source="a",
+        )
+        assert await page.evaluate("window.activations || 0") == 0
+        assert page.url == "https://portal.example/reports"
