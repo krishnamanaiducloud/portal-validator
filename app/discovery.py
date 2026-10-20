@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import Error as PlaywrightError
 
 
 DOCUMENT_NAVIGATION = "DOCUMENT_NAVIGATION"
@@ -552,6 +553,17 @@ NAVIGATION_DOM_HELPERS = r"""
     return !!target && (target.matches('nav,[role="navigation"],[role="menu"],[role="menubar"]') ||
       !!target.querySelector('[role="menuitem"],[aria-expanded]'));
   };
+  // A utility popover outside the primary navigation (notifications, profile,
+  // help, app switcher) opens a panel of its own content. It is validated as
+  // a view, and still explored for links like any other menu. Dropdowns of
+  // the primary navigation remain link discovery only.
+  const isPopoverView = element => {
+    if (element.matches('summary') || element.getAttribute('role') === 'tab') return false;
+    if (composedClosest(element, 'nav,[role="navigation"],[role="menubar"],[role="menu"],[role="tree"],aside')) return false;
+    const panel = controlledPanel(element);
+    const target = panel && element.getRootNode().querySelector('#' + CSS.escape(panel));
+    return !!target && !target.contains(element) && !element.contains(target);
+  };
   const navigationParents = element => {
     const chains = [];
     const openers = window.__portalValidatorPanelOpeners;
@@ -623,7 +635,7 @@ NAVIGATION_DOM_HELPERS = r"""
   const describeView = (element, includeHidden = false) => {
     if (!isNavigationControl(element) || (!includeHidden && !visibleControl(element)) || composedClosest(element, 'form') || element.hasAttribute('disabled') ||
         element.getAttribute('aria-disabled') === 'true' || element.hasAttribute('download') ||
-        unsafeAction(element) || isMenuExpander(element)) return null;
+        unsafeAction(element) || (isMenuExpander(element) && !isPopoverView(element))) return null;
     const raw = routeAttribute(element);
     if (raw && (!raw.startsWith('#') || raw.startsWith('#/') || raw.startsWith('#!/'))) return null;
     const label = controlLabel(element);
@@ -646,7 +658,8 @@ NAVIGATION_DOM_HELPERS = r"""
     // Framework-generated DOM IDs remain locators, not stable view identity.
     const identity = JSON.stringify([navigationParents(element), label, element.getAttribute('role') || 'navigation']);
     return {panel:panel || ('navigation:' + label), identity, label, id:element.id || '', kind:panel ? 'panel' : 'navigation',
-      scope, ancestors:JSON.stringify(navigationParents(element))};
+      scope, ancestors:JSON.stringify(navigationParents(element)),
+      ...(isMenuExpander(element) ? {presentation:'popover'} : {})};
   };
 """
 
@@ -690,7 +703,8 @@ async (maximumScrolls) => {
         seen.add(key);
         if (!window.__portalValidatorViewSourceUrls.has(element))
           window.__portalValidatorViewSourceUrls.set(element, window.location.href);
-        values.push({url: window.__portalValidatorViewSourceUrls.get(element), label, source:'ui-tab',
+        values.push({url: window.__portalValidatorViewSourceUrls.get(element), label,
+          source:view.presentation === 'popover' ? 'ui-popover' : 'ui-tab',
           accessibleName:ariaLabel, labelSource:ariaLabel ? 'aria-label' : 'visible-text',
           safetyLabel:[ariaLabel, element.textContent, element.getAttribute('title')].filter(Boolean).join(' '),
           navigationHierarchy:navigationParents(element), viewControl:view});
@@ -809,7 +823,7 @@ EXPAND_SAFE_NAVIGATION_SCRIPT = r"""
             !(exploredSignatures.size && exploredSignatures.has(controlSignature(element))) &&
             (isNavigationControl(element) || element.matches(selector)) &&
             (!raw || (raw.startsWith('#') && !raw.startsWith('#/') && !raw.startsWith('#!/'))) &&
-            !describeView(element)) values.push(element);
+            !(describeView(element) && !isMenuExpander(element))) values.push(element);
       }
       for (const element of root.querySelectorAll('*')) {
         if (element.shadowRoot) visit(element.shadowRoot);
@@ -1364,6 +1378,25 @@ async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> No
                 arg={"element": element, "previous": evidence}, timeout=remaining_ms(),
             )
             return
+        if control.get("presentation") == "popover" and await element.evaluate(
+            "e => e.getAttribute('aria-expanded') === 'true'",
+        ):
+            # Left open earlier (for example by menu exploration). Toggle it
+            # closed so this activation observes the panel's own load; a
+            # popover that will not close is validated as it is.
+            await element.click(timeout=remaining_ms())
+            try:
+                await page.wait_for_function(
+                    "e => e.getAttribute('aria-expanded') !== 'true'",
+                    arg=element, timeout=min(remaining_ms(), 2000),
+                )
+            except PlaywrightTimeoutError:
+                await element.evaluate(
+                    "element => {" + NAVIGATION_DOM_HELPERS +
+                    "(window.__portalValidatorOpenPopovers ||= []).push(element);}",
+                )
+                page._portal_validator_open_popovers = True
+                return
         evidence = await element.evaluate(r"""(e, panel) => {
           const p = e.getRootNode().querySelector('#' + CSS.escape(panel));
           const style = p && getComputedStyle(p), rect = p && p.getBoundingClientRect();
@@ -1386,8 +1419,13 @@ async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> No
         await element.evaluate(
             "element => {" + NAVIGATION_DOM_HELPERS +
             "const panel=controlledPanel(element);const target=panel && element.getRootNode().querySelector('#'+CSS.escape(panel));"
-            "if(target && visibleControl(target)) bindNavigationPanel(element,target);}",
+            "if(target && visibleControl(target)) bindNavigationPanel(element,target);"
+            # Remember popovers this validator opened so the next route can
+            # close them; an open overlay must not cover the next control.
+            "if(isMenuExpander(element)) (window.__portalValidatorOpenPopovers ||= []).push(element);}",
         )
+        if control.get("presentation") == "popover":
+            page._portal_validator_open_popovers = True
     finally:
         await handle.dispose()
 
@@ -1448,6 +1486,32 @@ def resolve_view_target(page, view_control: dict[str, str] | None = None):
     return frames[0]
 
 
+CLOSE_VALIDATOR_POPOVERS_SCRIPT = r"""
+() => {
+  const opened = window.__portalValidatorOpenPopovers || [];
+  window.__portalValidatorOpenPopovers = [];
+  let closed = 0;
+  // Toggle back only popovers this validator itself opened and that are
+  // still expanded: the inverse of an already approved harmless activation.
+  for (const element of opened) {
+    if (element.isConnected && element.getAttribute('aria-expanded') === 'true') { element.click(); closed += 1; }
+  }
+  return closed;
+}
+"""
+
+
+async def close_validator_popovers(page) -> None:
+    if not getattr(page, "_portal_validator_open_popovers", False):
+        return
+    page._portal_validator_open_popovers = False
+    try:
+        await page.evaluate(CLOSE_VALIDATOR_POPOVERS_SCRIPT)
+    except PlaywrightError:
+        # A navigated or closed document has no open popover to close.
+        pass
+
+
 async def perform_route_navigation(
     page,
     url: str,
@@ -1467,6 +1531,7 @@ async def perform_route_navigation(
     Playwright correctly returns no Response for same-document transitions; callers use
     the returned boolean as the navigation signal instead of fabricating an HTTP result.
     """
+    await close_validator_popovers(page)
     if mode == UI_VIEW_ACTIVATION:
         if view_control is None:
             raise RuntimeError("UI view activation requires an observed tab control")
