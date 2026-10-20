@@ -203,3 +203,49 @@ destinations and every non-authentication mutation remain blocked.
   - the identity-host callout and one-click approval;
   - grouped diagnostics;
   - the new table columns.
+
+## Verification
+
+- Host suite (WSL2, Python 3.14): 1197 passed. The one failing safety test
+  (a dispatched click must never be retried) led to the trial-click design.
+  It passes now, together with 79 navigation, discovery, challenge and SSO
+  tests. Frontend `tests/ui_check.py` passed.
+- Debug image (Python 3.15, arbitrary UID, read-only root, all capabilities
+  dropped): 219 of 219 tests passed, covering SSO round trips, challenges,
+  navigation safety, session recovery and renewal, authentication-first,
+  public access, SSO, UI views, broad discovery, trust, health and the app.
+- `tests/release_image_smoke.py` passed for both images.
+- Real public scans with the final code are listed under *Generic validation
+  of any website* above.
+
+## Published images
+
+Built from commit `7924f035f2a9b2852c355e763fae15cc3d9122e3` for
+`linux/amd64`. Later commits change documentation and the Deployment
+reference only.
+
+| Image | Digest | Compressed size |
+|---|---|---|
+| `docker.io/mohankrishna999/portal-validator:1.13.4` | `sha256:e63a38154e24c49fecfde3e2632ac7c06389d3a672db20f89b99e728d2a624dd` | 503.7 MB |
+| `docker.io/mohankrishna999/portal-validator:1.13.4-debug` | `sha256:e646fb5dec1d2c9420716a1b7ce4b517db36c5fbb505874deee2c832957840e1` | 527.3 MB |
+
+Both digests were confirmed from the registry. Each image was pulled by digest
+and reported version 1.13.4, the commit above and `VERIFIED` source integrity.
+`openshift/deployment.yaml` pins the production image by tag and digest. No
+cluster rollout was performed.
+
+## Security scan results
+
+Trivy 0.72.0 (DB 2026-10-19 19:08 UTC) and Grype 0.104.0 (DB 2026-10-19 06:39
+UTC):
+
+| Check | `1.13.4` | `1.13.4-debug` |
+|---|---|---|
+| Trivy Critical/High/Medium/Low | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| Trivy secrets | 0 | 0 |
+| Grype Critical/High/Medium/Low | 0 / 0 / 3 / 0 | 0 / 0 / 3 / 0 |
+| SBOM packages (SPDX) | 121 | 172 |
+
+The three Grype findings are the unchanged, still-unfixed `alsa-lib
+1.2.16.1-r3` CVEs, carried forward under the exception documented in
+`docs/RELEASE-1.13.0.md`.
