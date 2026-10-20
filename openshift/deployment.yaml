@@ -49,9 +49,9 @@ spec:
         - name: PORTAL_VALIDATOR_MANAGED_CA_BUNDLE
           value: /etc/portal-validator/certs/ca-bundle.crt
         - name: PORTAL_VALIDATOR_ADDITIONAL_CA_DIRS
-          value: /etc/portal-validator/zscaler
+          value: /etc/portal-validator/corporate-ca
         - name: PORTAL_VALIDATOR_BROWSER_CA_DIRS
-          value: /etc/portal-validator/zscaler
+          value: /etc/portal-validator/corporate-ca
         - name: RUNTIME_CA_BUNDLE
           value: /tmp/portal-validator-home/.portal-validator/ca-bundle.crt
         - name: CHROMIUM_NSS_DB
@@ -63,8 +63,8 @@ spec:
         - name: trusted-ca
           mountPath: /etc/portal-validator/certs
           readOnly: true
-        - name: zscaler-ca
-          mountPath: /etc/portal-validator/zscaler
+        - name: corporate-ca
+          mountPath: /etc/portal-validator/corporate-ca
           readOnly: true
         - name: runtime-tmp
           mountPath: /tmp
@@ -85,9 +85,9 @@ spec:
           items:
           - key: ca-bundle.crt
             path: ca-bundle.crt
-      - name: zscaler-ca
+      - name: corporate-ca
         configMap:
-          name: portal-validator-zscaler-ca
+          name: portal-validator-corporate-ca
       - name: runtime-tmp
         emptyDir:
           sizeLimit: 1Gi

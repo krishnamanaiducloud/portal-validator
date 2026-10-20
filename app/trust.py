@@ -23,7 +23,7 @@ PEM_CERTIFICATE_RE = re.compile(
 MAX_BUNDLE_BYTES = 10 * 1024 * 1024
 MAX_CERTIFICATES = 500
 DEFAULT_MANAGED_BUNDLE = "/etc/portal-validator/certs/ca-bundle.crt"
-DEFAULT_ENTERPRISE_CA_DIRECTORY = "/etc/portal-validator/zscaler"
+DEFAULT_ENTERPRISE_CA_DIRECTORY = "/etc/portal-validator/corporate-ca"
 SUPPORTED_CERTIFICATE_SUFFIXES = frozenset({".crt", ".pem", ".cer"})
 MANAGED_NICKNAME_PREFIX = "portal-validator-enterprise-"
 
