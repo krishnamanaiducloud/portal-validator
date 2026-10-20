@@ -51,3 +51,42 @@ that view. These controls appear with discovery source `ui-popover`.
   menubars, menus, trees, `aside`) are still explored for links only.
 - Labels such as *Sign out*, *Delete* or *Submit* are never activated, and
   all requests remain under the read-only network policy.
+
+## Verification
+
+- Host suite (WSL2, Python and Playwright): 1203 passed. This includes the
+  new `tests/test_auxiliary_views.py`, which covers linked documents (same
+  tab and new tab), the notification panel, the profile menu with identity
+  data, and the strict `shell_marker_grace_ms=0` mode.
+- UI smoke (`tests/ui_check.py`): passed. It includes the new *Linked page
+  grace* setting.
+- Debug image (Python 3.15, restricted runtime): 1195 of 1203 passed.
+  - 6 failures are `tests/test_operator_policy_script.py`, which needs
+    `bash`. The image deliberately does not ship it, and these tests pass on
+    the host.
+  - 2 failures were per-test time budgets exceeded under full-suite load:
+    `test_cdk_backdrop_is_closed_with_escape_before_next_top_level_menu` and
+    `test_nested_subtabs_are_validated_with_their_read_only_post`. Rerun in
+    isolation, both passed 3 of 3 times in the 1.13.7 image and in the 1.13.6
+    image, and they pass on the host.
+- `tests/release_image_smoke.py` passed for both images. The debug run used
+  `RELEASE_SMOKE_STARTUP_TIMEOUT=300`.
+
+| Image | Digest | Compressed size |
+|---|---|---|
+| `docker.io/mohankrishna999/portal-validator:1.13.7` | `sha256:644534ce71ae66b638b471a8ef1e2a4f89dc738d5071493c8b8cd65cd22c9c21` | 503.7 MB |
+| `docker.io/mohankrishna999/portal-validator:1.13.7-debug` | `sha256:e7f56b32c669e61a6fce6d11284a96621b061f96e722c2a5614ad35a8896b667` | 527.3 MB |
+
+Both images were built for `linux/amd64` from commit
+`bc447e4528330523a5204e7d11b24845930cf97d`. The digests were confirmed from
+the registry. Each image pulled by digest reported version 1.13.7, that
+commit and `VERIFIED` source integrity.
+
+| Scanner | Result (both images) |
+|---|---|
+| Trivy 0.72.0 | 0 vulnerabilities, 0 secrets |
+| Grype 0.104.0 | 3 Medium: the still-unfixed `alsa-lib 1.2.16.1-r3` CVEs (CVE-2026-90781, CVE-2026-96674, CVE-2026-96675), carried forward under the exception in `docs/RELEASE-1.13.0.md` |
+| Syft | SPDX SBOM generated |
+
+`openshift/deployment.yaml` pins the production image by tag and digest. No
+cluster rollout was performed.
