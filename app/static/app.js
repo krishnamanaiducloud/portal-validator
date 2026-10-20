@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = '1.13.6';
+const FRONTEND_VERSION = '1.13.7';
 // The server pins this exact deferred script with SRI and a hash-versioned URL.
 // Capture currentScript now; it is unavailable in subsequent async callbacks.
 const frontendScript = document.currentScript;
@@ -1823,6 +1823,7 @@ form.addEventListener('submit', async (event) => {
   try {
     payload = {target:byId('target').value.trim(),max_pages:Number(byId('pages').value),max_depth:Number(byId('depth').value),max_redirects:Number(byId('redirects').value),timeout_ms:Number(byId('timeout').value),total_timeout_ms:Number(byId('total-timeout').value),check_links:byId('links').checked,check_console:byId('console').checked,check_resources:byId('resources').checked,check_performance:byId('performance').checked,check_security_headers:byId('headers').checked,allow_subdomains:byId('subdomains').checked,allow_private_networks:byId('private-network').checked,portal_hosts:splitList(byId('portal-hosts').value),resource_hosts:splitList(byId('resource-hosts').value),credential_hosts:splitList(byId('credential-hosts').value),query_parameter_policy:byId('query-policy').value,allowed_query_parameters:splitList(byId('query-parameters').value),slow_page_threshold_ms:Number(byId('slow-threshold').value),render_settle_ms:Number(byId('render-settle').value),max_navigation_actions:Number(byId('navigation-actions').value),max_discovery_scrolls:Number(byId('discovery-scrolls').value),authentication:authenticationPayload(),allow_mutations:false};
     payload.network_settle_cap_ms = Number(byId('network-settle-cap').value);
+    payload.shell_marker_grace_ms = Number(byId('shell-marker-grace').value);
     payload.menu_settle_ms = Number(byId('menu-settle').value);
     payload.reexplore_navigation_each_route = byId('reexplore-navigation').checked;
     payload.session_recovery_attempts = Number(byId('session-recovery-attempts').value);
@@ -1866,7 +1867,7 @@ verifyBuildIdentity();
 // Bounds and defaults come from the backend request model, never from markup.
 const SCAN_SETTING_INPUTS = {max_pages:'pages',max_depth:'depth',max_redirects:'redirects',timeout_ms:'timeout',
   total_timeout_ms:'total-timeout',slow_page_threshold_ms:'slow-threshold',render_settle_ms:'render-settle',
-  min_observation_ms:'min-observation',network_quiet_ms:'network-quiet',network_settle_cap_ms:'network-settle-cap',
+  min_observation_ms:'min-observation',network_quiet_ms:'network-quiet',network_settle_cap_ms:'network-settle-cap',shell_marker_grace_ms:'shell-marker-grace',
   menu_settle_ms:'menu-settle',max_navigation_actions:'navigation-actions',max_discovery_scrolls:'discovery-scrolls',
   per_route_timeout_ms:'per-route-timeout',discovery_timeout_ms:'discovery-timeout',navigation_timeout_ms:'navigation-timeout',
   authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout',

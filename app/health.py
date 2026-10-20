@@ -223,6 +223,18 @@ def meaningful_rendered_content(snapshot: dict[str, Any]) -> bool:
     return bool(snapshot.get("text_length", 0) >= minimum_text or snapshot.get("visible_elements", 0) >= 3)
 
 
+def configured_readiness_satisfied(snapshot: dict[str, Any] | None) -> bool:
+    """The configured shell condition was met, or does not apply to this page.
+
+    It does not apply to a separately loaded document that rendered stable
+    content without ever loading the application shell (for example a linked
+    help or documentation page).
+    """
+    snapshot = snapshot or {}
+    return bool(snapshot.get("configured_readiness_met", True)
+                or snapshot.get("configured_readiness_applicable") is False)
+
+
 def application_shell_ready(snapshot: dict[str, Any] | None) -> bool:
     """Observable rendered readiness, not HTTP 200 or an authentication claim.
 
@@ -232,7 +244,7 @@ def application_shell_ready(snapshot: dict[str, Any] | None) -> bool:
     return bool(
         snapshot
         and snapshot.get("ready_state") in {"interactive", "complete"}
-        and snapshot.get("configured_readiness_met", True)
+        and configured_readiness_satisfied(snapshot)
         and snapshot.get("view_scope_available", True)
         and not snapshot.get("busy_indicators", 0)
         and not snapshot.get("challenge_indicators", 0)
@@ -252,6 +264,7 @@ async def wait_for_render_settle(
     readiness_event: str | None = None,
     view_control: dict[str, str] | None = None,
     network_settle_cap_ms: int = 0,
+    shell_marker_grace_ms: int = 0,
 ) -> dict[str, Any]:
     """Wait for bounded DOM stability and route-scoped network quiet.
 
@@ -259,7 +272,12 @@ async def wait_for_render_settle(
     maximum remains authoritative so polling portals cannot hold a scan open.
     With ``network_settle_cap_ms`` a rendered, DOM-stable view stops waiting
     for network quiet after that long (reason ``DOM_STABLE_NETWORK_ACTIVE``).
+    With ``shell_marker_grace_ms`` (only for a newly loaded document) a page
+    that rendered stable content but never shows the configured application
+    shell condition for that long is a linked document outside the shell
+    (reason ``LINKED_DOCUMENT_RENDERED``), not a page still loading.
     """
+    shell_marker_grace_ms = max(0, int(shell_marker_grace_ms))
     network_settle_cap_ms = max(0, int(network_settle_cap_ms))
     maximum_ms = max(0, int(maximum_ms))
     settle_ms = max(0, int(settle_ms))
@@ -285,6 +303,10 @@ async def wait_for_render_settle(
     capture_intervals: list[tuple[float, float]] = []
     dom_active_until = started
     api_active_until = started
+    # Activity excluding "configured condition not met yet", used when the
+    # condition turns out not to apply to this document.
+    content_active_until = started
+    marker_free_ready_since: float | None = None
 
     def finish(reason: str, now: float, pending: int, generation: int) -> dict[str, Any]:
         elapsed_ms = max(0, round((now - started) * 1000))
@@ -377,6 +399,8 @@ async def wait_for_render_settle(
         if latest["busy_indicators"] or latest["ready_state"] == "loading" or not latest.get("configured_readiness_met", True):
             dom_active_until = capture_started
             application_active_until = max(application_active_until, capture_started)
+        if latest["busy_indicators"] or latest["ready_state"] == "loading" or pending:
+            content_active_until = max(content_active_until, capture_started)
         if generation != last_generation:
             last_generation = generation
             network_quiet_since = now
@@ -385,6 +409,7 @@ async def wait_for_render_settle(
             application_active_until = max(
                 application_active_until, min(now, max(started, last_activity))
             )
+            content_active_until = max(content_active_until, min(now, max(started, last_activity)))
         # Disabling DOM stability confirmation does not disable the separately
         # configured network/minimum observation windows. In particular, an
         # already requested popup document must not disappear before discovery.
@@ -415,9 +440,23 @@ async def wait_for_render_settle(
                 # Background polling keeps the network busy indefinitely; the
                 # rendered view is ready, so do not spend the route budget.
                 return finish("DOM_STABLE_NETWORK_ACTIVE", now, pending, generation)
+            if shell_marker_grace_ms and not latest.get("configured_readiness_met", True):
+                marker_free_ready = application_shell_ready({**latest, "configured_readiness_met": True})
+                if not marker_free_ready:
+                    marker_free_ready_since = None
+                elif marker_free_ready_since is None:
+                    marker_free_ready_since = capture_started
+                elif (dom_stable and observed_minimum
+                      and (now - marker_free_ready_since) * 1000 >= shell_marker_grace_ms):
+                    latest["configured_readiness_applicable"] = False
+                    first_render_ready = marker_free_ready_since
+                    application_active_until = content_active_until
+                    return finish("LINKED_DOCUMENT_RENDERED", now, pending, generation)
         else:
+            marker_free_ready_since = None
             if previous is not None:
                 dom_active_until = capture_started
+                content_active_until = max(content_active_until, capture_started)
                 application_active_until = max(application_active_until, capture_started)
             previous = signature
             stable_since = capture_started

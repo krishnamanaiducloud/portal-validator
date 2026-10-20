@@ -62,6 +62,7 @@ from app.health import (
     api_health_findings,
     assess_page_health,
     application_shell_ready,
+    configured_readiness_satisfied,
     capture_render_health,
     configured_readiness_conditions,
     document_navigation_timing,
@@ -329,6 +330,12 @@ class ScanRequest(BaseModel):
     # network quiet after this long. Polling applications never go quiet;
     # 0 waits for quiet until the readiness budget is exhausted.
     network_settle_cap_ms: int = Field(2000, ge=0, le=BROWSER_TIMER_LIMIT_MS)
+    # A separately loaded document (a hyperlink to a help, documentation or
+    # other non-application page) never shows the application shell's
+    # readiness selector/event. Once it has rendered stable content for this
+    # long without it, validate it as a linked document instead of waiting
+    # for the route timeout. 0 always requires the configured condition.
+    shell_marker_grace_ms: int = Field(2000, ge=0, le=BROWSER_TIMER_LIMIT_MS)
     # Observation after opening a menu during discovery (not route validation).
     menu_settle_ms: int = Field(250, ge=0, le=BROWSER_TIMER_LIMIT_MS)
     max_navigation_actions: int = Field(200, ge=0)
@@ -1232,6 +1239,9 @@ async def execute_scan(
     queued_routes: set[str] = set()
     # (label, menu hierarchy) of entries discovered as real links.
     linked_menu_entries: set[tuple[str, tuple[str, ...]]] = set()
+    # Shared header popovers (notifications, profile, help) appear on every
+    # route; like shared menus they are validated once per scan.
+    queued_popover_views: set[tuple[str, str, str]] = set()
     # Signatures of shared navigation controls already explored in this scan.
     explored_navigation_controls: set[str] | None = (
         None if req.reexplore_navigation_each_route else set()
@@ -1392,6 +1402,16 @@ async def execute_scan(
                 view_keys.add(route_key)
             if route_key in discovered_routes:
                 continue
+            popover_key = None
+            if (route.view_control and route.view_control.get("presentation") == "popover"
+                    and not req.reexplore_navigation_each_route):
+                popover_key = (
+                    str(route.view_control.get("scope", "")),
+                    str(route.view_control.get("identity") or route.view_control.get("panel")),
+                    str(route.view_control.get("label", "")),
+                )
+                if popover_key in queued_popover_views:
+                    continue
             discovered_routes.add(route_key)
             if depth >= req.max_depth:
                 depth_limited_routes.add(route_key)
@@ -1408,6 +1428,8 @@ async def execute_scan(
                 parent_route_id,
             ))
             queued_routes.add(route_key)
+            if popover_key is not None:
+                queued_popover_views.add(popover_key)
             log_event(logging.DEBUG, "LINK_DISCOVERED", scan_id=scan_id,
                       current_url=identity, crawl_depth=depth + 1,
                       navigation_type=route.navigation_mode)
@@ -3289,6 +3311,13 @@ async def execute_scan(
                                         readiness_event=req.readiness_event if dom_target == page else None,
                                         view_control=view_control,
                                         network_settle_cap_ms=req.network_settle_cap_ms,
+                                        # Only a newly loaded document after the
+                                        # shell was proven may lack the shell marker.
+                                        shell_marker_grace_ms=(
+                                            req.shell_marker_grace_ms
+                                            if application_gate_confirmed and dom_target == page and status is not None
+                                            and (req.readiness_selector or req.readiness_event) else 0
+                                        ),
                                     ) if authentication_classification == "PASS" else None
                                     if dom_target != page and render_health is not None and (req.readiness_selector or req.readiness_event):
                                         # The configured application-shell selector lives
@@ -3787,7 +3816,7 @@ async def execute_scan(
                                 slow_page_threshold_ms=req.slow_page_threshold_ms,
                                 performance_enabled=req.check_performance,
                             )
-                            if not render_health.get("configured_readiness_met", True):
+                            if not configured_readiness_satisfied(render_health):
                                 health_findings.append(finding(
                                     "READINESS_NOT_REACHED", "ERROR",
                                     "The configured readiness selector or event was not reached within its budget.",
@@ -4038,8 +4067,9 @@ async def execute_scan(
                             "render_health": render_health,
                             "application_ready": application_ready,
                             "application_readiness": (
-                                "READY" if application_ready else "NOT_TESTED" if render_health is None
-                                else "CONFIGURED_CONDITION_NOT_REACHED" if not render_health.get("configured_readiness_met", True)
+                                "LINKED_DOCUMENT" if application_ready and render_health.get("configured_readiness_applicable") is False
+                                else "READY" if application_ready else "NOT_TESTED" if render_health is None
+                                else "CONFIGURED_CONDITION_NOT_REACHED" if not configured_readiness_satisfied(render_health)
                                 else "RENDER_NOT_READY"
                             ),
                             "authentication_observation": auth_settle,
@@ -4586,7 +4616,7 @@ async def execute_scan(
         "large_js_threshold_bytes", "large_css_font_threshold_bytes",
         "check_links", "check_console", "check_resources", "check_performance", "check_security_headers",
         "allow_subdomains", "allow_private_networks", "max_navigation_actions", "max_discovery_scrolls",
-        "discovery_timeout_ms", "network_settle_cap_ms", "menu_settle_ms", "reexplore_navigation_each_route",
+        "discovery_timeout_ms", "network_settle_cap_ms", "shell_marker_grace_ms", "menu_settle_ms", "reexplore_navigation_each_route",
         "session_refresh_interval_ms", "session_recovery_attempts",
     })
     scan_configuration["authentication_mode"] = req.authentication.mode
