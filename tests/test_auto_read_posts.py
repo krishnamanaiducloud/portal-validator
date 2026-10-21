@@ -127,7 +127,9 @@ def auto_post_site(monkeypatch):
 def auto_request(origin, **overrides):
     values = dict(
         target=origin + "/", allow_private_networks=True, max_pages=1, max_depth=0,
-        timeout_ms=10000, total_timeout_ms=60000, readiness_selector='[data-app-ready="true"]',
+        # Generous budgets: this test asserts policy, not speed, and also runs
+        # inside the slower restricted image under full-suite load.
+        timeout_ms=30000, total_timeout_ms=120000, readiness_selector='[data-app-ready="true"]',
         render_settle_ms=100, min_observation_ms=100, network_quiet_ms=50,
         max_navigation_actions=0, max_discovery_scrolls=0, check_security_headers=False,
     )
