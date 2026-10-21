@@ -1,12 +1,13 @@
 # Portal Validator
 
-Portal Validator 1.13.8 is a read-only browser health validator with optional authentication for public,
+Portal Validator 1.13.9 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
 results without disabling certificate verification.
 
-See [1.13.8 auto-loaded read-only POSTs and session renewal](docs/RELEASE-1.13.8.md),
+See [1.13.9 navigation outcomes, dialogs and scope reporting](docs/RELEASE-1.13.9.md),
+[1.13.8 auto-loaded read-only POSTs and session renewal](docs/RELEASE-1.13.8.md),
 [1.13.7 linked pages, notifications and profile views](docs/RELEASE-1.13.7.md),
 [1.13.6 query-addressed sub-tabs and POST approval review](docs/RELEASE-1.13.6.md),
 [1.13.5 corporate CA directory restored](docs/RELEASE-1.13.5.md),
@@ -54,13 +55,43 @@ Browser navigation and crawling intentionally have different boundaries:
   exact target host and are sent to another portal/API host only when that host
   is explicitly credential-approved. Credential, crawl, and resource scopes
   are independent. Browser cookie domain rules remain in effect.
-- Normal validation permits only GET, HEAD, and OPTIONS. Unexpected mutating
-  requests are observed first, then blocked and reported as
-  `READ_ONLY_MUTATION_BLOCKED`. Main-frame
+- Normal validation permits GET, HEAD, and OPTIONS, plus POSTs the application
+  issues by itself with read-only evidence (see below). PUT, PATCH, DELETE and
+  every other unexpected mutating request are observed first, then blocked and
+  reported as `READ_ONLY_MUTATION_BLOCKED`. Main-frame
   SSO form POSTs are handled separately: they are allowed only inside a detected
   authentication chain and every new destination still passes the network/SSRF
   policy.
 - Only ports 80, 443, 8080, and 8443 are accepted.
+
+### Navigation outcomes
+
+How a route was activated (`navigation_type`) and what observably happened
+(`navigation_outcome`) are reported separately. The outcome comes from browser
+evidence, never from target-specific rules:
+
+| `navigation_outcome` | Evidence | Readiness used |
+|---|---|---|
+| `DOCUMENT_NAVIGATION` | A new main document loaded | Document plus rendered application readiness; a linked page outside the shell after the *Linked page grace* |
+| `HISTORY_NAVIGATION` | `pushState`/`replaceState` route change without a document | Rendered view readiness |
+| `HASH_NAVIGATION` | Fragment route change | Rendered view readiness |
+| `IN_PAGE_ACTIVATION` | Tab, panel or navigation button changed selected state or visible content, URL unchanged | The activated panel's own content |
+| `DIALOG_ACTIVATION` | A control opened the native/ARIA dialog or modal it references | The dialog's content; closed afterwards with Escape or its own close control |
+| `OVERLAY_ACTIVATION` | A header popover (notifications, profile, help) opened its panel | The panel's content; toggled closed afterwards |
+| `POPUP_NAVIGATION` | The activation opened a new tab or window | The new page's readiness, within scope |
+| `IFRAME_NAVIGATION` | A view inside a same-origin frame | The frame's content |
+| `EXTERNAL_NAVIGATION` | The destination is outside the scan scope | Not visited: listed as `SKIPPED_OUT_OF_SCOPE` (not a failure); add the host to *Portal hosts* to validate it |
+| `NO_OBSERVABLE_CHANGE` | The control was activated and neither URL, selected state nor visible content changed (usually the view already shown) | Bounded by *UI activation timeout*; not a failure |
+| `ACTIVATION_TIMEOUT` | The control's referenced panel/dialog never appeared, or the route budget ran out | Reported with `timeout_diagnostics`: expected vs observed outcome, failed phase, per-phase timings and budgets |
+| `POLICY_BLOCKED` | The read-only or network policy blocked the navigation | — |
+
+The summary's `discovery_metrics` reconcile raw discoveries, unique navigation
+targets, merged duplicates and attempted, successful, failed, unchanged and
+skipped activations; each metric's definition is included in the report. Two
+controls with the same label but different destinations or ancestry remain
+separate targets. Scope: the target host (and its `www` form), *Include
+subdomains*, and explicitly approved *Portal hosts* are validated; everything
+else is discovery-only.
 
 ### Passive API observation and read-only policy
 
@@ -390,10 +421,10 @@ runtime files against the image's generated hash manifest.
 ```bash
 docker build --build-arg VCS_REF="$(git rev-parse HEAD)" \
   --build-arg BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -t mohankrishna999/portal-validator:1.13.8 .
+  -t mohankrishna999/portal-validator:1.13.9 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.8 \
-  -t mohankrishna999/portal-validator:1.13.8-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.9 \
+  -t mohankrishna999/portal-validator:1.13.9-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -408,7 +439,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.13.8
+  mohankrishna999/portal-validator:1.13.9
 ```
 
 ## OpenShift

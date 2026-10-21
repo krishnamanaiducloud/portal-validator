@@ -103,7 +103,7 @@ COPY --chown=10001:10001 app ./app
 # Source identity must not invalidate unchanged OS/venv/browser layers.
 ARG VCS_REF=""
 ARG BUILD_TIMESTAMP=""
-LABEL org.opencontainers.image.version="1.13.8" \
+LABEL org.opencontainers.image.version="1.13.9" \
     org.opencontainers.image.revision=$VCS_REF \
     org.opencontainers.image.created=$BUILD_TIMESTAMP
 
