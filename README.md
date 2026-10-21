@@ -1,12 +1,13 @@
 # Portal Validator
 
-Portal Validator 1.13.7 is a read-only browser health validator with optional authentication for public,
+Portal Validator 1.13.8 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
 results without disabling certificate verification.
 
-See [1.13.7 linked pages, notifications and profile views](docs/RELEASE-1.13.7.md),
+See [1.13.8 auto-loaded read-only POSTs and session renewal](docs/RELEASE-1.13.8.md),
+[1.13.7 linked pages, notifications and profile views](docs/RELEASE-1.13.7.md),
 [1.13.6 query-addressed sub-tabs and POST approval review](docs/RELEASE-1.13.6.md),
 [1.13.5 corporate CA directory restored](docs/RELEASE-1.13.5.md),
 [1.13.4 SSO route diagnosis, route states and dashboard](docs/RELEASE-1.13.4.md),
@@ -113,8 +114,19 @@ Set `PORTAL_VALIDATOR_READ_ONLY_POLICY` to JSON, or mount the same JSON and set
 }
 ```
 
-Rules use exact hosts and exact or segment-bounded paths; URL wording, response
-status, and request body never establish safety. An access-gate selector must resolve to one visible,
+Rules use exact hosts and exact or segment-bounded paths. Separately, and on by
+default (`auto_allow_read_only_posts`), a POST the application issues by itself
+(fetch/XHR from an in-scope page to a portal or approved resource host) is allowed
+without a rule when it carries read-only evidence: a GraphQL body of queries
+only, a JSON-RPC read method, or a path that names a read operation (search,
+list, get, query...) and no write operation (save, update, delete, submit,
+export, track, token...). Form submissions, uploads, mutations and anything
+ambiguous stay blocked; response status never establishes safety. The
+application's own session renewal (`auto_allow_session_renewal`, default on) is
+allowed for refresh-token exchanges and session refresh/keepalive endpoints on
+portal hosts, and for refresh-token exchanges to identity hosts that are
+approved, took part in sign-in, or hold the session profile's cookies. See
+[docs/RELEASE-1.13.8.md](docs/RELEASE-1.13.8.md). An access-gate selector must resolve to one visible,
 explicitly approved control, and any non-safe request caused by it still needs
 its own safe-request rule. Authentication POSTs retain their separate narrow
 main-frame authentication-chain exception. Browser-native session refresh runs
@@ -378,10 +390,10 @@ runtime files against the image's generated hash manifest.
 ```bash
 docker build --build-arg VCS_REF="$(git rev-parse HEAD)" \
   --build-arg BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -t mohankrishna999/portal-validator:1.13.7 .
+  -t mohankrishna999/portal-validator:1.13.8 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.7 \
-  -t mohankrishna999/portal-validator:1.13.7-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.8 \
+  -t mohankrishna999/portal-validator:1.13.8-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -396,7 +408,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.13.7
+  mohankrishna999/portal-validator:1.13.8
 ```
 
 ## OpenShift
