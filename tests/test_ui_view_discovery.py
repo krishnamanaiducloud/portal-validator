@@ -150,6 +150,8 @@ async def scan_views(origin, path, *, approve_posts=True, scan_options=None):
             {"method": "POST", "host": "127.0.0.1", "path": "/api/read/reports"},
             {"method": "POST", "host": "127.0.0.1", "path": "/api/read/activity"},
         ] if approve_posts else [],
+        # Explicit approval semantics: no automatic read-only inference.
+        auto_allow_read_only_posts=False,
     )
     values.update(scan_options or {})
     return await execute_scan(ScanRequest(**values))

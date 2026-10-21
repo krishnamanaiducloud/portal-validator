@@ -22,6 +22,7 @@ SAFE_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 PUBLIC_POLICY_NAMES = {
     "APPROVED_READ_POST": "APPROVED_READ_ONLY",
     "APPROVED_READ_REQUEST": "APPROVED_READ_ONLY",
+    "INFERRED_READ_POST": "AUTO_READ_ONLY",
     "BLOCKED_MUTATION": "READ_ONLY_BLOCKED",
     "READ_ONLY_BLOCK": "READ_ONLY_BLOCKED",
 }
@@ -39,6 +40,7 @@ SENSITIVE_PATH_LABELS = frozenset(
 POLICY_CLASSIFICATIONS = frozenset({
     "APPROVED_READ_POST",
     "APPROVED_READ_REQUEST",
+    "INFERRED_READ_POST",
     "SESSION_REFRESH",
     "ACCESS_GATE",
 })
@@ -140,7 +142,7 @@ def classify_traffic(
         "/analytics", "/beacon", "/collect", "/metrics", "/telemetry",
     )):
         return "TELEMETRY"
-    if classification in {"APPROVED_READ_POST", "APPROVED_READ_REQUEST"} or normalized_path.startswith("/api/") or normalized_path.endswith("/graphql"):
+    if classification in {"APPROVED_READ_POST", "APPROVED_READ_REQUEST", "INFERRED_READ_POST"} or normalized_path.startswith("/api/") or normalized_path.endswith("/graphql"):
         return "APPLICATION_API"
     return "UNCLASSIFIED_API"
 
@@ -265,7 +267,8 @@ def summarize_post_observation(events: list[dict[str, Any]]) -> dict[str, int]:
             event.get("policy_classification") or event.get("request_classification") or ""
         )
         approved = (
-            classification in {"APPROVED_READ_POST", "APPROVED_READ_REQUEST", "APPROVED_READ_ONLY"}
+            classification in {"APPROVED_READ_POST", "APPROVED_READ_REQUEST", "APPROVED_READ_ONLY",
+                               "INFERRED_READ_POST", "AUTO_READ_ONLY"}
             and not event.get("blocked_by_validator")
             and event.get("policy_decision") not in {"BLOCK", "PENDING"}
         )
@@ -299,6 +302,8 @@ def classify_post_observation(event: dict[str, Any]) -> list[str]:
     )
     if approved:
         labels.append("POST_READ_ONLY_APPROVED")
+        if classification in {"INFERRED_READ_POST", "AUTO_READ_ONLY"}:
+            labels.append("POST_READ_ONLY_AUTO_ALLOWED")
     elif authentication:
         labels.append("POST_AUTH_BOOTSTRAP")
     else:
@@ -524,6 +529,71 @@ def is_read_only_graphql_body(body: str | None) -> bool:
     except (ValueError, TypeError, GraphQLError, RecursionError):
         # Parser exception messages may include source payloads: never expose them.
         return False
+
+
+# Read-only inference for POST requests the application issues on its own
+# (fetch/XHR while a view loads). It is deliberately lexical and conservative:
+# a read word with no write word anywhere in the path (or JSON-RPC method).
+READ_OPERATION_WORDS = frozenset({
+    "search", "searches", "query", "queries", "list", "lists", "listing", "get", "find", "fetch",
+    "lookup", "lookups", "filter", "filters", "read", "load", "view", "views", "count", "counts",
+    "summary", "summaries", "stats", "statistics", "details", "detail", "info", "browse",
+    "retrieve", "preview", "facets", "suggest", "suggestions", "autocomplete", "typeahead",
+    "aggregate", "aggregates", "aggregation", "aggregations", "resolve", "describe", "inquiry",
+})
+WRITE_OPERATION_WORDS = frozenset({
+    "create", "update", "updates", "delete", "remove", "save", "submit", "set", "add", "insert",
+    "upsert", "patch", "put", "approve", "reject", "cancel", "send", "mark", "ack", "acknowledge",
+    "archive", "assign", "unassign", "upload", "import", "export", "execute", "exec", "run", "start",
+    "stop", "restart", "deploy", "logout", "signout", "login", "signin", "register", "signup",
+    "subscribe", "unsubscribe", "pay", "payment", "purchase", "checkout", "transfer", "reset",
+    "change", "modify", "edit", "write", "publish", "unpublish", "enable", "disable", "lock",
+    "unlock", "move", "copy", "merge", "close", "track", "collect", "beacon", "telemetry",
+    "analytics", "log", "feedback", "comment", "like", "vote", "rate", "share", "invite",
+    "revoke", "grant", "token", "refresh", "renew", "sync", "process", "trigger", "schedule",
+    "book", "reserve", "claim", "accept", "decline", "confirm", "complete", "apply", "generate",
+    "password", "mutation", "mutate", "command", "action", "actions", "batch", "bulk",
+})
+_CAMEL_BOUNDARY_RE = re.compile(r"([a-z0-9])([A-Z])")
+
+
+def operation_words(text: str) -> set[str]:
+    spaced = _CAMEL_BOUNDARY_RE.sub(r"\1 \2", unquote(text or ""))
+    return {word for word in re.split(r"[^a-z0-9]+", spaced.lower()) if word}
+
+
+def inferred_read_only_post(url: str, body: str | None, content_type: str | None = None) -> str | None:
+    """Evidence that an application-issued POST only reads data, else None.
+
+    Grants nothing by itself: the caller additionally requires a fetch/XHR
+    from an in-scope page to an in-scope host. Uploads, ambiguous names and
+    anything carrying a write word are never inferred as read-only.
+    """
+    if "multipart/" in (content_type or "").lower():
+        return None
+    try:
+        path = urlparse(url).path or "/"
+    except ValueError:
+        return None
+    words = operation_words(path)
+    if words & WRITE_OPERATION_WORDS:
+        return None
+    if isinstance(body, str) and body and is_read_only_graphql_body(body):
+        return "GRAPHQL_QUERY"
+    if "graphql" in words:
+        # A GraphQL endpoint is read-only only for proven query documents.
+        return None
+    if isinstance(body, str) and body.lstrip().startswith("{") and len(body) <= 65536:
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            payload = None
+        method = payload.get("method") if isinstance(payload, dict) else None
+        if isinstance(method, str) and "jsonrpc" in payload:
+            method_words = operation_words(method)
+            return ("JSON_RPC_READ" if method_words & READ_OPERATION_WORDS
+                    and not method_words & WRITE_OPERATION_WORDS else None)
+    return "READ_OPERATION_PATH" if words & READ_OPERATION_WORDS else None
 
 
 @dataclass(frozen=True)

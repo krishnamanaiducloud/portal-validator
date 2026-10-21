@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -241,6 +242,55 @@ def oauth_refresh_grant_signal(post_data: str | None) -> bool:
     if not oauth_token_form_signal(post_data):
         return False
     return parse_qs(post_data or "", keep_blank_values=True).get("grant_type", [""])[0] == "refresh_token"
+
+
+def json_refresh_grant_signal(post_data: str | None) -> bool:
+    """A JSON-encoded refresh-token exchange (many SPAs and API gateways).
+
+    Requires an actual refresh token value; sign-in fields never qualify.
+    """
+    if not post_data or len(post_data) > 64 * 1024 or not post_data.lstrip().startswith("{"):
+        return False
+    try:
+        payload = json.loads(post_data)
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    keys = {str(key).lower().replace("_", "").replace("-", ""): value for key, value in payload.items()}
+    if {"password", "username", "code", "otp"} & set(keys):
+        return False
+    token = keys.get("refreshtoken")
+    grant = keys.get("granttype")
+    return bool(isinstance(token, str) and token.strip() and grant in (None, "refresh_token"))
+
+
+RENEWAL_PATH_WORDS = frozenset({"refresh", "renew", "renewal", "keepalive", "heartbeat", "extend", "silent"})
+SESSION_PATH_WORDS = frozenset({
+    "token", "tokens", "session", "sessions", "auth", "oauth", "oauth2", "oidc", "jwt", "sso",
+    "identity", "access", "login",
+})
+NOT_RENEWAL_PATH_WORDS = frozenset({
+    "logout", "signout", "revoke", "register", "signup", "password", "delete", "remove",
+})
+
+
+def session_renewal_path_signal(url: str) -> bool:
+    """A portal endpoint whose name says it renews/keeps alive the session."""
+    try:
+        path = urlparse(url).path or ""
+    except ValueError:
+        return False
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", path)
+    words = {word for word in re.split(r"[^a-z0-9]+", spaced.lower()) if word}
+    if "keep" in words and "alive" in words:
+        words.add("keepalive")
+    return bool(words & RENEWAL_PATH_WORDS and words & SESSION_PATH_WORDS
+                and not words & NOT_RENEWAL_PATH_WORDS)
+
+
+def refresh_token_exchange_signal(post_data: str | None) -> bool:
+    return oauth_refresh_grant_signal(post_data) or json_refresh_grant_signal(post_data)
 
 
 @dataclass

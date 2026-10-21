@@ -486,6 +486,8 @@ async def test_full_scan_natural_spa_post_observer_policy_network_and_report(pro
             "method": "POST", "host": "127.0.0.1", "path": "/api/query",
             "description": "Application owner approved fixture read query",
         }] if approve_post else []),
+        # Explicit approval semantics: no automatic read-only inference.
+        auto_allow_read_only_posts=False,
     )
     report = await execute_scan(request)
     assert report["summary"]["routes_validated"] == route_count + 1, [
@@ -548,6 +550,7 @@ async def test_disabled_resource_checks_do_not_hide_scan_wide_read_only_blocks(p
         target=origin, allow_private_networks=True, max_pages=2, max_depth=2,
         timeout_ms=5000, render_settle_ms=500, max_navigation_actions=0,
         max_discovery_scrolls=0, check_security_headers=False, check_resources=False,
+        auto_allow_read_only_posts=False,
     ))
     post = next(item for item in report["api_inventory"] if item["method"] == "POST")
     assert post["calls"] == 7 and post["blocked_calls"] == 7 and post["allowed_calls"] == 0
@@ -573,6 +576,7 @@ async def test_actual_scan_read_post_health_matches_real_target_response(product
         approved_read_post_operations=([{
             "method": "POST", "host": "127.0.0.1", "path": "/api/query",
         }] if approved else []),
+        auto_allow_read_only_posts=False,
     ))
     post = next(item for item in report["api_inventory"] if item["method"] == "POST")
     route = next(item for item in report["results"] if item["url"].endswith("#/route-1"))
@@ -768,3 +772,22 @@ async def test_http_404_subresource_is_preserved_as_nonblocking_owned_warning(pr
     assert detail["content_type"] == "text/plain"
     assert "fixture-private-mime" not in json.dumps(report)
     assert report["summary"]["healthy_routes"] == 2 and report["summary"]["failed_pages"] == 0
+
+
+@pytest.mark.asyncio
+async def test_default_scan_allows_the_naturally_issued_read_query_but_never_writes(production_spa):
+    """With automatic read-only inference (the default), the SPA's own
+    POST /api/query reaches the target while PUT/PATCH/DELETE stay blocked."""
+    origin, handler = production_spa
+    async with async_playwright() as playwright:
+        if not Path(playwright.chromium.executable_path).is_file():
+            pytest.skip("matching Playwright Chromium is not installed on this host")
+    report = await execute_scan(ScanRequest(
+        target=origin, allow_private_networks=True, max_pages=2, max_depth=2,
+        timeout_ms=5000, render_settle_ms=500, max_navigation_actions=0,
+        max_discovery_scrolls=0, check_security_headers=False,
+    ))
+    post = next(item for item in report["api_inventory"] if item["method"] == "POST")
+    assert post["endpoint"] == "/api/query" and post["allowed_calls"] == 7
+    assert "POST_READ_ONLY_AUTO_ALLOWED" in post["post_classifications"]
+    assert handler.mutation_calls == 0

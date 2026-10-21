@@ -192,6 +192,24 @@ async def test_renewal_to_an_unapproved_identity_host_stays_blocked(renewal_site
 
 
 @pytest.mark.asyncio
+async def test_renewal_to_the_identity_host_holding_the_session_cookies_is_automatic(renewal_site):
+    """An SSO profile captured after signing in carries the identity host's
+    cookies. Its token renewal needs no separate identity host approval."""
+    await require_browser()
+    origin, profiles, receipts, _home = renewal_site
+    state = json.loads((profiles / "renewing.json").read_text(encoding="utf-8"))
+    state["cookies"].append({"name": "idp-session", "value": "fixture-private-idp", "domain": "localhost",
+                             "path": "/", "expires": -1, "httpOnly": True, "secure": False, "sameSite": "Lax"})
+    (profiles / "renewing.json").write_text(json.dumps(state), encoding="utf-8")
+    report = await execute_scan(renewal_request(origin, authentication_hosts=[]))
+    assert report["scan_status"] != "FAILED", report.get("authentication_error")
+    assert refresh_posts(receipts) == len(report["results"]) >= 2
+    assert report["session"]["renewal_hosts"] == ["localhost"]
+    assert "fixture-private" not in json.dumps(report)
+    assert "fixture-refresh" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
 async def test_periodic_profile_refresh_runs_on_an_internal_tab_during_the_scan(renewal_site):
     await require_browser()
     origin, profiles, receipts, _home = renewal_site

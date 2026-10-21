@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = '1.13.7';
+const FRONTEND_VERSION = '1.13.8';
 // The server pins this exact deferred script with SRI and a hash-versioned URL.
 // Capture currentScript now; it is unavailable in subsequent async callbacks.
 const frontendScript = document.currentScript;
@@ -1826,6 +1826,8 @@ form.addEventListener('submit', async (event) => {
     payload.shell_marker_grace_ms = Number(byId('shell-marker-grace').value);
     payload.menu_settle_ms = Number(byId('menu-settle').value);
     payload.reexplore_navigation_each_route = byId('reexplore-navigation').checked;
+    payload.auto_allow_read_only_posts = byId('auto-read-posts').checked;
+    payload.auto_allow_session_renewal = byId('auto-session-renewal').checked;
     payload.session_recovery_attempts = Number(byId('session-recovery-attempts').value);
     payload.approved_read_post_operations = approvedReadPostOperations();
     Object.assign(payload, phaseConfiguration());
@@ -1882,6 +1884,10 @@ requestJson('/api/scan-settings', {}, 'Scan settings request').then((data) => {
   }
   const capacity = data.deployment?.max_concurrent_scans;
   if (Number.isInteger(capacity) && capacity > 0) byId('concurrency-limit').max = capacity;
+  for (const [name, id] of [['auto_allow_read_only_posts','auto-read-posts'],['auto_allow_session_renewal','auto-session-renewal']]) {
+    const setting = data.settings?.[name];
+    if (setting && typeof setting.default === 'boolean') byId(id).checked = setting.default;
+  }
   const reexplore = data.settings?.reexplore_navigation_each_route;
   if (reexplore && typeof reexplore.default === 'boolean') byId('reexplore-navigation').checked = reexplore.default;
 }).catch(() => notify('Scan setting defaults could not be loaded; the displayed defaults are used.', true));

@@ -82,6 +82,8 @@ from app.navigation import (
     auth_protocol_signal,
     authentication_form_signal,
     oauth_refresh_grant_signal,
+    refresh_token_exchange_signal,
+    session_renewal_path_signal,
 )
 from app.navigation_guard import RedirectResponseGuard
 from app.network import (
@@ -90,6 +92,7 @@ from app.network import (
     PassiveNetworkObserver,
     ReadOnlyPolicy,
     RouteNetworkActivity,
+    inferred_read_only_post,
     is_read_only_graphql_body,
     load_read_only_policy,
     request_identity,
@@ -352,6 +355,17 @@ class ScanRequest(BaseModel):
     # content differs per route).
     reexplore_navigation_each_route: bool = False
     authentication: Authentication = Field(default_factory=Authentication)
+    # POSTs the application issues by itself while a view loads (fetch/XHR,
+    # never a form submission) with concrete read-only evidence: a GraphQL
+    # query, a JSON-RPC read method, or a path naming only a read operation
+    # (search, list, get, query...) and no write operation. Anything else
+    # stays blocked unless explicitly approved.
+    auto_allow_read_only_posts: bool = True
+    # The application's own token renewal: refresh-token exchanges (form or
+    # JSON) and session refresh/keepalive endpoints on portal hosts, and
+    # refresh-token exchanges to identity hosts that are approved, were part
+    # of this scan's sign-in, or already hold this session's cookies.
+    auto_allow_session_renewal: bool = True
     allow_mutations: bool = False
     mutation_acknowledged: bool = False
     mutation_endpoint_allowlist: list[str] = Field(default_factory=list, max_length=50)
@@ -1197,6 +1211,19 @@ async def execute_scan(
             if mounted_state_path is not None and req.authentication.storage_profile else None
         )
         state_generation = state_path.stat().st_mtime_ns if state_path is not None else None
+        # Hosts the session profile signed in to (cookie domains only). The
+        # cookies of unapproved hosts are still never loaded into the scan;
+        # the domain list only evidences where this session was issued.
+        session_cookie_domains: set[str] = set()
+        if state_path is not None:
+            try:
+                for cookie in json.loads(state_path.read_text(encoding="utf-8")).get("cookies", []):
+                    if isinstance(cookie, dict):
+                        domain = normalized_host(str(cookie.get("domain") or "").lstrip("."))
+                        if domain:
+                            session_cookie_domains.add(domain)
+            except (OSError, ValueError, AttributeError):
+                session_cookie_domains.clear()
         refresh_config = (
             load_refresh_config(req.authentication.storage_profile, AUTH_STATE_DIR)
             if req.authentication.mode == "storage_state" and req.authentication.storage_profile
@@ -2475,6 +2502,22 @@ async def execute_scan(
                         cursor = max(cursor, stop)
                     return round(elapsed * 1000)
 
+                async def session_holds_cookies_for(host: str) -> bool:
+                    """The session holds cookies for this host: the SSO profile
+                    was captured after signing in there, or the host set them
+                    during this scan. Only cookie domains are inspected."""
+                    if any(host == domain or host.endswith("." + domain) for domain in session_cookie_domains):
+                        return True
+                    try:
+                        cookies = await context.cookies()
+                    except PlaywrightError:
+                        return False
+                    for cookie in cookies:
+                        domain = str(cookie.get("domain") or "").lstrip(".").lower()
+                        if domain and (host == domain or host.endswith("." + domain)):
+                            return True
+                    return False
+
                 async def route_guard_policy(route: Route):
                     nonlocal navigation_policy_error
                     request = route.request
@@ -2513,6 +2556,23 @@ async def execute_scan(
                             portal_scoped=portal_scoped,
                         )
                     )
+                    renewal_allowed = False
+                    if (
+                        req.auto_allow_session_renewal and not auth_request_allowed and not main_navigation
+                        and approved_operation is None and request.method.upper() == "POST"
+                        and request.resource_type in {"xhr", "fetch"}
+                        and request_url.scheme in {"http", "https"}
+                        and url_in_scan_scope(source_url, root_host, req.allow_subdomains, approved_portal_hosts)
+                    ):
+                        if portal_scoped:
+                            renewal_allowed = bool(
+                                refresh_token_exchange_signal(auth_body) or session_renewal_path_signal(request.url)
+                            )
+                        elif refresh_token_exchange_signal(auth_body):
+                            renewal_allowed = (
+                                host in req.authentication_hosts or host in navigation_hosts
+                                or await session_holds_cookies_for(host)
+                            )
                     if main_navigation:
                         try:
                             validated_host, _ = validate_http_url(request.url)
@@ -2540,7 +2600,7 @@ async def execute_scan(
                             )
                             await abort_by_validator(route, "network_policy")
                             return
-                    elif auth_request_allowed:
+                    elif auth_request_allowed or renewal_allowed:
                         # Explicit protocol-specific authentication approval is
                         # separate from assets, crawling and business POST rules.
                         # It never exempts the actual destination from SSRF.
@@ -2600,10 +2660,48 @@ async def execute_scan(
                                 await abort_by_validator(route, "read_only_mutation_policy")
                                 return
                             auth_navigation_allowed = False
-                        if not auth_navigation_allowed and approved_rule is None:
+                        inferred_read = None
+                        if (
+                            not renewal_allowed and not auth_navigation_allowed and approved_rule is None
+                            and req.auto_allow_read_only_posts and method == "POST" and not main_navigation
+                            and request.resource_type in {"xhr", "fetch"} and (portal_scoped or resource_scoped)
+                            and url_in_scan_scope(source_url, root_host, req.allow_subdomains, approved_portal_hosts)
+                        ):
+                            inferred_read = inferred_read_only_post(
+                                request.url, auth_body, request.headers.get("content-type"),
+                            )
+                        if not renewal_allowed and not inferred_read and not auth_navigation_allowed and approved_rule is None:
                             await abort_by_validator(route, "read_only_mutation_policy")
                             return
-                        if auth_navigation_allowed:
+                        if renewal_allowed:
+                            request_observation[request_identity(request)] = ("SESSION_REFRESH", "AUTHENTICATION")
+                            network_observer.mark_allowed(
+                                request, "SESSION_REFRESH", phase="SESSION_REFRESH", importance="AUTHENTICATION",
+                            )
+                            session_refresh["automatic_renewals"] = int(session_refresh.get("automatic_renewals", 0)) + 1
+                            renewal_hosts = set(session_refresh.get("renewal_hosts", []))
+                            renewal_hosts.add(host)
+                            session_refresh["renewal_hosts"] = sorted(renewal_hosts)
+                            log_event(
+                                logging.INFO, "SESSION_REFRESH_OBSERVED", scan_id=scan_id,
+                                hostname=host, method=method, automatic=True,
+                            )
+                        elif inferred_read:
+                            request_observation[request_identity(request)] = (
+                                request_phase(request), api_importance(request),
+                            )
+                            network_observer.mark_allowed(
+                                request, "INFERRED_READ_POST",
+                                phase=request_phase(request), importance=api_importance(request),
+                            )
+                            log_event(
+                                logging.INFO, "SAFE_APPLICATION_POST_ALLOWED", scan_id=scan_id, hostname=host,
+                                endpoint=api_event.get("endpoint") if api_event else "/", method=method,
+                                classification="INFERRED_READ_POST", evidence=inferred_read,
+                                request_id=api_event.get("request_id") if api_event else None,
+                                route_activation_id=api_event.get("route_activation_id") if api_event else None,
+                            )
+                        elif auth_navigation_allowed:
                             session_renewal = (
                                 not main_navigation and method == "POST"
                                 and oauth_refresh_grant_signal(auth_body)
@@ -2902,7 +3000,11 @@ async def execute_scan(
                         scan_id=scan_id,
                         hostname=normalized_host(urlparse(refresh_config.refresh_url).hostname or ""),
                     )
-                    session_refresh = await refresh_browser_session(page, refresh_config)
+                    automatic_renewal = {
+                        key: session_refresh[key] for key in ("automatic_renewals", "renewal_hosts")
+                        if key in session_refresh
+                    }
+                    session_refresh = {**automatic_renewal, **await refresh_browser_session(page, refresh_config)}
                     log_event(
                         logging.INFO if not session_refresh.get("error") else logging.WARNING,
                         "SESSION_REFRESH_COMPLETED",
@@ -4618,6 +4720,7 @@ async def execute_scan(
         "allow_subdomains", "allow_private_networks", "max_navigation_actions", "max_discovery_scrolls",
         "discovery_timeout_ms", "network_settle_cap_ms", "shell_marker_grace_ms", "menu_settle_ms", "reexplore_navigation_each_route",
         "session_refresh_interval_ms", "session_recovery_attempts",
+        "auto_allow_read_only_posts", "auto_allow_session_renewal",
     })
     scan_configuration["authentication_mode"] = req.authentication.mode
     scan_configuration["readiness_selector_configured"] = bool(req.readiness_selector)
