@@ -73,3 +73,58 @@ include a sanitized `timeout_diagnostics` object containing:
 
 The automatic session renewal from 1.13.8 is unchanged and remains on by
 default. The dashboard now shows how often the session was renewed.
+
+## Verification
+
+- Host suite (WSL2, Python and Playwright): 1234 of 1235 passed, including
+  all 13 navigation-matrix scenarios.
+  - The one failure was
+    `test_disabled_resource_checks_do_not_hide_scan_wide_read_only_blocks`.
+    Its 5 s route budget expired under full-suite load before the fixture
+    issued its POSTs, so its POST lookup found nothing.
+  - Rerun alone, it passed 3 of 3 times. Its whole file, together with the
+    application, settings and matrix tests, then passed on the release
+    version: 115 passed.
+- UI smoke (`tests/ui_check.py`): passed. It covers outcome chips, the
+  dialog filter, the *Out of scope* and *No visible change* filters, the
+  *Session renewals* card, timeout diagnostics in the inspector, and the
+  new setting.
+- Debug image (Python 3.15, restricted runtime): 1229 of 1235 passed. The 6
+  failures are `tests/test_operator_policy_script.py`, which needs `bash`;
+  the image does not ship it.
+- `tests/release_image_smoke.py` passed for both images. The debug run used
+  `RELEASE_SMOKE_STARTUP_TIMEOUT=300`.
+
+| Image | Digest | Compressed size |
+|---|---|---|
+| `docker.io/mohankrishna999/portal-validator:1.13.9` | `sha256:38a21071dd46d65a54e45d9b493978f6cb8cf6bf6997b95753889f7094da0445` | 503.7 MB |
+| `docker.io/mohankrishna999/portal-validator:1.13.9-debug` | `sha256:22dbb21f3320ea07a8d715a5c350595ff9cafce09e8d28998cbe29a5d56b1c2c` | 527.3 MB |
+
+Both images were built for `linux/amd64` from commit
+`0191221f51df3fbc8e8bc049ca6c20fc79f5d038`. The digests were confirmed from
+the registry. Each image pulled by digest reported version 1.13.9, that
+commit and `VERIFIED` source integrity.
+
+| Scanner | Result (both images) |
+|---|---|
+| Trivy 0.72.0 | 0 vulnerabilities, 0 secrets |
+| Grype 0.104.0 | 3 Medium: the still-unfixed `alsa-lib 1.2.16.1-r3` CVEs (CVE-2026-90781, CVE-2026-96674, CVE-2026-96675). Chromium requires libasound. They are carried forward under the exception in `docs/RELEASE-1.13.0.md`, pending an upstream fix. |
+| Syft | SPDX SBOM generated |
+
+`openshift/deployment.yaml` pins the production image by tag and digest. No
+cluster rollout was performed.
+
+## Known limitations
+
+- A popup or dialog is recognised only when its control references the panel
+  (`aria-controls`, `data-bs-target`/`data-target`, `#id`) or uses
+  `aria-haspopup`. Overlays mounted with no such reference are still
+  discovered through their links, but are not validated as views of their
+  own.
+- Navigation scope stays host-based: the target, its `www` form, *Include
+  subdomains* and approved *Portal hosts*. There is no separate
+  per-origin crawl mode.
+- Timing fields that were never measured are `null`. The diagnostics report
+  the elapsed time of failed activations.
+- Not verified against any private enterprise application; all evidence
+  comes from the synthetic fixtures.
