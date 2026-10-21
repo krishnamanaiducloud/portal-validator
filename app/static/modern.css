@@ -113,3 +113,9 @@ input::placeholder,textarea::placeholder{color:#5d6f8c;font-style:italic;opacity
 .post-review-list{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:6px}
 .post-review-list li{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .post-review-list small{color:var(--muted)}
+
+/* Navigation outcome chips */
+.navigation-cell{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
+.navigation-cell small{color:var(--muted);font-size:.72rem;letter-spacing:.02em}
+.chip-info{background:#7cc4ff1f;color:#bfe1ff;border:1px solid #7cc4ff55}
+.outcome-chip{white-space:nowrap}

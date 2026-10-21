@@ -1,4 +1,4 @@
-const FRONTEND_VERSION = '1.13.8';
+const FRONTEND_VERSION = '1.13.9';
 // The server pins this exact deferred script with SRI and a hash-versioned URL.
 // Capture currentScript now; it is unavailable in subsequent async callbacks.
 const frontendScript = document.currentScript;
@@ -164,7 +164,11 @@ const splitList = (value) => value.split(',').map((item) => item.trim()).filter(
 const statusClass = (value) => String(value || 'NOT_TESTED').toLowerCase().replaceAll('_', '-');
 const authOutcomes = new Set(['AUTH_REQUIRED','AUTHENTICATION_REQUIRED','AUTHENTICATION_BLOCKED','AUTH_FAILED','AUTH_TIMEOUT','MFA_REQUIRED','SESSION_EXPIRED']);
 const accessOutcomes = new Set(['ACCESS_RESTRICTED','CHALLENGE_REQUIRED']);
-const failureOutcomes = new Set(['TLS_ERROR','DNS_ERROR','NETWORK_ERROR','HTTP_ERROR','AUTHORIZATION_DENIED','TIMEOUT','NAVIGATION_ERROR','VALIDATION_FAILED','PAGE_RENDER_ERROR','FAIL']);
+const failureOutcomes = new Set(['TLS_ERROR','DNS_ERROR','NETWORK_ERROR','HTTP_ERROR','AUTHORIZATION_DENIED','TIMEOUT','ACTIVATION_TIMEOUT','NAVIGATION_ERROR','VALIDATION_FAILED','PAGE_RENDER_ERROR','FAIL']);
+const NAVIGATION_OUTCOME_LABELS = {DOCUMENT_NAVIGATION:'Page load',HISTORY_NAVIGATION:'History route',HASH_NAVIGATION:'Hash route',
+  IN_PAGE_ACTIVATION:'In-page view',DIALOG_ACTIVATION:'Dialog',OVERLAY_ACTIVATION:'Popover',POPUP_NAVIGATION:'New tab',
+  IFRAME_NAVIGATION:'Frame',EXTERNAL_NAVIGATION:'External',NO_OBSERVABLE_CHANGE:'No change',POLICY_BLOCKED:'Blocked',
+  ACTIVATION_TIMEOUT:'Timed out'};
 const passOutcomes = new Set(['PASS','PASS_WITH_WARNINGS']);
 const terminalStates = new Set(['COMPLETED','PARTIAL','FAILED','CANCELLED']);
 const numericRouteKeys = new Set(['status','load_ms','api_failures','resource_failure_count','console_count','warning_findings','details']);
@@ -599,6 +603,8 @@ function matchesOutcome(item, filter) {
   if (filter === 'auth') return authOutcomes.has(item.classification);
   if (filter === 'access') return accessOutcomes.has(item.classification);
   if (filter === 'not-tested') return item.validation_status === 'NOT_TESTED' || item.page_load_status === 'NOT_TESTED';
+  if (filter === 'out-of-scope') return item.route_state === 'SKIPPED_OUT_OF_SCOPE';
+  if (filter === 'no-change') return item.route_state === 'NO_OBSERVABLE_CHANGE';
   return item.classification === filter;
 }
 
@@ -607,6 +613,7 @@ function matchesDrilldown(item) {
   if (activeDrilldown === 'validated') return item.validation_status !== 'NOT_TESTED' && item.page_load_status !== 'NOT_TESTED' && item.classification !== 'SKIPPED';
   if (activeDrilldown === 'healthy') return passOutcomes.has(item.classification);
   if (activeDrilldown === 'warnings') return item.classification === 'PASS_WITH_WARNINGS';
+  if (activeDrilldown === 'out-of-scope') return item.route_state === 'SKIPPED_OUT_OF_SCOPE';
   if (activeDrilldown === 'failed') return matchesOutcome(item, 'failure');
   if (activeDrilldown === 'auth') return authOutcomes.has(item.classification);
   if (activeDrilldown === 'access') return accessOutcomes.has(item.classification);
@@ -634,7 +641,7 @@ function detailSection(title, value) {
 // credential form inputs, browser storage, or an arbitrary full route object.
 function routeDiagnostics(item) {
   return {
-    overview: {route_name:item.route_name || item.route_label,classification:item.classification,validation_status:item.validation_status,application_ready:item.application_ready,application_readiness:item.application_readiness,access_status:item.access_status,coverage_detail:item.coverage_detail,warning_reasons:routeWarnings(item),finding_details:item.finding_details},
+    overview: {route_name:item.route_name || item.route_label,classification:item.classification,route_state:item.route_state,navigation_outcome:item.navigation_outcome,timeout_diagnostics:item.timeout_diagnostics,validation_status:item.validation_status,application_ready:item.application_ready,application_readiness:item.application_readiness,access_status:item.access_status,coverage_detail:item.coverage_detail,warning_reasons:routeWarnings(item),finding_details:item.finding_details},
     page_load: {status:item.page_load_status,http_status:item.http_status_display ?? item.status ?? null,render_status:item.render_status,failure_dimension:item.failure_dimension,failure_reason:item.failure_reason},
     navigation: {requested_url:item.requested_url,discovered_url:item.discovered_url,final_url:item.final_url,redirects:item.redirects,type:item.navigation_type,status:item.navigation_status,identity:{route_id:item.route_id,view_type:item.view_type,parent_route_id:item.parent_route_id,parent_route_name:item.parent_route_name,navigation_hierarchy:item.navigation_hierarchy,canonical_route:item.canonical_route,display_path:item.display_path,origin:item.origin,host:item.host,pathname:item.pathname,query_sanitized:item.query_sanitized,fragment:item.fragment,spa_route:item.spa_route,route_name:item.route_name,route_name_source:item.route_name_source,route_name_confidence:item.route_name_confidence,discovery_sources:item.discovery_sources,duplicate_discovery_count:item.duplicate_discovery_count,depth:item.depth}},
     authentication: {status:item.authentication_status,stage:item.authentication_stage,observation:item.authentication_observation || item.auth_observation},
@@ -755,7 +762,7 @@ function renderRows() {
   const navigationFilter = byId('navigation-filter').value;
   let rows = [...(lastReport.route_inventory || lastReport.results || [])].map((item) => ({...item, warning_findings:routeWarnings(item).length, console_count:(item.console_errors?.length || 0) + (item.page_errors?.length || 0)})).filter((item) => {
     const haystack = `${item.url} ${item.route_name || ''} ${item.display_path || ''} ${item.document_title || item.title || ''} ${item.navigation_label || item.route_label || ''} ${(item.navigation_hierarchy || []).join(' ')} ${routeDiscoverySources(item)} ${item.classification} ${item.failure_reason || ''}`.toLowerCase();
-    return (!query || haystack.includes(query)) && matchesOutcome(item, filter) && matchesDrilldown(item) && (navigationFilter === 'all' || item.navigation_type === navigationFilter)
+    return (!query || haystack.includes(query)) && matchesOutcome(item, filter) && matchesDrilldown(item) && (navigationFilter === 'all' || item.navigation_type === navigationFilter || item.navigation_outcome === navigationFilter)
       && (!routeStateFilter || item.route_state === routeStateFilter);
   });
   rows.sort((left, right) => {
@@ -772,7 +779,7 @@ function renderRows() {
     const failure = item.failure_reason ? `<small class="failure-reason"><b>${escapeHtml(item.failure_dimension || 'VALIDATION')}</b>${escapeHtml(item.failure_reason)}</small>` : '';
     const hierarchy = item.navigation_hierarchy?.length ? item.navigation_hierarchy.join(' › ') : [item.parent_route_name,item.route_name || item.route_label].filter(Boolean).join(' › ');
     const dimension = (value) => `<span class="dimension-state ${statusClass(value)}">${escapeHtml(value || 'NOT_TESTED')}</span>`;
-    return `<tr class="route-row outcome-${statusClass(item.classification)}"><td><span class="outcome-badge ${statusClass(item.classification)}">${escapeHtml(item.classification)}</span>${failure}</td><td class="route-name-cell"><strong>${escapeHtml(item.route_name || item.route_label || 'Unnamed route')}</strong><small>${escapeHtml(item.route_name_source || 'FALLBACK')}</small></td><td class="route-cell"><span>${escapeHtml(route.host)}</span><code>${escapeHtml(route.path)}</code></td><td>${dimension(item.navigation_type || 'DOCUMENT_NAVIGATION')}</td><td><strong class="http-status">${escapeHtml(item.http_status_display ?? item.status ?? 'N/A')}</strong></td><td><span class="time-value ${item.slow ? 'slow' : ''}">${escapeHtml(item.load_ms ?? '—')} ms</span></td><td>${dimension(item.api_status)}</td><td>${dimension(item.resource_status)}</td><td>${dimension(item.console_status)}</td><td>${dimension(item.authentication_status)}</td><td>${dimension(item.tls_status)}</td><td><strong>${escapeHtml(item.warning_findings || 0)}</strong></td><td><button type="button" class="secondary route-inspect" aria-expanded="false" aria-controls="route-inspector" aria-label="Inspect ${escapeHtml(item.route_name || item.display_path || 'route')}">Inspect</button></td><td class="route-hierarchy-cell">${escapeHtml(hierarchy || 'Not recorded')}${item.parent_route_name ? `<small>Parent: ${escapeHtml(item.parent_route_name)}</small>` : ''}<small>${escapeHtml(item.spa_route || item.route_id || '')}</small></td><td class="route-discovery-cell">${escapeHtml(routeDiscoverySources(item))}</td><td class="route-state-cell">${stateChip(item.route_state)}</td></tr>`;
+    return `<tr class="route-row outcome-${statusClass(item.classification)}"><td><span class="outcome-badge ${statusClass(item.classification)}">${escapeHtml(item.classification)}</span>${failure}</td><td class="route-name-cell"><strong>${escapeHtml(item.route_name || item.route_label || 'Unnamed route')}</strong><small>${escapeHtml(item.route_name_source || 'FALLBACK')}</small></td><td class="route-cell"><span>${escapeHtml(route.host)}</span><code>${escapeHtml(route.path)}</code></td><td class="navigation-cell">${outcomeChip(item)}<small>${escapeHtml(item.navigation_type || 'DOCUMENT_NAVIGATION')}</small></td><td><strong class="http-status">${escapeHtml(item.http_status_display ?? item.status ?? 'N/A')}</strong></td><td><span class="time-value ${item.slow ? 'slow' : ''}">${escapeHtml(item.load_ms ?? '—')} ms</span></td><td>${dimension(item.api_status)}</td><td>${dimension(item.resource_status)}</td><td>${dimension(item.console_status)}</td><td>${dimension(item.authentication_status)}</td><td>${dimension(item.tls_status)}</td><td><strong>${escapeHtml(item.warning_findings || 0)}</strong></td><td><button type="button" class="secondary route-inspect" aria-expanded="false" aria-controls="route-inspector" aria-label="Inspect ${escapeHtml(item.route_name || item.display_path || 'route')}">Inspect</button></td><td class="route-hierarchy-cell">${escapeHtml(hierarchy || 'Not recorded')}${item.parent_route_name ? `<small>Parent: ${escapeHtml(item.parent_route_name)}</small>` : ''}<small>${escapeHtml(item.spa_route || item.route_id || '')}</small></td><td class="route-discovery-cell">${escapeHtml(routeDiscoverySources(item))}</td><td class="route-state-cell">${stateChip(item.route_state)}</td></tr>`;
   }).join('') || `<tr><td colspan="${tableColumns.route.length}" class="empty-table">No routes match this filter.</td></tr>`;
   byId('result-list').querySelectorAll('.route-row').forEach((row, index) => {
     const item = rows[index];
@@ -1227,7 +1234,7 @@ function activateSummary(action, value, button) {
   if (['business-apis','apis','api-failures'].includes(action)) scrollAndFocus(byId('api-inventory'));
   else if (action === 'security') scrollAndFocus(byId('security-recommendations'));
   else if (action === 'resources') scrollAndFocus(byId('resource-inventory'));
-  else if (['discovered','validated','not-tested'].includes(action)) scrollAndFocus(byId('route-results-panel'));
+  else if (['discovered','validated','not-tested','out-of-scope'].includes(action)) scrollAndFocus(byId('route-results-panel'));
   else if (Number(value) === 0) showEvidence('No matching evidence', {message:`No ${action.replaceAll('-', ' ')} were observed during this scan.`});
 }
 
@@ -1330,7 +1337,16 @@ const ROUTE_STATE_LABELS = {
   VALIDATED:['Validated','good'], RENDERED:['Rendered, not ready','warning'], NAVIGATION_ATTEMPTED:['Attempted','warning'],
   AUTHENTICATION_BLOCKED:['Sign-in blocked','bad'], AUTHORIZATION_DENIED:['Access denied','bad'], POLICY_BLOCKED:['Policy blocked','bad'],
   NAVIGATION_FAILED:['Navigation failed','bad'], TIMEOUT:['Timed out','bad'], INCOMPLETE:['Incomplete','warning'], DISCOVERED:['Not visited','muted'],
+  ACTIVATION_TIMEOUT:['Activation timed out','bad'], NO_OBSERVABLE_CHANGE:['No visible change','muted'],
+  SKIPPED_OUT_OF_SCOPE:['Out of scope','muted'],
 };
+
+function outcomeChip(item) {
+  const outcome = item.navigation_outcome;
+  if (!outcome) return `<span class="dimension-state">${escapeHtml(item.navigation_type || 'DOCUMENT_NAVIGATION')}</span>`;
+  const kind = ['ACTIVATION_TIMEOUT','POLICY_BLOCKED'].includes(outcome) ? 'bad' : ['NO_OBSERVABLE_CHANGE','EXTERNAL_NAVIGATION'].includes(outcome) ? 'muted' : 'info';
+  return `<span class="chip chip-${kind} outcome-chip" title="${escapeHtml(outcome)}">${escapeHtml(NAVIGATION_OUTCOME_LABELS[outcome] || outcome)}</span>`;
+}
 
 function stateChip(state) {
   const [label, kind] = ROUTE_STATE_LABELS[state] || [state || 'Not recorded', 'muted'];
@@ -1550,6 +1566,11 @@ function renderReport(report, context = null) {
     ['Discovered routes', report.summary.routes_discovered, '', 'discovered'], ['Validated routes', report.summary.routes_validated, '', 'validated'], ['Healthy', report.summary.healthy_routes, 'good', 'healthy'], ['Passed with warnings', report.summary.routes_with_warnings, report.summary.routes_with_warnings ? 'warn' : '', 'warnings'], ['Failed', report.summary.failed_pages, report.summary.failed_pages ? 'bad' : 'good', 'failed'], ['Auth issues', authIssues, authIssues ? 'auth' : '', 'auth'], ['Access / challenges', accessIssues, accessIssues ? 'warn' : '', 'access'], ['Not tested', notTested, notTested ? 'warn' : 'good', 'not-tested'], ['Unique APIs observed', report.summary.unique_apis || 0, '', 'apis'], ['API failures', report.summary.api_failures, report.summary.api_failures ? 'bad' : 'good', 'api-failures'], ['Resources observed', report.summary.unique_resources || 0, '', 'resources'], ['Resource failures', report.summary.resource_failures, report.summary.resource_failures ? 'warn' : 'good', 'resource-failures'], ['Console issues', report.summary.console_failures || 0, report.summary.console_failures ? 'warn' : 'good', 'console'], ['Slow routes', report.summary.slow_pages, report.summary.slow_pages ? 'warn' : 'good', 'slow'], ['Read-only blocks', report.summary.read_only_blocks, report.summary.read_only_blocks ? 'warn' : 'good', 'read-only'], ['Security recommendations', report.summary.security_recommendations || 0, report.summary.security_recommendations ? 'warn' : 'good', 'security'], ['Scan duration', duration, '', 'validated'],
   ];
   summaryMetrics.splice(8, 0, ['Business APIs', report.summary.business_apis ?? (report.business_api_inventory || []).length, '', 'business-apis']);
+  if (report.summary.external_destinations_discovered) summaryMetrics.splice(8, 0, ['Out of scope', report.summary.external_destinations_discovered, '', 'out-of-scope']);
+  if (report.session && (report.session.automatic_renewals || report.session.periodic_refreshes || report.session.recoveries)) {
+    const renewals = Number(report.session.automatic_renewals || 0) + Number(report.session.periodic_refreshes || 0);
+    summaryMetrics.splice(8, 0, ['Session renewals', renewals, renewals ? 'good' : '', 'validated']);
+  }
   const interruption = report.session_interruption, recoveries = Number(report.session?.recoveries || 0);
   if (interruption && report.summary.termination_reason === 'SESSION_EXPIRED') {
     notify(`The session expired after ${report.summary.routes_validated} validated routes and could not be recovered. Validated routes are kept; the remaining routes were not tested. Refresh the SSO session profile and approve the identity provider host, then scan again.`, true);
@@ -1569,7 +1590,9 @@ function renderReport(report, context = null) {
   const executionStatus = coverage.execution_status || 'FINISHED';
   const accessExplanation = accessIssues ? ` Access restrictions/challenges limited application coverage for ${accessIssues} route${accessIssues === 1 ? '' : 's'}. These responses do not establish an authentication requirement or application failure.` : '';
   const limitations = [...new Set([...(coverage.coverage_reasons || []),...(report.summary.coverage_reasons || [])].map((reason) => typeof reason === 'string' ? reason : reason.message || reason.code).filter(Boolean))];
-  const navigationCounts = coverage.navigation_controls_discovered != null ? ` Navigation controls: ${coverage.navigation_controls_discovered} discovered, ${coverage.navigation_controls_activated || 0} activated, ${coverage.navigation_controls_unresolved || 0} unresolved.` : '';
+  const metrics = report.summary.discovery_metrics;
+  const navigationCounts = metrics ? ` Discovery: ${metrics.raw_discoveries} observations, ${metrics.unique_navigation_targets} unique targets (${metrics.duplicate_discoveries} duplicates merged); ${metrics.attempted_activations} attempted, ${metrics.successful_activations} succeeded, ${metrics.failed_activations} failed, ${metrics.no_observable_change} without visible change, ${metrics.skipped_activations} skipped.`
+    : coverage.navigation_controls_discovered != null ? ` Navigation controls: ${coverage.navigation_controls_discovered} discovered, ${coverage.navigation_controls_activated || 0} activated, ${coverage.navigation_controls_unresolved || 0} unresolved.` : '';
   const scopeExplanation = ' Coverage describes safely reachable routes observed within the configured limits; total application coverage remains unknown.';
   byId('coverage').innerHTML = `<strong>Coverage: ${escapeHtml(coverageStatus)}</strong><span>Execution: ${escapeHtml(executionStatus)}. ${escapeHtml(terminationMessage(coverage))}${escapeHtml(accessExplanation)}${escapeHtml(navigationCounts)}${escapeHtml(scopeExplanation)}</span>${limitations.length ? `<span class="coverage-reasons">Limitations: ${escapeHtml(limitations.join('; '))}</span>` : ''}`;
   byId('scan-diagnostics-content').innerHTML = `${detailSection('Effective scan configuration', report.scan_configuration || report.scan_config || {})}${detailSection('Scan timing breakdown', report.scan_timing || report.scan_timings || {})}`;
@@ -1824,6 +1847,7 @@ form.addEventListener('submit', async (event) => {
     payload = {target:byId('target').value.trim(),max_pages:Number(byId('pages').value),max_depth:Number(byId('depth').value),max_redirects:Number(byId('redirects').value),timeout_ms:Number(byId('timeout').value),total_timeout_ms:Number(byId('total-timeout').value),check_links:byId('links').checked,check_console:byId('console').checked,check_resources:byId('resources').checked,check_performance:byId('performance').checked,check_security_headers:byId('headers').checked,allow_subdomains:byId('subdomains').checked,allow_private_networks:byId('private-network').checked,portal_hosts:splitList(byId('portal-hosts').value),resource_hosts:splitList(byId('resource-hosts').value),credential_hosts:splitList(byId('credential-hosts').value),query_parameter_policy:byId('query-policy').value,allowed_query_parameters:splitList(byId('query-parameters').value),slow_page_threshold_ms:Number(byId('slow-threshold').value),render_settle_ms:Number(byId('render-settle').value),max_navigation_actions:Number(byId('navigation-actions').value),max_discovery_scrolls:Number(byId('discovery-scrolls').value),authentication:authenticationPayload(),allow_mutations:false};
     payload.network_settle_cap_ms = Number(byId('network-settle-cap').value);
     payload.shell_marker_grace_ms = Number(byId('shell-marker-grace').value);
+    payload.ui_activation_timeout_ms = Number(byId('ui-activation-timeout').value);
     payload.menu_settle_ms = Number(byId('menu-settle').value);
     payload.reexplore_navigation_each_route = byId('reexplore-navigation').checked;
     payload.auto_allow_read_only_posts = byId('auto-read-posts').checked;
@@ -1869,7 +1893,7 @@ verifyBuildIdentity();
 // Bounds and defaults come from the backend request model, never from markup.
 const SCAN_SETTING_INPUTS = {max_pages:'pages',max_depth:'depth',max_redirects:'redirects',timeout_ms:'timeout',
   total_timeout_ms:'total-timeout',slow_page_threshold_ms:'slow-threshold',render_settle_ms:'render-settle',
-  min_observation_ms:'min-observation',network_quiet_ms:'network-quiet',network_settle_cap_ms:'network-settle-cap',shell_marker_grace_ms:'shell-marker-grace',
+  min_observation_ms:'min-observation',network_quiet_ms:'network-quiet',network_settle_cap_ms:'network-settle-cap',shell_marker_grace_ms:'shell-marker-grace',ui_activation_timeout_ms:'ui-activation-timeout',
   menu_settle_ms:'menu-settle',max_navigation_actions:'navigation-actions',max_discovery_scrolls:'discovery-scrolls',
   per_route_timeout_ms:'per-route-timeout',discovery_timeout_ms:'discovery-timeout',navigation_timeout_ms:'navigation-timeout',
   authentication_timeout_ms:'authentication-timeout',api_timeout_ms:'api-timeout',readiness_timeout_ms:'readiness-timeout',

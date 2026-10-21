@@ -188,7 +188,7 @@ async def main():
         await page.route("**/api/auth-profiles", profile_list_fixture)
         await page.goto(base_url, wait_until="networkidle")
         build_metadata = await page.evaluate("async () => (await fetch('/api/diagnostics/build', {cache:'no-store'})).json()")
-        assert build_metadata["version"] == "1.13.8"
+        assert build_metadata["version"] == "1.13.9"
         assert await page.evaluate("loadedFrontendSha256") == build_metadata["frontend_sha256"]
         assert await page.evaluate("loadedFrontendIntegrity.startsWith('sha256-')")
         assert "Frontend matched" in await page.locator("#build-summary").text_content()
@@ -244,6 +244,7 @@ async def main():
         assert await page.locator("#render-settle").input_value() == "400"
         assert await page.locator("#network-settle-cap").input_value() == "2000"
         assert await page.locator("#shell-marker-grace").input_value() == "2000"
+        assert await page.locator("#ui-activation-timeout").input_value() == "5000"
         assert await page.locator("#auto-read-posts").is_checked()
         assert await page.locator("#auto-session-renewal").is_checked()
         assert await page.locator("#menu-settle").input_value() == "250"
@@ -654,6 +655,38 @@ async def main():
         await page.locator("#route-inspector .inspect-raw > summary").click()
         assert "UI_VIEW_fixture_1" in await page.locator("#route-inspector").inner_text()
         await page.evaluate("renderReport(window.uiViewOriginalReport); delete window.uiViewOriginalReport")
+        # Observed navigation outcomes: dialogs, no-change activations and
+        # out-of-scope destinations are labelled, filterable and not failures.
+        await page.evaluate("""() => {
+          window.outcomeOriginalReport = lastReport;
+          const baseline = lastReport.results[0];
+          renderReport({...lastReport, summary:{...lastReport.summary, external_destinations_discovered:1},
+            session:{automatic_renewals:2, renewal_hosts:['identity.example.test']},
+            route_inventory:[baseline,
+              {...baseline, route_id:'UI_VIEW_dialog', route_name:'Account details', navigation_type:'UI_VIEW_ACTIVATION',
+               navigation_outcome:'DIALOG_ACTIVATION', route_state:'VALIDATED'},
+              {...baseline, route_id:'UI_VIEW_same', route_name:'Overview again', navigation_type:'UI_VIEW_ACTIVATION',
+               navigation_outcome:'NO_OBSERVABLE_CHANGE', route_state:'NO_OBSERVABLE_CHANGE', classification:'NO_OBSERVABLE_CHANGE',
+               timeout_diagnostics:{content_changed:false, url_changed:false, elapsed_ms:5012}},
+              {...baseline, route_id:'https://partner.example.test/', route_name:'Partner application', status:null,
+               navigation_outcome:'EXTERNAL_NAVIGATION', route_state:'SKIPPED_OUT_OF_SCOPE',
+               classification:'EXTERNAL_DESTINATION_DISCOVERED', validation_status:'SKIPPED_OUT_OF_SCOPE',
+               page_load_status:'NOT_TESTED', failure_reason:'VALIDATION_SKIPPED_OUT_OF_SCOPE'}]});
+        }""")
+        assert "Dialog" in await page.locator("#result-list .outcome-chip").all_text_contents()
+        assert await page.get_by_role("button", name="Show Session renewals evidence").is_visible()
+        assert await page.locator("[data-summary-action='out-of-scope'] strong").inner_text() == "1"
+        await page.locator("#result-filter").select_option("out-of-scope")
+        assert await page.locator("#result-list .route-name-cell strong").all_text_contents() == ["Partner application"]
+        await page.locator("#result-filter").select_option("no-change")
+        assert await page.locator("#result-list .route-name-cell strong").all_text_contents() == ["Overview again"]
+        await page.locator("#result-list .route-inspect").first.click()
+        assert "content_changed" in await page.locator("#route-inspector").inner_text()
+        await page.locator("#result-filter").select_option("all")
+        await page.locator("#navigation-filter").select_option("DIALOG_ACTIVATION")
+        assert await page.locator("#result-list .route-name-cell strong").all_text_contents() == ["Account details"]
+        await page.locator("#navigation-filter").select_option("all")
+        await page.evaluate("renderReport(window.outcomeOriginalReport); delete window.outcomeOriginalReport")
         # All discovered logical routes remain visible even when execution limits
         # prevented validation. They must never be presented as target failures.
         await page.evaluate("""() => {
