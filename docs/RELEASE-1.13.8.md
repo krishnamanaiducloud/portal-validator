@@ -72,3 +72,52 @@ The report's `session` section now records `automatic_renewals` and
 `renewal_hosts`. The setting is *Advanced → Session renewal*
 (`auto_allow_session_renewal`, default on). A refresh-token exchange to a
 host with no relation to the session stays blocked.
+
+## Verification
+
+- Host suite (WSL2, Python and Playwright): 1222 passed. New coverage:
+  - `tests/test_auto_read_posts.py`:
+    - inference rules: 14 allowed and blocked cases;
+    - renewal signals;
+    - an end-to-end portal whose search, list and GraphQL-query POSTs and
+      its own `/api/auth/refresh` reach the server, while the GraphQL
+      mutation and the preference save do not;
+    - strict mode.
+  - `tests/test_session_renewal.py`: renewal to the identity host that holds
+    the session profile's cookies, with no host approval.
+  - `tests/test_scan_post_lifecycle.py`: the production-style fixture's own
+    `POST /api/query` is allowed by default and PUT/PATCH/DELETE stay
+    blocked.
+  - Tests of the explicit-approval semantics now pin
+    `auto_allow_read_only_posts=False`.
+- UI smoke (`tests/ui_check.py`): passed. It includes both new settings.
+- Debug image (Python 3.15, restricted runtime): 1214 of 1222 passed.
+  - 6 failures are `tests/test_operator_policy_script.py`, which needs
+    `bash`; the image does not ship it.
+  - 2 failures were per-test time budgets exceeded under full-suite load:
+    `test_auto_loaded_read_only_posts_reach_the_application` and
+    `test_noop_semantic_navigation_does_not_fabricate_route_transition_or_repeat_post`.
+    Rerun in isolation in the image, both passed 3 of 3 times.
+  - The new test's budgets were widened afterwards. That was a test-only
+    change; the image's runtime code is unchanged.
+- `tests/release_image_smoke.py` passed for both images. The debug run used
+  `RELEASE_SMOKE_STARTUP_TIMEOUT=300`.
+
+| Image | Digest | Compressed size |
+|---|---|---|
+| `docker.io/mohankrishna999/portal-validator:1.13.8` | `sha256:ff663daf247bca5e21946ad52ad217ca98126ba801fcbad34bff7422c8cafff2` | 503.7 MB |
+| `docker.io/mohankrishna999/portal-validator:1.13.8-debug` | `sha256:134d81fc52a4fcf76d964712d1553cd89121e232f064ac4ef70b9cc31498858e` | 527.3 MB |
+
+Both images were built for `linux/amd64` from commit
+`5ba9086f766393349734877cad2041ab68e286a8`. The digests were confirmed from
+the registry. Each image pulled by digest reported version 1.13.8, that
+commit and `VERIFIED` source integrity.
+
+| Scanner | Result (both images) |
+|---|---|
+| Trivy 0.72.0 | 0 vulnerabilities, 0 secrets |
+| Grype 0.104.0 | 3 Medium: the still-unfixed `alsa-lib 1.2.16.1-r3` CVEs (CVE-2026-90781, CVE-2026-96674, CVE-2026-96675), carried forward under the exception in `docs/RELEASE-1.13.0.md` |
+| Syft | SPDX SBOM generated |
+
+`openshift/deployment.yaml` pins the production image by tag and digest. No
+cluster rollout was performed.
