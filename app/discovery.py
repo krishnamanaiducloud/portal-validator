@@ -557,6 +557,15 @@ NAVIGATION_DOM_HELPERS = r"""
   // help, app switcher) opens a panel of its own content. It is validated as
   // a view, and still explored for links like any other menu. Dropdowns of
   // the primary navigation remain link discovery only.
+  const dialogTarget = element => {
+    const panel = controlledPanel(element);
+    const target = panel && element.getRootNode().querySelector('#' + CSS.escape(panel));
+    return target && target.matches('dialog,[role="dialog"],[role="alertdialog"],[aria-modal="true"],.modal') ? target : null;
+  };
+  // A button (or in-page anchor) that opens a dialog it references. The
+  // dialog is a view: activation must reveal it, nothing else is clicked.
+  const isDialogOpener = element => element.matches('button,[role="button"],a[href^="#"]') &&
+    !element.matches('[role="tab"]') && !!dialogTarget(element);
   const isPopoverView = element => {
     if (element.matches('summary') || element.getAttribute('role') === 'tab') return false;
     if (composedClosest(element, 'nav,[role="navigation"],[role="menubar"],[role="menu"],[role="tree"],aside')) return false;
@@ -633,7 +642,7 @@ NAVIGATION_DOM_HELPERS = r"""
       panelVisible:!!target && visibleControl(target)};
   };
   const describeView = (element, includeHidden = false) => {
-    if (!isNavigationControl(element) || (!includeHidden && !visibleControl(element)) || composedClosest(element, 'form') || element.hasAttribute('disabled') ||
+    if (!(isNavigationControl(element) || isDialogOpener(element)) || (!includeHidden && !visibleControl(element)) || composedClosest(element, 'form') || element.hasAttribute('disabled') ||
         element.getAttribute('aria-disabled') === 'true' || element.hasAttribute('download') ||
         unsafeAction(element) || (isMenuExpander(element) && !isPopoverView(element))) return null;
     const raw = routeAttribute(element);
@@ -659,7 +668,7 @@ NAVIGATION_DOM_HELPERS = r"""
     const identity = JSON.stringify([navigationParents(element), label, element.getAttribute('role') || 'navigation']);
     return {panel:panel || ('navigation:' + label), identity, label, id:element.id || '', kind:panel ? 'panel' : 'navigation',
       scope, ancestors:JSON.stringify(navigationParents(element)),
-      ...(isMenuExpander(element) ? {presentation:'popover'} : {})};
+      ...(isDialogOpener(element) ? {presentation:'dialog'} : isMenuExpander(element) ? {presentation:'popover'} : {})};
   };
 """
 
@@ -704,7 +713,7 @@ async (maximumScrolls) => {
         if (!window.__portalValidatorViewSourceUrls.has(element))
           window.__portalValidatorViewSourceUrls.set(element, window.location.href);
         values.push({url: window.__portalValidatorViewSourceUrls.get(element), label,
-          source:view.presentation === 'popover' ? 'ui-popover' : 'ui-tab',
+          source:view.presentation === 'popover' ? 'ui-popover' : view.presentation === 'dialog' ? 'ui-dialog' : 'ui-tab',
           accessibleName:ariaLabel, labelSource:ariaLabel ? 'aria-label' : 'visible-text',
           safetyLabel:[ariaLabel, element.textContent, element.getAttribute('title')].filter(Boolean).join(' '),
           navigationHierarchy:navigationParents(element), viewControl:view});
@@ -1315,9 +1324,35 @@ NAVIGATION_VIEW_COMPLETED_SCRIPT = r"""
 """.replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
 
 
-async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> None:
-    """Activate one evidenced navigation view and verify a real UI transition."""
+class ActivationOutcomeError(RuntimeError):
+    """A safe control was activated, but the expected view did not appear.
+
+    ``classification`` is NO_OBSERVABLE_CHANGE (nothing observable changed:
+    typically the view already displayed) or ACTIVATION_TIMEOUT (the control
+    references a panel/dialog that did not become visible).
+    """
+
+    def __init__(self, classification: str, public_message: str, observed: dict[str, bool] | None = None):
+        super().__init__(public_message)
+        self.classification = classification
+        self.public_message = public_message
+        # What was checked and found unchanged/absent (booleans only).
+        self.observed = dict(observed or {})
+
+
+async def activate_ui_view(
+    page, control: dict[str, str], timeout_ms: int, *, observe_timeout_ms: int | None = None,
+) -> None:
+    """Activate one evidenced navigation view and verify a real UI transition.
+
+    ``observe_timeout_ms`` bounds the wait for the activation's observable
+    outcome, so an activation that changes nothing is reported as such
+    instead of consuming the whole route budget.
+    """
     deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+
+    def observe_ms() -> int:
+        return min(remaining_ms(), observe_timeout_ms) if observe_timeout_ms else remaining_ms()
 
     def remaining_ms() -> int:
         remaining = int((deadline - asyncio.get_running_loop().time()) * 1000)
@@ -1373,10 +1408,18 @@ async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> No
         if control.get("kind") == "navigation":
             evidence = await page.evaluate(NAVIGATION_VIEW_EVIDENCE_SCRIPT, element)
             await element.click(timeout=remaining_ms())
-            await page.wait_for_function(
-                NAVIGATION_VIEW_COMPLETED_SCRIPT,
-                arg={"element": element, "previous": evidence}, timeout=remaining_ms(),
-            )
+            try:
+                await page.wait_for_function(
+                    NAVIGATION_VIEW_COMPLETED_SCRIPT,
+                    arg={"element": element, "previous": evidence}, timeout=observe_ms(),
+                )
+            except PlaywrightTimeoutError as error:
+                raise ActivationOutcomeError(
+                    "NO_OBSERVABLE_CHANGE",
+                    "The control was activated but neither the URL, the selected state nor the visible "
+                    "content changed; it most likely shows the view that was already displayed.",
+                    {"url_changed": False, "selected_state_changed": False, "content_changed": False},
+                ) from error
             return
         if control.get("presentation") == "popover" and await element.evaluate(
             "e => e.getAttribute('aria-expanded') === 'true'",
@@ -1406,28 +1449,42 @@ async def activate_ui_view(page, control: dict[str, str], timeout_ms: int) -> No
               style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0};
         }""", control["panel"])
         await element.click(timeout=remaining_ms())
-        await page.wait_for_function(r"""({element, panel, requiresSelection, wasHidden, panelText}) => {
-          if (!element.isConnected) return false;
-          const target = element.getRootNode().querySelector('#' + CSS.escape(panel));
-          if (!target || target.closest('[hidden],[inert],[aria-hidden="true"]')) return false;
-          const style = getComputedStyle(target), rect = target.getBoundingClientRect();
-          if (style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) return false;
-          if (target.innerText && target.innerText !== panelText) return true;
-          return requiresSelection ? element.getAttribute('aria-selected') === 'true' :
-            wasHidden || element.classList.contains('active') || element.parentElement?.classList.contains('active');
-        }""", arg={"element": element, **control, **evidence}, timeout=remaining_ms())
+        try:
+            await _wait_for_panel(page, element, control, evidence, observe_ms())
+        except PlaywrightTimeoutError as error:
+            raise ActivationOutcomeError(
+                "ACTIVATION_TIMEOUT",
+                f"The control was activated but its {control.get('presentation') or 'panel'} did not "
+                "become visible within the UI activation timeout.",
+                {"panel_visible": False, "dialog_visible": False} if control.get("presentation") == "dialog"
+                else {"panel_visible": False},
+            ) from error
         await element.evaluate(
             "element => {" + NAVIGATION_DOM_HELPERS +
             "const panel=controlledPanel(element);const target=panel && element.getRootNode().querySelector('#'+CSS.escape(panel));"
             "if(target && visibleControl(target)) bindNavigationPanel(element,target);"
-            # Remember popovers this validator opened so the next route can
-            # close them; an open overlay must not cover the next control.
-            "if(isMenuExpander(element)) (window.__portalValidatorOpenPopovers ||= []).push(element);}",
+            # Remember popovers/dialogs this validator opened so the next route
+            # can close them; an open overlay must not cover the next control.
+            "if(isMenuExpander(element)) (window.__portalValidatorOpenPopovers ||= []).push(element);"
+            "if(isDialogOpener(element)) (window.__portalValidatorOpenDialogs ||= []).push(dialogTarget(element));}",
         )
-        if control.get("presentation") == "popover":
+        if control.get("presentation") in {"popover", "dialog"}:
             page._portal_validator_open_popovers = True
     finally:
         await handle.dispose()
+
+
+async def _wait_for_panel(page, element, control, evidence, timeout_ms: int) -> None:
+    await page.wait_for_function(r"""({element, panel, requiresSelection, wasHidden, panelText}) => {
+      if (!element.isConnected) return false;
+      const target = element.getRootNode().querySelector('#' + CSS.escape(panel));
+      if (!target || target.closest('[hidden],[inert],[aria-hidden="true"]')) return false;
+      const style = getComputedStyle(target), rect = target.getBoundingClientRect();
+      if (style.display === 'none' || style.visibility === 'hidden' || rect.width <= 0 || rect.height <= 0) return false;
+      if (target.innerText && target.innerText !== panelText) return true;
+      return requiresSelection ? element.getAttribute('aria-selected') === 'true' :
+        wasHidden || element.classList.contains('active') || element.parentElement?.classList.contains('active');
+    }""", arg={"element": element, **control, **evidence}, timeout=timeout_ms)
 
 
 async def restore_navigation_hierarchy(
@@ -1501,12 +1558,45 @@ CLOSE_VALIDATOR_POPOVERS_SCRIPT = r"""
 """
 
 
+OPEN_VALIDATOR_DIALOGS_SCRIPT = r"""
+() => {
+  /* NAVIGATION_DOM_HELPERS */
+  window.__portalValidatorOpenDialogs = (window.__portalValidatorOpenDialogs || [])
+    .filter(dialog => dialog?.isConnected && visibleControl(dialog));
+  return window.__portalValidatorOpenDialogs.length;
+}
+""".replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
+
+
+DISMISS_VALIDATOR_DIALOGS_SCRIPT = r"""
+() => {
+  /* NAVIGATION_DOM_HELPERS */
+  // Escape was already tried. Use only an explicit dismiss control inside a
+  // dialog this validator opened, or close a native dialog element.
+  const dismiss = /^(close|dismiss|done|ok|back|x|\u00d7|\u2715)$/i;
+  for (const dialog of window.__portalValidatorOpenDialogs || []) {
+    if (!dialog.isConnected || !visibleControl(dialog)) continue;
+    const control = Array.from(dialog.querySelectorAll('button,[role="button"]')).find(candidate =>
+      visibleControl(candidate) && !unsafeAction(candidate) && !candidate.closest('form:not([method="dialog"])') &&
+      dismiss.test((candidate.getAttribute('aria-label') || candidate.textContent || '').trim()));
+    if (control) control.click();
+    else if (dialog instanceof HTMLDialogElement && dialog.open) dialog.close();
+  }
+  window.__portalValidatorOpenDialogs = [];
+}
+""".replace("/* NAVIGATION_DOM_HELPERS */", NAVIGATION_DOM_HELPERS)
+
+
 async def close_validator_popovers(page) -> None:
     if not getattr(page, "_portal_validator_open_popovers", False):
         return
     page._portal_validator_open_popovers = False
     try:
         await page.evaluate(CLOSE_VALIDATOR_POPOVERS_SCRIPT)
+        if await page.evaluate(OPEN_VALIDATOR_DIALOGS_SCRIPT):
+            await page.keyboard.press("Escape")
+            if await page.evaluate(OPEN_VALIDATOR_DIALOGS_SCRIPT):
+                await page.evaluate(DISMISS_VALIDATOR_DIALOGS_SCRIPT)
     except PlaywrightError:
         # A navigated or closed document has no open popover to close.
         pass
@@ -1525,6 +1615,7 @@ async def perform_route_navigation(
     source_route_url: str | None = None,
     navigation_hierarchy: tuple[str, ...] = (),
     on_popup: Callable[[Any], Awaitable[None]] | None = None,
+    activation_timeout_ms: int | None = None,
 ):
     """Navigate a document or transition an existing SPA document.
 
@@ -1536,7 +1627,10 @@ async def perform_route_navigation(
         if view_control is None:
             raise RuntimeError("UI view activation requires an observed tab control")
         if view_control.get("frame_url"):
-            await activate_ui_view(resolve_view_target(page, view_control), view_control, timeout_ms)
+            await activate_ui_view(
+                resolve_view_target(page, view_control), view_control, timeout_ms,
+                observe_timeout_ms=activation_timeout_ms,
+            )
             return None, True, "SAME_ORIGIN_FRAME_UI_CONTROL"
         response = None
         if normalize_route_url(page.url) != normalize_route_url(url):
@@ -1554,7 +1648,7 @@ async def perform_route_navigation(
                 # next click; otherwise that baseline becomes a false extra
                 # inactive view after the application changes selection.
                 await discover_page_routes(page, 0)
-        await activate_ui_view(page, view_control, timeout_ms)
+        await activate_ui_view(page, view_control, timeout_ms, observe_timeout_ms=activation_timeout_ms)
         return response, True, "UI_TAB_CONTROL"
     if mode == SEMANTIC_LINK_NAVIGATION:
         responses = []

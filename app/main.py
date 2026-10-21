@@ -37,6 +37,7 @@ from app.auth_policy import (
 from app.logging_config import LOGGER, log_event
 from app.browser_lifecycle import BrowserLifecycle
 from app.discovery import (
+    ActivationOutcomeError,
     DOCUMENT_NAVIGATION,
     DOWNLOAD_OBSERVED,
     POPUP_NAVIGATION,
@@ -106,6 +107,7 @@ from app.network import (
 from app.reporting import (
     _safe_authentication_diagnostics,
     group_authentication_diagnostics,
+    navigation_outcome,
     suggested_authentication_hosts,
     traffic_class,
     aggregate_api_events,
@@ -339,6 +341,11 @@ class ScanRequest(BaseModel):
     # long without it, validate it as a linked document instead of waiting
     # for the route timeout. 0 always requires the configured condition.
     shell_marker_grace_ms: int = Field(2000, ge=0, le=BROWSER_TIMER_LIMIT_MS)
+    # How long an activated in-page control (tab, panel, dialog, popover) may
+    # take to show an observable outcome. An activation that changes nothing
+    # is reported as NO_OBSERVABLE_CHANGE (or ACTIVATION_TIMEOUT when its
+    # referenced panel/dialog never appears) instead of a route timeout.
+    ui_activation_timeout_ms: int = Field(5000, ge=1000, le=BROWSER_TIMER_LIMIT_MS)
     # Observation after opening a menu during discovery (not route validation).
     menu_settle_ms: int = Field(250, ge=0, le=BROWSER_TIMER_LIMIT_MS)
     max_navigation_actions: int = Field(200, ge=0)
@@ -1269,6 +1276,10 @@ async def execute_scan(
     # Shared header popovers (notifications, profile, help) appear on every
     # route; like shared menus they are validated once per scan.
     queued_popover_views: set[tuple[str, str, str]] = set()
+    # Every route observation handed to the queue, before deduplication.
+    discovery_observations = Counter()
+    # Destinations outside the configured scope: reported, never visited.
+    external_destinations: dict[str, dict[str, object]] = {}
     # Signatures of shared navigation controls already explored in this scan.
     explored_navigation_controls: set[str] | None = (
         None if req.reexplore_navigation_each_route else set()
@@ -1340,6 +1351,7 @@ async def execute_scan(
         if not application_gate_confirmed or authentication_error is not None:
             return []
         learn_view_query_parameters(routes)
+        discovery_observations["raw"] += len(routes)
         external_urls: set[str] = set()
         # A menu entry rendered both as a link and as a clickable menu item is
         # one destination: validate it once through its link.
@@ -1371,6 +1383,16 @@ async def execute_scan(
                 continue
             if not url_in_scan_scope(identity, root_host, req.allow_subdomains, approved_portal_hosts):
                 external_urls.add(sanitized_url(identity))
+                if not route.view_control:
+                    external_destinations.setdefault(sanitized_url(identity), {
+                        "label": sanitize_text(route.label, limit=160) if route.label else None,
+                        "source": route.source,
+                        "navigation_type": route.navigation_mode,
+                        "parent_route_id": route.opener_route_id or active_route_id,
+                        "navigation_hierarchy": [
+                            sanitize_text(label, limit=160) for label in route.navigation_hierarchy
+                        ],
+                    })
                 continue
             if any(word in urlparse(identity).path.lower() for word in DANGEROUS_PATH_WORDS):
                 continue
@@ -3123,6 +3145,8 @@ async def execute_scan(
                         render_health: dict[str, object] | None = None
                         application_ready = False
                         dom_target = page
+                        opened_new_page = False
+                        activation_evidence: dict[str, bool] = {}
                         auth_settle: dict[str, object] = {"stage": "NOT_TESTED", "completed": False}
                         browser_lifecycle = BrowserLifecycle()
                         browser_lifecycle.advance("INITIAL_NAVIGATION")
@@ -3178,8 +3202,10 @@ async def execute_scan(
                                             route_metadata.get(route_key, {}).get("navigation_hierarchy", ())
                                         ),
                                         on_popup=select_semantic_popup,
+                                        activation_timeout_ms=req.ui_activation_timeout_ms,
                                     )
                                     if semantic_popup is not None:
+                                        opened_new_page = True
                                         page = semantic_popup
                                         dom_target = page
                                         active_browser_page_key = browser_page_keys.get(request_identity(page))
@@ -3734,7 +3760,11 @@ async def execute_scan(
                                     log_event(logging.ERROR, "ROUTE_DISCOVERY_FAILED", scan_id=scan_id,
                                               current_route=active_route_id, error=navigation_actions["error"])
                                 else:
-                                    if isinstance(exc, TimeoutError):
+                                    if isinstance(exc, ActivationOutcomeError):
+                                        error = exc.public_message
+                                        error_classification = exc.classification
+                                        activation_evidence = exc.observed
+                                    elif isinstance(exc, TimeoutError):
                                         error = "Configured maximum time per route exceeded"
                                         error_classification = "TIMEOUT"
                                     elif navigation_policy_error is not None:
@@ -4202,6 +4232,43 @@ async def execute_scan(
                             "missing_security_headers": missing_headers,
                             **classification,
                         }
+                        result["navigation_outcome"] = navigation_outcome(
+                            navigation_type=navigation_mode, view_control=view_control, status=status,
+                            route_transition_succeeded=route_transition_succeeded,
+                            classification=result.get("classification"), opened_new_page=opened_new_page,
+                            final_in_scope=final_in_scope or final_url is None,
+                        )
+                        if result.get("classification") in {"TIMEOUT", "ACTIVATION_TIMEOUT", "NO_OBSERVABLE_CHANGE"}:
+                            # Sanitized, evidence-only account of where the time went.
+                            presentation = (view_control or {}).get("presentation") or (view_control or {}).get("kind")
+                            result["timeout_diagnostics"] = {
+                                "navigation_outcome": result["navigation_outcome"],
+                                "navigation_type": navigation_mode,
+                                "expected_outcome": (
+                                    f"The referenced {presentation} becomes visible" if view_control and presentation != "navigation"
+                                    else "The URL, selected state or visible content changes" if view_control
+                                    else "The document loads and the application becomes ready"
+                                ),
+                                "failed_phase": browser_lifecycle.failed_stage or observation_phase,
+                                "original_url": requested_url,
+                                "final_url": final_url or sanitized_url(page.url) if page.url.startswith(("http://", "https://")) else final_url,
+                                "url_changed": bool(final_url and final_url != requested_url),
+                                "new_page_opened": opened_new_page,
+                                "readiness_reached": bool(application_ready),
+                                **activation_evidence,
+                                "elapsed_ms": round((time.perf_counter() - started) * 1000),
+                                "phase_ms": {
+                                    "navigation": navigation_ms or None,
+                                    "readiness": (render_health or {}).get("settle_elapsed_ms"),
+                                    "discovery": route_discovery_ms or None,
+                                },
+                                "configured_budgets_ms": {
+                                    "per_route": req.per_route_timeout_ms or req.timeout_ms,
+                                    "navigation": req.navigation_timeout_ms or req.timeout_ms,
+                                    "ui_activation": req.ui_activation_timeout_ms,
+                                    "readiness": req.readiness_timeout_ms or req.timeout_ms,
+                                },
+                            }
                         results.append(result)
                         active_route_identity = None
                         await publish_progress(
@@ -4568,6 +4635,68 @@ async def execute_scan(
             "coverage_reason": reason, "passed": False, "status": None,
             "warning_reasons": [], "finding_details": [],
         })
+    validated_urls = {str(result.get("final_url") or "") for result in results} | {
+        str(result.get("url") or "") for result in results
+    }
+    for destination_url, destination in sorted(external_destinations.items()):
+        if destination_url in validated_urls:
+            continue
+        route_fields = route_identity_fields(destination_url, query_policy="preserve", allowed_query_parameters=set())
+        parent_id = destination.get("parent_route_id")
+        name = str(destination.get("label") or route_fields["display_path"] or destination_url)
+        route_inventory.append({
+            **route_fields,
+            "route_id": destination_url, "normalized_route_identity": destination_url,
+            "url": destination_url, "requested_url": destination_url, "discovered_url": destination_url,
+            "final_url": None, "route_name": name, "route_name_source": "navigation_label",
+            "route_name_confidence": "HIGH" if destination.get("label") else "LOW",
+            "route_label": destination.get("label"), "route_source": destination.get("source"),
+            "navigation_type": destination.get("navigation_type"),
+            "parent_route_id": parent_id, "parent_route_name": route_name_by_id.get(str(parent_id)) if parent_id else None,
+            "navigation_hierarchy": [*destination.get("navigation_hierarchy", []), name],
+            "view_type": "EXTERNAL_DESTINATION",
+            "discovery_sources": [destination.get("source")] if destination.get("source") else [],
+            "classification": "EXTERNAL_DESTINATION_DISCOVERED",
+            "route_state": "SKIPPED_OUT_OF_SCOPE",
+            "page_load_status": "NOT_TESTED", "validation_status": "SKIPPED_OUT_OF_SCOPE",
+            "navigation_status": "NOT_TESTED", "render_status": "NOT_TESTED",
+            "authentication_status": "NOT_TESTED", "tls_status": "NOT_TESTED",
+            "api_status": "NOT_TESTED", "resource_status": "NOT_TESTED", "console_status": "NOT_TESTED",
+            "failure_dimension": "SCOPE", "failure_reason": "VALIDATION_SKIPPED_OUT_OF_SCOPE",
+            "coverage_reason": "VALIDATION_SKIPPED_OUT_OF_SCOPE",
+            "detail": "Destination is outside the configured scan scope. Add its host to Portal hosts to validate it.",
+            "passed": None, "status": None, "warning_reasons": [], "finding_details": [],
+        })
+    summary["external_destinations_discovered"] = sum(
+        item.get("route_state") == "SKIPPED_OUT_OF_SCOPE" for item in route_inventory
+    )
+    if isinstance(summary.get("route_states"), dict):
+        summary["route_states"]["SKIPPED_OUT_OF_SCOPE"] = summary["external_destinations_discovered"]
+    visited_states = Counter(str(result.get("route_state")) for result in results)
+    unique_targets = len(route_inventory)
+    summary["discovery_metrics"] = {
+        "raw_discoveries": max(int(discovery_observations["raw"]), unique_targets),
+        "unique_navigation_targets": unique_targets,
+        "duplicate_discoveries": max(0, int(discovery_observations["raw"]) - unique_targets),
+        "attempted_activations": len(results),
+        "successful_activations": visited_states["VALIDATED"] + visited_states["RENDERED"],
+        "no_observable_change": visited_states["NO_OBSERVABLE_CHANGE"],
+        "failed_activations": len(results) - visited_states["VALIDATED"] - visited_states["RENDERED"]
+        - visited_states["NO_OBSERVABLE_CHANGE"],
+        "skipped_activations": unique_targets - len(results),
+        "definitions": {
+            "raw_discoveries": "Route observations handed to the queue, including repeats across routes and menus.",
+            "unique_navigation_targets": "Distinct routes, views and out-of-scope destinations in the route inventory.",
+            "duplicate_discoveries": "Raw observations that resolved to an already known target.",
+            "attempted_activations": "Targets the browser actually navigated to or activated.",
+            "successful_activations": "Attempted targets that loaded (validated or rendered).",
+            "failed_activations": "Attempted targets that failed, timed out or were blocked.",
+            "skipped_activations": "Known targets not attempted (out of scope or a configured limit).",
+        },
+    }
+    for item in route_inventory:
+        if item.get("route_state") == "SKIPPED_OUT_OF_SCOPE":
+            item["navigation_outcome"] = "EXTERNAL_NAVIGATION"
     aggregation_started = time.perf_counter()
     api_inventory = (
         aggregate_api_events(scan_api_events)
@@ -4718,7 +4847,8 @@ async def execute_scan(
         "large_js_threshold_bytes", "large_css_font_threshold_bytes",
         "check_links", "check_console", "check_resources", "check_performance", "check_security_headers",
         "allow_subdomains", "allow_private_networks", "max_navigation_actions", "max_discovery_scrolls",
-        "discovery_timeout_ms", "network_settle_cap_ms", "shell_marker_grace_ms", "menu_settle_ms", "reexplore_navigation_each_route",
+        "discovery_timeout_ms", "network_settle_cap_ms", "shell_marker_grace_ms", "ui_activation_timeout_ms",
+        "menu_settle_ms", "reexplore_navigation_each_route",
         "session_refresh_interval_ms", "session_recovery_attempts",
         "auto_allow_read_only_posts", "auto_allow_session_renewal",
     })

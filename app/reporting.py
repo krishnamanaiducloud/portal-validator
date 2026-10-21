@@ -27,6 +27,10 @@ ACCESS_OUTCOMES = frozenset({"ACCESS_RESTRICTED", "CHALLENGE_REQUIRED"})
 LIMITED_OUTCOMES = frozenset({
     "DISCOVERED_BUT_NOT_SAFELY_ACTIVATABLE",
     "DISCOVERY_LIMITATION", "DOWNLOAD_OBSERVED",
+    # An activated control that changed nothing observable (typically the
+    # view already displayed): not a failure, and nothing new to validate.
+    "NO_OBSERVABLE_CHANGE",
+    "EXTERNAL_DESTINATION_DISCOVERED",
 }) | ACCESS_OUTCOMES
 FAILURE_OUTCOMES = frozenset({
     "TLS_ERROR",
@@ -34,6 +38,7 @@ FAILURE_OUTCOMES = frozenset({
     "NETWORK_ERROR",
     "HTTP_ERROR",
     "TIMEOUT",
+    "ACTIVATION_TIMEOUT",
     "NAVIGATION_ERROR",
     "VALIDATION_FAILED",
     "PAGE_RENDER_ERROR",
@@ -1062,9 +1067,56 @@ def unvisited_route_reason(termination_reason: str) -> str:
 
 ROUTE_STATES = (
     "DISCOVERED", "NAVIGATION_ATTEMPTED", "RENDERED", "VALIDATED", "AUTHENTICATION_BLOCKED",
-    "AUTHORIZATION_DENIED", "POLICY_BLOCKED", "NAVIGATION_FAILED", "TIMEOUT", "INCOMPLETE",
+    "AUTHORIZATION_DENIED", "POLICY_BLOCKED", "NAVIGATION_FAILED", "TIMEOUT", "ACTIVATION_TIMEOUT",
+    "NO_OBSERVABLE_CHANGE", "SKIPPED_OUT_OF_SCOPE", "INCOMPLETE",
 )
 NAVIGATION_FAILURE_OUTCOMES = frozenset({"TLS_ERROR", "DNS_ERROR", "NETWORK_ERROR", "HTTP_ERROR", "NAVIGATION_ERROR"})
+
+
+NAVIGATION_OUTCOMES = (
+    "DOCUMENT_NAVIGATION", "HISTORY_NAVIGATION", "HASH_NAVIGATION", "IN_PAGE_ACTIVATION",
+    "DIALOG_ACTIVATION", "OVERLAY_ACTIVATION", "POPUP_NAVIGATION", "IFRAME_NAVIGATION",
+    "EXTERNAL_NAVIGATION", "NO_OBSERVABLE_CHANGE", "POLICY_BLOCKED", "ACTIVATION_TIMEOUT",
+)
+
+
+def navigation_outcome(
+    *, navigation_type: str | None, view_control: dict[str, Any] | None, status: int | None,
+    route_transition_succeeded: bool, classification: str | None, opened_new_page: bool,
+    final_in_scope: bool = True,
+) -> str:
+    """What the activation observably did, from recorded browser evidence.
+
+    The navigation type says how the validator activated the route; this says
+    what actually happened (a dialog opened, a new tab appeared, nothing
+    changed...). Internal vocabulary only, never target-specific.
+    """
+    if classification in {"NO_OBSERVABLE_CHANGE", "ACTIVATION_TIMEOUT"}:
+        return classification
+    if classification == "TIMEOUT":
+        return "ACTIVATION_TIMEOUT"
+    if classification in {"NAVIGATION_BLOCKED", "POLICY_BLOCKED"}:
+        return "POLICY_BLOCKED"
+    if classification == "EXTERNAL_DESTINATION_DISCOVERED":
+        return "EXTERNAL_NAVIGATION"
+    if opened_new_page or navigation_type == "POPUP_NAVIGATION":
+        return "POPUP_NAVIGATION"
+    if not final_in_scope:
+        return "EXTERNAL_NAVIGATION"
+    if view_control:
+        if view_control.get("frame_url"):
+            return "IFRAME_NAVIGATION"
+        presentation = view_control.get("presentation")
+        if presentation == "dialog":
+            return "DIALOG_ACTIVATION"
+        if presentation == "popover":
+            return "OVERLAY_ACTIVATION"
+        return "IN_PAGE_ACTIVATION"
+    if navigation_type == "HASH_ROUTE_TRANSITION":
+        return "HASH_NAVIGATION"
+    if route_transition_succeeded and status is None:
+        return "HISTORY_NAVIGATION"
+    return "DOCUMENT_NAVIGATION"
 
 
 def route_state(result: dict[str, Any]) -> str:
@@ -1083,6 +1135,10 @@ def route_state(result: dict[str, Any]) -> str:
         return "POLICY_BLOCKED"
     if classification == "TIMEOUT":
         return "TIMEOUT"
+    if classification in {"ACTIVATION_TIMEOUT", "NO_OBSERVABLE_CHANGE"}:
+        return classification
+    if classification == "EXTERNAL_DESTINATION_DISCOVERED":
+        return "SKIPPED_OUT_OF_SCOPE"
     if classification in {"SKIPPED", "DISCOVERED_BUT_NOT_SAFELY_ACTIVATABLE", "DISCOVERY_LIMITATION"}             or result.get("page_load_status") == "NOT_TESTED":
         return "INCOMPLETE"
     if classification in NAVIGATION_FAILURE_OUTCOMES or result.get("page_load_status") == "FAILED_TO_LOAD":

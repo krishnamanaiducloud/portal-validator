@@ -124,6 +124,6 @@ def test_scan_settings_have_no_policy_caps_and_are_served_to_the_dashboard():
     settings = TestClient(main.app).get("/api/scan-settings").json()["settings"]
     for name in ("max_pages", "max_depth", "max_navigation_actions", "max_discovery_scrolls"):
         assert "maximum" not in settings[name], name
-    for name in ("timeout_ms", "total_timeout_ms", "discovery_timeout_ms", "network_settle_cap_ms", "shell_marker_grace_ms", "menu_settle_ms"):
+    for name in ("timeout_ms", "total_timeout_ms", "discovery_timeout_ms", "network_settle_cap_ms", "shell_marker_grace_ms", "ui_activation_timeout_ms", "menu_settle_ms"):
         assert settings[name]["maximum"] == 2_147_483_647, name
     assert settings["reexplore_navigation_each_route"]["default"] is False
