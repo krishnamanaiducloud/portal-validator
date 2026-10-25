@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.13.9 is a read-only browser health validator with optional authentication for public,
+Portal Validator 1.13.10 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -404,7 +404,7 @@ Relevant environment variables:
 
 The multi-stage production image uses a digest-pinned Chainguard Python builder
 and a digest-pinned Wolfi runtime. Only the application virtualenv, matching
-Playwright 1.63.0 Chromium under `/ms-playwright`, and required runtime libraries
+Playwright 1.64.1 Chromium under `/ms-playwright`, and required runtime libraries
 are shipped. Compiler/download tools, a second system browser, and package caches
 stay outside the final image. Browser permissions are set before copying to avoid
 duplicating the browser layer. A build-time check verifies the expected executable
@@ -421,10 +421,10 @@ runtime files against the image's generated hash manifest.
 ```bash
 docker build --build-arg VCS_REF="$(git rev-parse HEAD)" \
   --build-arg BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -t mohankrishna999/portal-validator:1.13.9 .
+  -t mohankrishna999/portal-validator:1.13.10 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.9 \
-  -t mohankrishna999/portal-validator:1.13.9-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.10 \
+  -t mohankrishna999/portal-validator:1.13.10-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -439,7 +439,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.13.9
+  mohankrishna999/portal-validator:1.13.10
 ```
 
 ## OpenShift

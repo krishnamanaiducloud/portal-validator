@@ -1,7 +1,7 @@
-fastapi==0.143.0
+fastapi==0.162.0
 uvicorn[standard]==0.54.0
-playwright==1.63.0
-pydantic==2.14.0
+playwright==1.64.1
+pydantic==2.14.1
 msgpack==1.2.3
-setuptools==84.0.0
+setuptools==84.2.1
 graphql-core==3.3.0

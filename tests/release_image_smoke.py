@@ -93,7 +93,7 @@ for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
     assert os.environ[name] == expected_bundle
 identity = build_diagnostics()
 print("BUILD_IDENTITY=" + json.dumps(identity), flush=True)
-assert identity["version"] == "1.13.9"
+assert identity["version"] == "1.13.10"
 # An explicitly selected, uncommitted release snapshot must be compared with
 # the operator's expected hashes rather than falsely claiming a Git revision.
 snapshot_path = os.getenv("RELEASE_SMOKE_SOURCE_HASHES")
@@ -108,7 +108,7 @@ if snapshot_path:
 else:
     assert identity["source_integrity"]["status"] == "VERIFIED"
 print("PLAYWRIGHT_VERSION=" + m.version("playwright"), flush=True)
-assert m.version("playwright") == "1.63.0"
+assert m.version("playwright") == "1.64.1"
 packages = {}
 for record in Path("/usr/lib/apk/db/installed").read_text().split("\n\n"):
     fields = dict(line.split(":", 1) for line in record.splitlines() if ":" in line)

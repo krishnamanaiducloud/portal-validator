@@ -1,8 +1,8 @@
-FROM cgr.dev/chainguard/wolfi-base:latest@sha256:c2a4815b6ca49b9bbafd451b4bde690d567a86b2b6b54877faac8082a7bc4296 AS runtime-base
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:360896efb0753a5701c48f860e17130c205eae5a264797aa3e7ea126ee2923a7 AS runtime-base
 
 # The venv is copied into a runtime that installs python-3.15, so the builder
 # must stay on a Python 3.15 digest; the assertion below catches minor drift.
-FROM cgr.dev/chainguard/python:latest-dev@sha256:905b31747ebcae4242e0b71fcd2640c712b79a96f929811d3202b9716b66592a AS builder
+FROM cgr.dev/chainguard/python:latest-dev@sha256:c179c7d8e23caed59a51ff74d4742f8f8d3f16af4c33c40acaf8d3ee07234592 AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
@@ -20,7 +20,7 @@ RUN python -c "import sys; assert sys.version_info[:2] == (3, 15), sys.version" 
     && /app/.venv/bin/pip uninstall -y pip setuptools
 
 # Download an exact, signed APK transaction without shipping download/build tools.
-FROM cgr.dev/chainguard/python:latest-dev@sha256:905b31747ebcae4242e0b71fcd2640c712b79a96f929811d3202b9716b66592a AS runtime-packages
+FROM cgr.dev/chainguard/python:latest-dev@sha256:c179c7d8e23caed59a51ff74d4742f8f8d3f16af4c33c40acaf8d3ee07234592 AS runtime-packages
 ARG APK_REPOSITORY=https://apk.cgr.dev/chainguard
 USER 0
 COPY --from=runtime-base / /tmp/apk-root/
@@ -103,7 +103,7 @@ COPY --chown=10001:10001 app ./app
 # Source identity must not invalidate unchanged OS/venv/browser layers.
 ARG VCS_REF=""
 ARG BUILD_TIMESTAMP=""
-LABEL org.opencontainers.image.version="1.13.9" \
+LABEL org.opencontainers.image.version="1.13.10" \
     org.opencontainers.image.revision=$VCS_REF \
     org.opencontainers.image.created=$BUILD_TIMESTAMP
 
