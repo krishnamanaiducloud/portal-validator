@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.13.10 is a read-only browser health validator with optional authentication for public,
+Portal Validator 1.13.11 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -421,10 +421,10 @@ runtime files against the image's generated hash manifest.
 ```bash
 docker build --build-arg VCS_REF="$(git rev-parse HEAD)" \
   --build-arg BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -t mohankrishna999/portal-validator:1.13.10 .
+  -t mohankrishna999/portal-validator:1.13.11 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.10 \
-  -t mohankrishna999/portal-validator:1.13.10-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.11 \
+  -t mohankrishna999/portal-validator:1.13.11-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -439,7 +439,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.13.10
+  mohankrishna999/portal-validator:1.13.11
 ```
 
 ## OpenShift
