@@ -3,7 +3,7 @@ FROM ${PRODUCTION_IMAGE} AS production
 
 # Resolve an exact, signed APK transaction for the diagnostic utilities against
 # the production package database, without shipping download tooling.
-FROM cgr.dev/chainguard/python:latest-dev@sha256:8a5780972067cfba4592b10e786a889807ed876c1100f89410fd0ed4e398992c AS debug-packages
+FROM cgr.dev/chainguard/python:latest-dev@sha256:fe4dbb574f811d271ac002a3e0270659f69841738276ef2d0084323baf1d75df AS debug-packages
 ARG APK_REPOSITORY=https://apk.cgr.dev/chainguard
 USER 0
 RUN --mount=type=bind,from=production,source=/,target=/tmp/apk-root,rw \
