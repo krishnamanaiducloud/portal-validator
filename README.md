@@ -411,6 +411,14 @@ duplicating the browser layer. A build-time check verifies the expected executab
 and launches Chromium in the final runtime. The runtime retains `certutil` and
 runs as UID/GID 10001 while supporting an arbitrary OpenShift UID.
 
+The browser is the Chromium build that Playwright 1.64.1 is tested with
+(156.0.8078.4). Scanners that match Chromium against Google Chrome advisories
+(`cpe:2.3:a:google:chrome`) report Chrome fixes released after that build. A
+newer Chromium is not swapped in on its own, because each Playwright release
+drives only its own Chromium build. The image moves to Playwright 1.65 and its
+Chromium as soon as 1.65 is published on PyPI (on 2026-11-07 it is on npm only;
+PyPI's latest is 1.64.1).
+
 Build versioned tags only:
 
 Record `VCS_REF` only for a clean, reviewed, committed source tree. For an
