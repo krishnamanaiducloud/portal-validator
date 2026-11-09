@@ -1,70 +1,76 @@
-FROM cgr.dev/chainguard/wolfi-base:latest@sha256:8509ee4351a2e501b7f98201f2e2642396e82020c61a589cacdcfe74b9de46c1 AS runtime-base
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:24f549a7fcace88e69b9557941168c74645688ecc4acf7fb6d734a6b74e9019d AS runtime-base
 
 # The venv is copied into a runtime that installs python-3.15, so the builder
 # must stay on a Python 3.15 digest; the assertion below catches minor drift.
-FROM cgr.dev/chainguard/python:latest-dev@sha256:fe4dbb574f811d271ac002a3e0270659f69841738276ef2d0084323baf1d75df AS builder
+FROM cgr.dev/chainguard/python:latest-dev@sha256:6b7c43c25f9446e8b1cf850797826a3d40b7cccdc6370c6e1b31cb28adae0a18 AS builder
+
+ARG BROWSER_PLAYWRIGHT_VERSION=1.65.0
+ARG BROWSER_REVISION=1254
+ARG PYTHON_DRIVER_REVISION=1248
+ARG TARGETARCH
 
 ENV PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PIP_NO_CACHE_DIR=1 PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    npm_config_fetch_timeout=30000 npm_config_fetch_retries=5 \
+    npm_config_fetch_retry_mintimeout=1000 npm_config_fetch_retry_maxtimeout=10000
 
 USER 0
 WORKDIR /app
 COPY requirements.txt .
-RUN python -c "import sys; assert sys.version_info[:2] == (3, 15), sys.version" \
-    && python -m venv /app/.venv \
+RUN --mount=type=cache,id=portal-validator-builder-apks-${TARGETARCH},target=/var/cache/apk,sharing=locked \
+    set -eu; \
+    python -c "import sys; assert sys.version_info[:2] == (3, 15), sys.version"; \
+    installed=0; \
+    for attempt in 1 2 3 4 5; do \
+      if timeout 120 apk --cache-dir /var/cache/apk --cache-max-age 0 \
+        --timeout 60 --no-progress add nodejs-24 npm; then \
+        installed=1; break; \
+      fi; \
+      echo "Builder package installation failed; retry $attempt" >&2; \
+      sleep "$attempt"; \
+    done; \
+    test "$installed" = 1; \
+    python -m venv /app/.venv \
     && /app/.venv/bin/pip install --no-cache-dir --no-compile -r requirements.txt \
-    && /app/.venv/bin/python -m playwright install chromium \
+    && npx --yes "playwright@${BROWSER_PLAYWRIGHT_VERSION}" install chromium \
+    && test -d "/ms-playwright/chromium-${BROWSER_REVISION}" \
+    && test -d "/ms-playwright/chromium_headless_shell-${BROWSER_REVISION}" \
+    && ln -s "chromium-${BROWSER_REVISION}" "/ms-playwright/chromium-${PYTHON_DRIVER_REVISION}" \
+    && ln -s "chromium_headless_shell-${BROWSER_REVISION}" "/ms-playwright/chromium_headless_shell-${PYTHON_DRIVER_REVISION}" \
     && chgrp -R 0 /ms-playwright \
     && chmod -R a+rX,go-w /ms-playwright \
     && /app/.venv/bin/python -c "from pathlib import Path; from playwright.sync_api import sync_playwright; manager = sync_playwright().start(); browser_path = Path(manager.chromium.executable_path); print(f'Playwright expected Chromium: {browser_path}'); assert browser_path.is_file(), f'Playwright Chromium missing: {browser_path}'; assert str(browser_path).startswith('/ms-playwright/'), f'Unexpected Chromium location: {browser_path}'; manager.stop(); print('Playwright Chromium installation verified')" \
     && /app/.venv/bin/pip uninstall -y pip setuptools
 
-# Download an exact, signed APK transaction without shipping download/build tools.
-FROM cgr.dev/chainguard/python:latest-dev@sha256:fe4dbb574f811d271ac002a3e0270659f69841738276ef2d0084323baf1d75df AS runtime-packages
+# Install only signed runtime packages; Node, npm and browser download tooling
+# remain confined to the separate builder stage above.
+FROM runtime-base AS runtime-packages
 ARG APK_REPOSITORY=https://apk.cgr.dev/chainguard
+ARG TARGETARCH
 USER 0
-COPY --from=runtime-base / /tmp/apk-root/
-RUN --mount=type=cache,id=portal-validator-apks,target=/tmp/apks set -eu; \
-    mkdir -p /runtime-repository/x86_64 /tmp/apk-root; \
-    wget --https-only --prefer-family=IPv4 --timeout=30 --tries=5 \
-      --retry-connrefused --retry-on-host-error \
-      --retry-on-http-error=429,500,502,503,504 --quiet \
-      "$APK_REPOSITORY/x86_64/APKINDEX.tar.gz" \
-      -O /runtime-repository/x86_64/APKINDEX.tar.gz; \
-    printf '%s\n' /runtime-repository > /etc/apk/repositories; \
-    transaction="$(apk --root /tmp/apk-root --initdb --keys-dir /etc/apk/keys \
-      --repositories-file /etc/apk/repositories --no-network --simulate --no-progress \
-      add 'glibc>=2.44-r8' python-3.15 libnss-tools openssl font-opensans libatk-bridge-2.0 \
-      cups-libs libxcomposite libxdamage libxfixes libxrandr libxkbcommon \
-      mesa-gbm alsa-lib pango libx11 libxcb libxext libstdc++ libexpat1 dbus-libs libudev 2>&1)" \
-      || { printf '%s\n' "$transaction" >&2; exit 1; }; \
-    printf '%s\n' "$transaction"; \
-    printf '%s\n' "$transaction" \
-      | sed -n 's/^([^)]*) Installing \([^ ]*\) (\([^)]*\)).*/\1=\2/p' \
-      > /runtime-repository/constraints; \
-    test -s /runtime-repository/constraints; \
-    package_files="$(printf '%s\n' "$transaction" \
-      | sed -n 's/^([^)]*) Installing \([^ ]*\) (\([^)]*\)).*/\1-\2.apk/p')"; \
-    for package_file in $package_files; do \
-      if [ ! -s "/tmp/apks/$package_file" ]; then \
-        downloaded=0; \
-        for attempt in 1 2 3 4 5; do \
-          if wget --https-only --prefer-family=IPv4 --timeout=30 --tries=3 \
-            --retry-connrefused --retry-on-host-error \
-            --retry-on-http-error=429,500,502,503,504 --quiet \
-            "$APK_REPOSITORY/x86_64/$package_file" -O "/tmp/apks/$package_file.partial"; then \
-            downloaded=1; break; \
-          fi; \
-          echo "Package download failed; retry $attempt: $package_file" >&2; \
-          sleep "$attempt"; \
-        done; \
-        test "$downloaded" = 1; \
-        mv "/tmp/apks/$package_file.partial" "/tmp/apks/$package_file"; \
+# The current Python builder carries the newest Wolfi trust store. Copy it
+# before apk resolves runtime packages so newly rotated repository chains are
+# verified without disabling TLS or signature checks.
+COPY --from=builder --chown=0:0 --chmod=0644 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN --mount=type=cache,id=portal-validator-runtime-apks-${TARGETARCH},target=/var/cache/apk,sharing=locked \
+    set -eu; \
+    printf '%s\n' "$APK_REPOSITORY" > /tmp/runtime-repositories; \
+    installed=0; \
+    for attempt in 1 2 3 4 5; do \
+      if timeout 120 apk --repositories-file /tmp/runtime-repositories \
+        --cache-dir /var/cache/apk --cache-max-age 0 --timeout 60 --no-progress add \
+        'glibc>=2.44-r8' python-3.15 libnss-tools openssl font-opensans libatk-bridge-2.0 \
+        cups-libs libxcomposite libxdamage libxfixes libxrandr libxkbcommon \
+        mesa-gbm alsa-lib pango libx11 libxcb libxext libstdc++ libexpat1 dbus-libs libudev; then \
+        installed=1; break; \
       fi; \
-      cp "/tmp/apks/$package_file" /runtime-repository/x86_64/; \
-    done
+      echo "Runtime package installation failed; retry $attempt" >&2; \
+      sleep "$attempt"; \
+    done; \
+    test "$installed" = 1; \
+    rm -f /tmp/runtime-repositories
 
-FROM runtime-base
+FROM runtime-packages
 
 ARG APK_REPOSITORY=https://apk.cgr.dev/chainguard
 
@@ -74,10 +80,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 
 USER 0
 WORKDIR /app
-RUN --mount=type=bind,from=runtime-packages,source=/runtime-repository,target=/runtime-repository \
-    set -eux; \
-    printf '%s\n' /runtime-repository > /etc/apk/repositories; \
-    apk --no-network --no-progress add --no-cache $(cat /runtime-repository/constraints); \
+RUN set -eux; \
     glibc_version="$(awk '/^P:/ { package=substr($0,3) } /^V:/ && package ~ /^glibc(-[0-9.]+)?$/ { print substr($0,3); exit }' /usr/lib/apk/db/installed)"; \
     test -n "$glibc_version"; \
     test "$(apk version -t "$glibc_version" 2.44-r8)" != '<'; \
@@ -103,7 +106,7 @@ COPY --chown=10001:10001 app ./app
 # Source identity must not invalidate unchanged OS/venv/browser layers.
 ARG VCS_REF=""
 ARG BUILD_TIMESTAMP=""
-LABEL org.opencontainers.image.version="1.13.11" \
+LABEL org.opencontainers.image.version="1.13.12" \
     org.opencontainers.image.revision=$VCS_REF \
     org.opencontainers.image.created=$BUILD_TIMESTAMP
 
@@ -111,7 +114,7 @@ RUN python -m app.build_info --git-commit "$VCS_REF" --timestamp "$BUILD_TIMESTA
     && python -c "from app.build_info import build_diagnostics; identity = build_diagnostics(); assert identity['source_integrity']['status'] != 'MISMATCH', identity; print('Final runtime build identity verified')" \
     && python -c "from pathlib import Path; from playwright.sync_api import sync_playwright; manager = sync_playwright().start(); browser_path = Path(manager.chromium.executable_path); print(f'Playwright expected Chromium: {browser_path}'); assert browser_path.is_file(), f'Playwright Chromium missing: {browser_path}'; manager.stop(); print('Final runtime Playwright Chromium verified')" \
     && command -v certutil >/dev/null \
-    && HOME=/tmp/portal-validator-build-home python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(headless=True); b.close(); b = p.chromium.launch(headless=True, channel='chromium'); b.close(); p.stop(); print('Final runtime Chromium launch verified')" \
+    && HOME=/tmp/portal-validator-build-home python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(headless=True); print(f'Final runtime Chromium version: {b.version}'); assert b.version.startswith('158.0.8127.18'), b.version; b.close(); b = p.chromium.launch(headless=True, channel='chromium'); assert b.version.startswith('158.0.8127.18'), b.version; b.close(); p.stop(); print('Final runtime Chromium launch verified')" \
     && rm -rf /tmp/portal-validator-build-home
 
 USER 10001:10001

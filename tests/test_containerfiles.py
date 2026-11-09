@@ -8,7 +8,7 @@ REPO = Path(__file__).resolve().parents[1]
 
 def test_runtime_copies_matching_venv_and_browser_without_copy_up():
     dockerfile = (REPO / "Dockerfile").read_text()
-    runtime = dockerfile.split("FROM runtime-base\n", 1)[1]
+    runtime = dockerfile.split("FROM runtime-packages\n", 1)[1]
     assert "COPY --from=builder --chown=10001:10001 /app/.venv /app/.venv" in runtime
     assert "COPY --from=builder --chown=0:0 /ms-playwright /ms-playwright" in runtime
     assert "chmod -R" not in runtime
@@ -19,11 +19,15 @@ def test_runtime_copies_matching_venv_and_browser_without_copy_up():
     assert 'ENTRYPOINT ["/app/container-entrypoint.sh"]' in runtime
 
 
-def test_runtime_uses_signed_exact_apk_transaction_and_debug_adds_only_delta():
+def test_runtime_uses_signed_bounded_apk_transaction_and_debug_adds_only_delta():
     dockerfile = (REPO / "Dockerfile").read_text()
     debugfile = (REPO / "Dockerfile-debug").read_text()
     assert "@sha256:" in dockerfile
-    assert "--no-network --no-progress add --no-cache" in dockerfile
+    assert "timeout 120 apk --repositories-file /tmp/runtime-repositories" in dockerfile
+    assert "--cache-dir /var/cache/apk --cache-max-age 0 --timeout 60 --no-progress add" in dockerfile
+    assert "portal-validator-runtime-apks-${TARGETARCH}" in dockerfile
+    assert "portal-validator-builder-apks-${TARGETARCH}" in dockerfile
+    assert "portal-validator-debug-apks-${TARGETARCH}" in debugfile
     assert "--allow-untrusted" not in dockerfile
     assert "--no-check-certificate" not in dockerfile
     assert "apk upgrade" not in dockerfile
@@ -34,6 +38,7 @@ def test_runtime_uses_signed_exact_apk_transaction_and_debug_adds_only_delta():
         assert "apk info --exists" not in containerfile
     assert "FROM ${PRODUCTION_IMAGE}" in debugfile
     assert "COPY --from" not in debugfile
+    assert "timeout 120 env SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt" in debugfile
     assert "python -m pip uninstall -y pip setuptools" in debugfile
     assert "USER 10001:10001" in debugfile
 
@@ -41,7 +46,7 @@ def test_runtime_uses_signed_exact_apk_transaction_and_debug_adds_only_delta():
 def test_final_runtime_records_exact_source_identity_after_copy_and_before_non_root():
     from app.version import VALIDATOR_VERSION
 
-    runtime = (REPO / "Dockerfile").read_text().split("FROM runtime-base\n", 1)[1]
+    runtime = (REPO / "Dockerfile").read_text().split("FROM runtime-packages\n", 1)[1]
     assert 'ARG VCS_REF=""' in runtime
     assert 'ARG BUILD_TIMESTAMP=""' in runtime
     assert f'org.opencontainers.image.version="{VALIDATOR_VERSION}"' in runtime

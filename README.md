@@ -1,6 +1,6 @@
 # Portal Validator
 
-Portal Validator 1.13.11 is a read-only browser health validator with optional authentication for public,
+Portal Validator 1.13.12 is a read-only browser health validator with optional authentication for public,
 private, and authenticated portals. It follows real browser redirects,
 classifies authentication outcomes, crawls a controlled portal scope, and
 reports load, TLS, HTTP, console, resource, performance, and security-header
@@ -403,21 +403,20 @@ Relevant environment variables:
 ## Images
 
 The multi-stage production image uses a digest-pinned Chainguard Python builder
-and a digest-pinned Wolfi runtime. Only the application virtualenv, matching
-Playwright 1.64.1 Chromium under `/ms-playwright`, and required runtime libraries
+and a digest-pinned Wolfi runtime. Only the application virtualenv, Playwright
+1.65.0 Chromium 158 under `/ms-playwright`, and required runtime libraries
 are shipped. Compiler/download tools, a second system browser, and package caches
 stay outside the final image. Browser permissions are set before copying to avoid
 duplicating the browser layer. A build-time check verifies the expected executable
 and launches Chromium in the final runtime. The runtime retains `certutil` and
 runs as UID/GID 10001 while supporting an arbitrary OpenShift UID.
 
-The browser is the Chromium build that Playwright 1.64.1 is tested with
-(156.0.8078.4). Scanners that match Chromium against Google Chrome advisories
-(`cpe:2.3:a:google:chrome`) report Chrome fixes released after that build. A
-newer Chromium is not swapped in on its own, because each Playwright release
-drives only its own Chromium build. The image moves to Playwright 1.65 and its
-Chromium as soon as 1.65 is published on PyPI (on 2026-11-07 it is on npm only;
-PyPI's latest is 1.64.1).
+The Python API remains on the current PyPI release, Playwright 1.64.1. Its
+browser payload is upgraded from Chromium 156 to the official Playwright 1.65.0
+Chromium 158.0.8127.18 payload published on npm. The build launches that browser
+through the Python driver and verifies the exact version twice, and the release
+smoke suite repeats the check. This removes the stale Google Chrome CPE match
+without shipping a second browser or changing the application API.
 
 Build versioned tags only:
 
@@ -429,10 +428,10 @@ runtime files against the image's generated hash manifest.
 ```bash
 docker build --build-arg VCS_REF="$(git rev-parse HEAD)" \
   --build-arg BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -t mohankrishna999/portal-validator:1.13.11 .
+  -t mohankrishna999/portal-validator:1.13.12 .
 docker build -f Dockerfile-debug \
-  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.11 \
-  -t mohankrishna999/portal-validator:1.13.11-debug .
+  --build-arg PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.12 \
+  -t mohankrishna999/portal-validator:1.13.12-debug .
 ```
 
 The debug image incrementally adds `debugpy`, test tools, hot reload, and port
@@ -447,7 +446,7 @@ docker run --rm -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,nosuid,size=512m \
   -v ./ca-bundle.crt:/etc/portal-validator/certs/ca-bundle.crt:ro \
   -v ./corporate-cas:/etc/portal-validator/zscaler:ro \
-  mohankrishna999/portal-validator:1.13.11
+  mohankrishna999/portal-validator:1.13.12
 ```
 
 ## OpenShift

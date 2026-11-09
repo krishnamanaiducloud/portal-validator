@@ -93,7 +93,7 @@ for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
     assert os.environ[name] == expected_bundle
 identity = build_diagnostics()
 print("BUILD_IDENTITY=" + json.dumps(identity), flush=True)
-assert identity["version"] == "1.13.11"
+assert identity["version"] == "1.13.12"
 # An explicitly selected, uncommitted release snapshot must be compared with
 # the operator's expected hashes rather than falsely claiming a Git revision.
 snapshot_path = os.getenv("RELEASE_SMOKE_SOURCE_HASHES")
@@ -126,6 +126,7 @@ with sync_playwright() as p:
     assert Path(p.chromium.executable_path).is_file()
     browser = p.chromium.launch(headless=True)
     print("CHROMIUM_VERSION=" + browser.version, flush=True)
+    assert browser.version.startswith("158.0.8127.18"), browser.version
     try:
         page = browser.new_page()
         response = page.goto(os.environ["RELEASE_SMOKE_TLS_ORIGIN"], wait_until="domcontentloaded", timeout=30000)

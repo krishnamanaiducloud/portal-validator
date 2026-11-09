@@ -1,38 +1,7 @@
-ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.11
+ARG PRODUCTION_IMAGE=mohankrishna999/portal-validator:1.13.12
 FROM ${PRODUCTION_IMAGE} AS production
-
-# Resolve an exact, signed APK transaction for the diagnostic utilities against
-# the production package database, without shipping download tooling.
-FROM cgr.dev/chainguard/python:latest-dev@sha256:fe4dbb574f811d271ac002a3e0270659f69841738276ef2d0084323baf1d75df AS debug-packages
 ARG APK_REPOSITORY=https://apk.cgr.dev/chainguard
-USER 0
-RUN --mount=type=bind,from=production,source=/,target=/tmp/apk-root,rw \
-    set -eu; \
-    mkdir -p /debug-repository/x86_64; \
-    wget --https-only --prefer-family=IPv4 --timeout=30 --tries=5 \
-      --retry-connrefused --retry-on-host-error \
-      --retry-on-http-error=429,500,502,503,504 --quiet \
-      "$APK_REPOSITORY/x86_64/APKINDEX.tar.gz" \
-      -O /debug-repository/x86_64/APKINDEX.tar.gz; \
-    printf '%s\n' /debug-repository > /etc/apk/repositories; \
-    transaction="$(apk --root /tmp/apk-root --keys-dir /etc/apk/keys \
-      --repositories-file /etc/apk/repositories --no-network --simulate --no-progress \
-      add curl bind-tools iproute2 jq 2>&1)" \
-      || { printf '%s\n' "$transaction" >&2; exit 1; }; \
-    printf '%s\n' "$transaction"; \
-    printf '%s\n' "$transaction" \
-      | sed -n 's/^([^)]*) Installing \([^ ]*\) (\([^)]*\)).*/\1=\2/p' \
-      > /debug-repository/constraints; \
-    test -s /debug-repository/constraints; \
-    for package_file in $(printf '%s\n' "$transaction" \
-      | sed -n 's/^([^)]*) Installing \([^ ]*\) (\([^)]*\)).*/\1-\2.apk/p'); do \
-      wget --https-only --prefer-family=IPv4 --timeout=30 --tries=5 \
-        --retry-connrefused --retry-on-host-error \
-        --retry-on-http-error=429,500,502,503,504 --quiet \
-        "$APK_REPOSITORY/x86_64/$package_file" -O "/debug-repository/x86_64/$package_file"; \
-    done
-
-FROM production
+ARG TARGETARCH
 
 ENV MAX_CONCURRENT_SCANS=1
 
@@ -40,12 +9,25 @@ USER 0
 WORKDIR /app
 # Diagnostics only: curl, dig/nslookup, ip/ss and jq. openssl, certutil, ps,
 # top and less already ship in the production image. TLS verification,
-# authentication and network policy are unchanged.
-RUN --mount=type=bind,from=debug-packages,source=/debug-repository,target=/debug-repository \
+# authentication and network policy are unchanged. Package signatures remain
+# verified by apk and the repository file is removed after the build step.
+RUN --mount=type=cache,id=portal-validator-debug-apks-${TARGETARCH},target=/var/cache/apk,sharing=locked \
     set -eu; \
-    printf '%s\n' /debug-repository > /tmp/debug-repositories; \
-    apk --repositories-file /tmp/debug-repositories --no-network --no-progress \
-      add --no-cache $(cat /debug-repository/constraints); \
+    printf '%s\n' "$APK_REPOSITORY" > /tmp/debug-repositories; \
+    installed=0; \
+    for attempt in 1 2 3 4 5; do \
+      if timeout 120 env SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+        REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+        CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+        apk --repositories-file /tmp/debug-repositories \
+        --cache-dir /var/cache/apk --cache-max-age 0 --timeout 60 --no-progress add \
+        curl bind-tools iproute2 jq; then \
+        installed=1; break; \
+      fi; \
+      echo "Debug package installation failed; retry $attempt" >&2; \
+      sleep "$attempt"; \
+    done; \
+    test "$installed" = 1; \
     rm -f /tmp/debug-repositories; \
     for tool in curl dig nslookup ip ss jq openssl certutil ps top less; do command -v "$tool" >/dev/null; done
 RUN --mount=type=bind,source=requirements-dev.txt,target=/tmp/requirements-dev.txt \
