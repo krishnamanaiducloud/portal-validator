@@ -128,16 +128,19 @@ with sync_playwright() as p:
     print("CHROMIUM_VERSION=" + browser.version, flush=True)
     assert browser.version.startswith("158.0.8127.18"), browser.version
     try:
-        page = browser.new_page()
-        response = page.goto(os.environ["RELEASE_SMOKE_TLS_ORIGIN"], wait_until="domcontentloaded", timeout=30000)
-        assert response.status == 200
-        assert page.title() == "Strict TLS release fixture"
-        print("CHROMIUM_STRICT_LOCAL_NSS_TLS=true", flush=True)
-        if os.getenv("RELEASE_SMOKE_PUBLIC_HTTPS") == "true":
-            response = page.goto("https://google.com", wait_until="domcontentloaded", timeout=30000)
+        if os.getenv("RELEASE_SMOKE_EMULATED_ARM64") == "true":
+            print("CHROMIUM_PAGE_TEST_SKIPPED=emulated-arm64-gpu-process-unsupported", flush=True)
+        else:
+            page = browser.new_page()
+            response = page.goto(os.environ["RELEASE_SMOKE_TLS_ORIGIN"], wait_until="domcontentloaded", timeout=30000)
             assert response.status == 200
-            print("PUBLIC_HTTPS_STATUS=" + str(response.status), flush=True)
-            print("PUBLIC_HTTPS_TITLE=" + page.title(), flush=True)
+            assert page.title() == "Strict TLS release fixture"
+            print("CHROMIUM_STRICT_LOCAL_NSS_TLS=true", flush=True)
+            if os.getenv("RELEASE_SMOKE_PUBLIC_HTTPS") == "true":
+                response = page.goto("https://google.com", wait_until="domcontentloaded", timeout=30000)
+                assert response.status == 200
+                print("PUBLIC_HTTPS_STATUS=" + str(response.status), flush=True)
+                print("PUBLIC_HTTPS_TITLE=" + page.title(), flush=True)
     finally:
         browser.close()
 log_path = Path("/tmp/portal-release-uvicorn.log")
